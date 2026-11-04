@@ -1191,15 +1191,22 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def preprocess_argv(argv: list) -> list:
-    """--project values are munged paths and always begin with '-' (e.g.
-    -home-recoding-Kairo-v1), which argparse would mistake for a flag.
-    Rewrite '--project -foo' into '--project=-foo' before parsing."""
+    """Munged path arguments always begin with '-' (e.g. -home-recoding-Kairo-v1),
+    which argparse would mistake for a flag. Rewrite '--project -foo' into
+    '--project=-foo', and shield adopt's source positional behind '--'."""
     out = []
     i = 0
     while i < len(argv):
         if argv[i] == "--project" and i + 1 < len(argv):
             out.append(f"--project={argv[i + 1]}")
             i += 2
+            continue
+        if (argv[i] == "adopt" and i + 1 < len(argv)
+                and argv[i + 1].startswith("-")
+                and argv[i + 1] not in ("-h", "--help")):
+            out.append(argv[i])
+            out.append("--")
+            i += 1
             continue
         out.append(argv[i])
         i += 1

@@ -6,8 +6,8 @@ Back up your conversations to Google Drive and replay any session on another
 machine's Claude Code, anytime — push, pull, diff and resolve sessions the way
 you would code with git.
 
-> **Status:** early. The setup + sync scripts below work today; the full
-> `sessium` CLI is being built (see `PLAN.md`).
+> **Status:** working CLI for Linux (Python 3, stdlib only). Windows version
+> next — see `PLAN.md` for phases and `SPEC.md` for the cross-platform contract.
 
 ## How it works
 
@@ -16,68 +16,74 @@ you would code with git.
   same name holding session data, plus your `memory/` directory.
 - Claude Code offers `--resume` sessions based on the current repo path, so the
   only trick for another machine is putting the files where it looks.
-- These scripts sync that folder (plus settings, skills, and your memory) with
-  rclone, which talks to Google Drive directly. Your code repos are NOT backed
-  up here — they live in git; clone them normally.
+- `sessium` syncs that tree with rclone, which talks to Google Drive directly.
+  Your code repos are NOT backed up here — they live in git; clone them normally.
+- A per-machine **ledger** (`~/.local/state/sessium/state.json`) remembers what
+  was synced, so `sessium status` can tell in-sync from push from pull from
+  CONFLICT — like `git status` for your sessions.
 
 ## One-time setup (each machine)
 
-1. Install rclone:  `sudo apt install rclone`
-2. Connect your Drive:  `rclone config`, then:
-   - `n` (new remote)
-   - name: `gdrive`
-   - Storage: type `drive` (Google Drive)
-   - client_id / client_secret / scope / service_account_file: press Enter for all
-   - Edit advanced config: `n`
-   - Auto config: `y` → a browser opens, sign in to the Google account you want
-   - team drive: `n`
-   - `y` to confirm, `q` to quit
-3. First push (this machine): `~/sessium/push.sh`
+```bash
+bash setup-ubuntu.sh        # installs rclone, does the Drive sign-in, self-tests
+```
 
-Step 1–3 in one go: run `bash setup-ubuntu.sh` — it installs rclone, asks for
-and validates your remote name and folder, does the sign-in, writes the config
-and auto-tests it.
+That's it — it writes `~/.config/sessium/config.json` and verifies the whole
+path (reach Drive, upload/read round-trip). Rerun with `--check-only` to
+re-verify without prompts.
 
 ## Day to day
 
-- After work sessions: `~/sessium/push.sh`
-  (never deletes from Drive, so it's safe to run anytime)
-- To automate, add an hourly sync: `crontab -e` and add
-  `0 * * * * $HOME/sessium/push.sh >> $HOME/sessium/push.log 2>&1`
-- Browse what's on Drive: at drive.google.com in the `claude-backup` folder, or
-  `rclone lsf gdrive:claude-backup/projects`
+```bash
+sessium status              # what changed here / there / in conflict
+sessium sync                # push AND pull what changed; prompts on conflicts
+sessium list --titles       # browse sessions, newest first
+sessium diff <id>           # local vs remote vs last-synced, side by side
+```
+
+`sync` on a schedule: `crontab -e` and add
+`0 * * * * $HOME/.local/bin/sessium sync >> $HOME/sessium-sync.log 2>&1`
+(no terminal attached → conflicts resolve newest-wins automatically, and the
+loser is always kept as a revert copy).
+
+Push or pull only: `sessium push` / `sessium pull` — both SKIP conflicts, like
+git refusing a push over divergence.
+
+Browse what's on Drive: at drive.google.com in the `claude-backup` folder, or
+`rclone lsf gdrive:claude-backup/projects`.
 
 ## Recovering on another computer
 
-1. `sudo apt install rclone` and run `rclone config` with the SAME remote
-   name (`gdrive`) as above — or just run `bash setup-ubuntu.sh`.
-2. Get your code: `git clone` the repos (ideally to the SAME absolute paths as
-   the original machine — e.g. keep the username the same — then everything
-   lines up with zero extra steps).
-3. `~/sessium/pull.sh`  (fetch the scripts + all sessions)
+1. `bash setup-ubuntu.sh` (installs rclone, same Drive sign-in).
+2. Get your code: `git clone` the repos — ideally to the SAME absolute paths as
+   the original machine, then everything lines up with zero extra steps.
+3. `sessium pull` — sessions come down to `~/.claude/projects/…`.
 4. If repo paths match the original machine: done.
-   If they differ: `~/sessium/restore-session.sh -home-recoding-crosswise ~/crosswise`
-   (first arg = folder name from the old machine, second = where the repo lives now)
+   If they differ: `sessium adopt <old-munged-folder> /new/repo/path`
+   (e.g. `sessium adopt -home-recoding-crosswise ~/crosswise`) — copies the
+   sessions under the new path so `claude --resume` finds them.
 5. `cd` into the repo and `claude --resume` — pick the session, continue.
 
-Bootstrap shortcut on a fresh machine (before step 3, if you don't have these
-scripts yet): after `rclone config`, fetch them straight from Drive with
-`rclone copy gdrive:claude-backup/sessium ~/sessium`.
+## Conflict semantics
 
-## Setup scripts
+Sessions are never line-merged — a transcript is one linear conversation. When
+both machines changed the same session:
 
-- `setup-ubuntu.sh` — interactive: installs rclone, collects + validates your
-  remote name and folder, runs the Google sign-in, writes the config, then
-  auto-tests (reach Drive, create folder, upload/read/delete round-trip).
-  Also updates `config.sh` with your choices. Rerun anytime with `--check-only`
-  to re-verify an existing setup without prompts.
-- `setup-windows.ps1` — same thing for Windows (winget or direct download,
-  PowerShell 5.1+). Run with
-  `powershell -ExecutionPolicy Bypass -File .\setup-windows.ps1`
+- `sessium sync` (or `resolve`) asks on a terminal: `[L]ocal / [R]emote /
+  [B]oth (newest wins) / [S]kip`. No terminal (cron, pipes) → newest-wins.
+- **The loser is never deleted** — it's kept as
+  `projects/<munged>/revert/<id>.revert-<timestamp>.jsonl` for
+  `sessium revert <id>` to swap back.
+- `push` / `pull` never touch conflicts — they skip and say so.
 
 ## Files here
 
-- `config.sh` — what gets synced; edit to add more
-- `push.sh` / `pull.sh` — sync to/from Drive (copy-only, nothing is ever deleted)
-- `restore-session.sh` — rehomes sessions when repo paths differ between machines
+- `linux/sessium` — the Linux CLI (installed to `~/.local/bin/sessium` by
+  `install.sh`)
+- `tests/` — hermetic test suite; `python3 tests/run_tests.py` (fake rclone,
+  fake two-machine Drive, nothing touches your real `~/.claude`)
 - `setup-ubuntu.sh` / `setup-windows.ps1` — one-command interactive installers
+- `SPEC.md` — the cross-platform contract (Drive layout, ledger schema, rules)
+- `PLAN.md` — the build plan and where we are in it
+- `archive/` — the retired `push.sh` / `pull.sh` / `restore-session.sh`,
+  kept for reference

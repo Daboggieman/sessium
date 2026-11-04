@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# RETIRED — use `sessium pull` / `sessium sync` instead (kept for reference).
 # Pull Claude Code sessions + config back from Google Drive (e.g. onto a new machine).
 # Safe by design: `rclone copy` never deletes anything on this machine.
 set -euo pipefail

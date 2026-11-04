@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# RETIRED — use `sessium adopt <munged-folder> /new/repo/path` instead (kept for reference).
 # Make sessions from another machine resumable on THIS machine.
 # Claude finds sessions by looking in ~/.claude/projects/<munged-repo-path>/,
 # where <munged-repo-path> is the repo's absolute path with every "/" replaced by "-".
