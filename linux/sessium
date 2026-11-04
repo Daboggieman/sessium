@@ -1,0 +1,556 @@
+#!/usr/bin/env python3
+"""sessium (Linux) — git-like version control for Claude Code sessions.
+
+The "repo" is your ~/.claude/projects tree; the "remote" is a Google Drive
+folder reached through rclone (no Drive API code lives here — rclone does all
+transport). A per-machine ledger (Phase 2) remembers last-synced checksums so
+sessium can tell "changed here" from "changed there" from "both changed".
+
+    local repo     ~/.claude/projects/<munged-project-path>/<session-id>.jsonl
+    remote         <rclone-remote>:<drive-folder>/projects/...
+    config         ~/.config/sessium/config.json   (falls back to sessium/config.sh)
+    ledger         ~/.local/state/sessium/state.json
+
+Phase 1 commands: list, status, check, setup.
+Phase 2 adds: push, pull, sync (the ledger starts working then).
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+VERSION = "0.1.0"
+DEBUG = False
+
+
+# ---------------------------------------------------------------------------
+# output helpers
+# ---------------------------------------------------------------------------
+
+def say(msg: str) -> None:
+    print(msg)
+
+
+def ok(msg: str) -> None:
+    print(f"[OK] {msg}")
+
+
+def warn(msg: str) -> None:
+    print(f"[!]  {msg}", file=sys.stderr)
+
+
+def fail(msg: str) -> None:
+    print(f"[X]  {msg}", file=sys.stderr)
+
+
+def debug(msg: str) -> None:
+    if DEBUG:
+        print(f"[dbg] {msg}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# paths and configuration
+# ---------------------------------------------------------------------------
+
+def claude_dir() -> Path:
+    """Claude Code's data root (SESSIUM_CLAUDE_DIR overrides, for tests)."""
+    return Path(os.environ.get("SESSIUM_CLAUDE_DIR", str(Path.home() / ".claude")))
+
+
+def config_path() -> Path:
+    env = os.environ.get("SESSIUM_CONFIG")
+    if env:
+        return Path(env)
+    xdg = os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))
+    return Path(xdg) / "sessium" / "config.json"
+
+
+def state_path() -> Path:
+    env = os.environ.get("SESSIUM_STATE")
+    if env:
+        return Path(env)
+    xdg = os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local" / "state"))
+    return Path(xdg) / "sessium" / "state.json"
+
+
+def rclone_bin() -> str:
+    return os.environ.get("SESSIUM_RCLONE_BIN", "rclone")
+
+
+def munge(project_path: str) -> str:
+    """Claude Code stores each project's sessions under its absolute path
+    with every '/' replaced by '-' (leading slash included)."""
+    return project_path.replace("/", "-")
+
+
+def load_config() -> dict:
+    """Effective config. Precedence: config.json > legacy sessium/config.sh > defaults."""
+    cfg = {"rclone_remote": "gdrive", "drive_folder": "claude-backup"}
+    path = config_path()
+    if path.is_file():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            for key in cfg:
+                if data.get(key):
+                    cfg[key] = data[key]
+            return cfg
+        except (json.JSONDecodeError, OSError) as exc:
+            warn(f"unreadable config {path}: {exc}")
+    legacy = Path.home() / "sessium" / "config.sh"
+    if legacy.is_file():
+        try:
+            text = legacy.read_text(encoding="utf-8")
+            match = re.search(r'^DRIVE_REMOTE="([^"]*)"', text, re.M)
+            if match:
+                cfg["rclone_remote"] = match.group(1)
+            match = re.search(r'^DRIVE_DIR="([^"]*)"', text, re.M)
+            if match:
+                cfg["drive_folder"] = match.group(1)
+        except OSError as exc:
+            warn(f"unreadable legacy config {legacy}: {exc}")
+    return cfg
+
+
+def drive_url(cfg: dict, sub: str = "") -> str:
+    base = f"{cfg['rclone_remote']}:{cfg['drive_folder']}"
+    return f"{base}/{sub}" if sub else base
+
+
+# ---------------------------------------------------------------------------
+# rclone wrapper — the only door to the outside world
+# ---------------------------------------------------------------------------
+
+class RcloneError(Exception):
+    pass
+
+
+def rclone(*args: str, timeout: int = 120, check: bool = True) -> subprocess.CompletedProcess:
+    cmd = [rclone_bin(), *args]
+    debug(" ".join(cmd))
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError as exc:
+        raise RcloneError(
+            f"rclone not found (tried: {rclone_bin()!r}) — install it, or point "
+            f"SESSIUM_RCLONE_BIN at the binary"
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RcloneError(f"rclone timed out after {timeout}s: {' '.join(args[:2])}") from exc
+    if check and proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip().splitlines()
+        tail = detail[-1][:200] if detail else "(no output)"
+        raise RcloneError(f"rclone {' '.join(args[:2])} failed (rc={proc.returncode}): {tail}")
+    return proc
+
+
+# ---------------------------------------------------------------------------
+# hashing and time helpers
+# ---------------------------------------------------------------------------
+
+def md5_of(path: Path, chunk: int = 1 << 20) -> str:
+    digest = hashlib.md5()
+    with open(path, "rb") as handle:
+        while True:
+            block = handle.read(chunk)
+            if not block:
+                break
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def parse_rclone_time(value: str) -> str:
+    """rclone ModTime is RFC3339 with nanoseconds; trim the fraction to
+    microseconds (keeping any timezone offset) so datetime.fromisoformat
+    accepts it on every Python 3 we support."""
+    if not value:
+        return ""
+    value = re.sub(r"\.(\d{6})\d+", r".\1", value)
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(
+            timezone.utc
+        ).strftime("%Y-%m-%d %H:%M")
+    except ValueError:
+        return value[:16]
+
+
+# ---------------------------------------------------------------------------
+# discovery — local side
+# ---------------------------------------------------------------------------
+
+def local_sessions() -> dict:
+    """munged project name -> sorted list of session dicts (id, path, size, mtime, md5)."""
+    root = claude_dir() / "projects"
+    result = {}
+    if not root.is_dir():
+        return result
+    for project in sorted(root.iterdir()):
+        if not project.is_dir():
+            continue
+        sessions = []
+        for jsonl in sorted(project.glob("*.jsonl")):
+            try:
+                stat = jsonl.stat()
+            except OSError:
+                continue
+            sessions.append({
+                "id": jsonl.stem,
+                "path": str(jsonl),
+                "size": stat.st_size,
+                "mtime": stat.st_mtime,
+                "md5": md5_of(jsonl),
+            })
+        result[project.name] = sessions
+    return result
+
+
+def extract_text(content) -> str:
+    """User message content is either a plain string or a list of blocks."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(str(block.get("text", "")))
+        return " ".join(parts)
+    return ""
+
+
+def session_title(path: Path, max_lines: int = 200) -> str:
+    """Best-effort title: the first real user message in the transcript.
+    Skips meta entries and slash-command wrappers; returns '' if none found."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            for index, line in enumerate(handle):
+                if index >= max_lines:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if entry.get("type") != "user" or entry.get("isMeta"):
+                    continue
+                text = extract_text((entry.get("message") or {}).get("content")).strip()
+                if not text:
+                    continue
+                if text.startswith(("<command-", "<local-command", "<ide_")):
+                    continue
+                return " ".join(text.split())[:70]
+    except OSError:
+        pass
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# discovery — remote side
+# ---------------------------------------------------------------------------
+
+def remote_sessions(cfg: dict) -> dict:
+    """munged project name -> list of session dicts, read straight off Drive."""
+    proc = rclone("lsjson", "--recursive", "--hash", drive_url(cfg, "projects"))
+    entries = json.loads(proc.stdout or "[]")
+    result = {}
+    for entry in entries:
+        if entry.get("IsDir"):
+            continue
+        path = entry.get("Path", "")
+        if not path.endswith(".jsonl") or "/" not in path:
+            continue
+        project, filename = path.split("/", 1)
+        if "/" in filename:
+            continue  # transcripts live at the top level of each project
+        result.setdefault(project, []).append({
+            "id": filename[:-len(".jsonl")],
+            "size": entry.get("Size", 0),
+            "mtime": parse_rclone_time(entry.get("ModTime", "")),
+            "md5": (entry.get("Hashes") or {}).get("MD5", ""),
+        })
+    for sessions in result.values():
+        sessions.sort(key=lambda s: s["id"])
+    return result
+
+
+def classify(local_map: dict, remote_map: dict) -> list:
+    """One row per (project, session) present on either side.
+
+    Phase 1 states (no ledger yet):
+      in-sync      same md5 on both sides
+      local-only   exists here, not on Drive
+      remote-only  exists on Drive, not here
+      diverged     both sides have a copy and they differ — Phase 2's ledger
+                   will say whether that's a plain push/pull or a conflict
+    """
+    rows = []
+    projects = sorted(set(local_map) | set(remote_map))
+    for project in projects:
+        here = {s["id"]: s for s in local_map.get(project, [])}
+        there = {s["id"]: s for s in remote_map.get(project, [])}
+        for sid in sorted(set(here) | set(there)):
+            local, remote = here.get(sid), there.get(sid)
+            if local and not remote:
+                state = "local-only"
+            elif remote and not local:
+                state = "remote-only"
+            elif local["md5"] and remote["md5"] and local["md5"] == remote["md5"]:
+                state = "in-sync"
+            else:
+                state = "diverged"
+            rows.append({
+                "project": project,
+                "id": sid,
+                "state": state,
+                "local": local,
+                "remote": remote,
+            })
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# formatting
+# ---------------------------------------------------------------------------
+
+def short_id(session_id: str, keep: int = 8) -> str:
+    return session_id[:keep]
+
+
+def human_size(size: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.0f}{unit}" if unit == "B" else f"{size:.1f}{unit}"
+        size /= 1024
+    return f"{size:.1f}GB"
+
+
+def fmt_local_time(mtime: float) -> str:
+    if not mtime:
+        return "-"
+    return datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
+
+
+def fmt_state(state: str) -> str:
+    return {
+        "in-sync": "in-sync",
+        "local-only": "local-only",
+        "remote-only": "remote-only",
+        "diverged": "DIVERGED",
+    }.get(state, state)
+
+
+# ---------------------------------------------------------------------------
+# commands
+# ---------------------------------------------------------------------------
+
+def cmd_list(args) -> int:
+    """Inventory of local sessions (no Drive access)."""
+    local_map = local_sessions()
+    if args.project:
+        local_map = {k: v for k, v in local_map.items() if k == args.project}
+        if not local_map:
+            fail(f"no local project folder named {args.project!r}")
+            return 1
+    total = 0
+    for project, sessions in local_map.items():
+        if not sessions:
+            continue
+        say(f"\n{project}  ({len(sessions)} session{'s' if len(sessions) != 1 else ''})")
+        for s in sorted(sessions, key=lambda x: x["mtime"], reverse=True):
+            total += 1
+            title = session_title(Path(s["path"])) if args.titles else ""
+            title_col = f"  {title}" if title else ""
+            say(f"  {fmt_local_time(s['mtime'])}  {human_size(s['size']):>8}  "
+                f"{short_id(s['id'])}{title_col}")
+    if total == 0:
+        say("No local sessions found.")
+    return 0
+
+
+def cmd_status(args) -> int:
+    """Compare local sessions against Drive (and the ledger once Phase 2 lands)."""
+    cfg = load_config()
+    local_map = local_sessions()
+    if args.project:
+        local_map = {k: v for k, v in local_map.items() if k == args.project}
+    try:
+        remote_map = remote_sessions(cfg)
+        if args.project:
+            remote_map = {k: v for k, v in remote_map.items() if k == args.project}
+    except RcloneError as exc:
+        warn(f"cannot reach Drive right now: {exc}")
+        warn("showing local-only view — run 'sessium check' for details")
+        remote_map = {}
+
+    rows = classify(local_map, remote_map)
+    counts = {}
+    for row in rows:
+        counts[row["state"]] = counts.get(row["state"], 0) + 1
+
+    say(f"remote: {drive_url(cfg)}")
+    say(f"projects: {len(set(local_map) | set(remote_map))}   "
+        f"sessions: {len(rows)}   "
+        + "   ".join(f"{fmt_state(k)}: {v}" for k, v in sorted(counts.items())) or "")
+    if not rows:
+        say("Nothing to report — no sessions on either side (filtered).")
+        return 0
+
+    say("")
+    header = f"  {'STATE':<12}{'ID':<10}{'MODIFIED':<18}{'SIZE':>9}  PROJECT"
+    say(header)
+    for row in sorted(rows, key=lambda r: (r["project"], r["state"], r["id"])):
+        local = row["local"]
+        remote = row["remote"]
+        source = local or remote
+        if isinstance(source.get("mtime"), float):
+            modified = fmt_local_time(source["mtime"])
+        else:
+            modified = source.get("mtime") or "-"
+        size = human_size(source.get("size", 0))
+        say(f"  {fmt_state(row['state']):<12}{short_id(row['id']):<10}"
+            f"{modified:<18}{size:>9}  {row['project']}")
+    if counts.get("diverged"):
+        say("\n[!] DIVERGED sessions need the ledger (Phase 2) to tell whether "
+            "they are a plain push, a pull, or a real conflict.")
+    return 0
+
+
+def cmd_check(args) -> int:
+    """Read-only self-test: rclone present, config sane, Drive reachable,
+    local repo present. Writes nothing (the round-trip write test lives in
+    setup-ubuntu.sh / setup-windows.ps1)."""
+    # 1. rclone present?
+    try:
+        proc = rclone("version", timeout=15)
+        version = proc.stdout.splitlines()[0] if proc.stdout else "unknown"
+        ok(f"rclone: {version}")
+    except RcloneError as exc:
+        fail(f"rclone: {exc}")
+        return 1
+
+    # 2. config
+    cfg = load_config()
+    from_config_json = config_path().is_file()
+    source = "config.json" if from_config_json else "sessium/config.sh (legacy)"
+    ok(f"config from {source}: remote={cfg['rclone_remote']} folder={cfg['drive_folder']}")
+
+    # 3. remote reachable?
+    try:
+        rclone("lsd", f"{cfg['rclone_remote']}:", timeout=30)
+        ok(f"remote '{cfg['rclone_remote']}' reachable")
+    except RcloneError as exc:
+        fail(str(exc))
+        return 1
+
+    # 4. backup folder present? (created automatically on first push/sync)
+    try:
+        rclone("lsf", drive_url(cfg), timeout=30)
+        ok(f"backup folder '{cfg['drive_folder']}' found on Drive")
+    except RcloneError:
+        warn(f"backup folder '{cfg['drive_folder']}' not on Drive yet — "
+             "it will be created on first push/sync")
+
+    # 5. local repo
+    projects = local_sessions()
+    session_count = sum(len(v) for v in projects.values())
+    ok(f"local repo: {len(projects)} project(s), {session_count} session(s) "
+       f"under {claude_dir() / 'projects'}")
+
+    # 6. ledger (Phase 2)
+    if state_path().is_file():
+        ok(f"ledger: {state_path()}")
+    else:
+        say(f"     ledger not created yet (Phase 2) — expected at {state_path()}")
+
+    return 0
+
+
+def cmd_setup(args) -> int:
+    """Delegate to the platform installer (setup-ubuntu.sh on Linux)."""
+    script = Path(__file__).resolve().parent.parent / "setup-ubuntu.sh"
+    if not script.is_file():
+        fail(f"setup script not found at {script}")
+        return 1
+    passthrough = ["--check-only"] if args.check_only else []
+    result = subprocess.run(["bash", str(script), *passthrough])
+    return result.returncode
+
+
+# ---------------------------------------------------------------------------
+# entry point
+# ---------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="sessium",
+        description="git-like version control for Claude Code sessions, "
+                    "with Google Drive as the remote.",
+    )
+    parser.add_argument("--version", action="version", version=f"sessium {VERSION}")
+    parser.add_argument("--debug", action="store_true", help="show rclone commands")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_list = sub.add_parser("list", help="inventory of local sessions")
+    p_list.add_argument("--project", metavar="MUNGED", help="only this project folder")
+    p_list.add_argument("--titles", action="store_true", help="extract a title per session")
+    p_list.set_defaults(func=cmd_list)
+
+    p_status = sub.add_parser("status", help="compare local vs Drive vs ledger")
+    p_status.add_argument("--project", metavar="MUNGED", help="only this project folder")
+    p_status.set_defaults(func=cmd_status)
+
+    p_check = sub.add_parser("check", help="read-only self-test of the whole setup")
+    p_check.set_defaults(func=cmd_check)
+
+    p_setup = sub.add_parser("setup", help="run the platform installer (rclone + OAuth)")
+    p_setup.add_argument("--check-only", action="store_true",
+                         help="pass through: verify existing setup, no prompts")
+    p_setup.set_defaults(func=cmd_setup)
+
+    return parser
+
+
+def preprocess_argv(argv: list) -> list:
+    """--project values are munged paths and always begin with '-' (e.g.
+    -home-recoding-Kairo-v1), which argparse would mistake for a flag.
+    Rewrite '--project -foo' into '--project=-foo' before parsing."""
+    out = []
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--project" and i + 1 < len(argv):
+            out.append(f"--project={argv[i + 1]}")
+            i += 2
+            continue
+        out.append(argv[i])
+        i += 1
+    return out
+
+
+def main(argv=None) -> int:
+    global DEBUG
+    if argv is None:
+        argv = sys.argv[1:]
+    parser = build_parser()
+    args = parser.parse_args(preprocess_argv(list(argv)))
+    DEBUG = args.debug
+    try:
+        return args.func(args)
+    except RcloneError as exc:
+        fail(str(exc))
+        return 1
+    except KeyboardInterrupt:
+        say("")
+        warn("interrupted")
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

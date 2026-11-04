@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+"""Fake rclone for sessium's test suite.
+
+Emulates the handful of rclone subcommands sessium uses, backed by a plain
+directory on disk (FAKE_DRIVE_ROOT) that mirrors the Drive folder layout:
+
+    $FAKE_DRIVE_ROOT/<folder>/projects/<munged-path>/<session>.jsonl
+
+Supported: version, lsd <remote>:, lsf <remote>:<path>, lsjson [--recursive]
+[--hash] <remote>:<path>. Everything else exits 1 — deliberately, so tests
+catch sessium calling something new before the stub learns it.
+"""
+import hashlib
+import json
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+def split_remote(arg: str) -> Path:
+    """'gdrive:claude-backup/projects' -> $FAKE_DRIVE_ROOT/claude-backup/projects"""
+    if ":" not in arg:
+        print(f"not a remote path: {arg}", file=sys.stderr)
+        sys.exit(1)
+    _, rest = arg.split(":", 1)
+    return Path(os.environ["FAKE_DRIVE_ROOT"]) / rest
+
+
+def list_dir_json(target: Path, recursive: bool, want_hash: bool) -> None:
+    if not target.is_dir():
+        print(f'directory not found: "{target}"', file=sys.stderr)
+        sys.exit(1)
+    entries = []
+    if recursive:
+        base = target
+        for path in sorted(target.rglob("*")):
+            rel = path.relative_to(base).as_posix()
+            entries.append(entry(path, rel, want_hash))
+    else:
+        for path in sorted(target.iterdir()):
+            entries.append(entry(path, path.name, want_hash))
+    print(json.dumps(entries))
+
+
+def entry(path: Path, display: str, want_hash: bool) -> dict:
+    stat = path.stat()
+    e = {
+        "Path": display,
+        "Name": path.name,
+        "Size": stat.st_size if path.is_file() else 0,
+        "MimeType": "inode/directory" if path.is_dir() else "application/octet-stream",
+        "ModTime": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%S.000000000Z"
+        ),
+        "IsDir": path.is_dir(),
+        "Hashes": {},
+    }
+    if want_hash and path.is_file():
+        e["Hashes"]["MD5"] = hashlib.md5(path.read_bytes()).hexdigest()
+    return e
+
+
+def main() -> None:
+    args = sys.argv[1:]
+    if not args:
+        sys.exit(1)
+    if args[0] == "version":
+        print("rclone vFAKE-STUB-1.0")
+        return
+    if args[0] == "lsd":
+        target = split_remote(args[1])
+        if target.exists():
+            return
+        print(f'directory not found: "{target}"', file=sys.stderr)
+        sys.exit(1)
+    if args[0] == "lsf":
+        target = split_remote(args[1])
+        if not target.is_dir():
+            print(f'directory not found: "{target}"', file=sys.stderr)
+            sys.exit(1)
+        for child in sorted(target.iterdir()):
+            suffix = "/" if child.is_dir() else ""
+            print(child.name + suffix)
+        return
+    if args[0] == "lsjson":
+        rest = args[1:]
+        recursive = "--recursive" in rest
+        want_hash = "--hash" in rest
+        positional = [a for a in rest if not a.startswith("--")]
+        list_dir_json(split_remote(positional[0]), recursive, want_hash)
+        return
+    print(f"fake_rclone: unsupported command: {' '.join(args)}", file=sys.stderr)
+    sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,17 @@
+#!/usr/bin/env python3
+"""Convenience runner: python3 tests/run_tests.py  (equals unittest discover)."""
+import sys
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from test_sessium import UnitTests, CommandTests  # noqa: E402
+
+if __name__ == "__main__":
+    loader = unittest.TestLoader()
+    suite = unittest.TestSuite()
+    suite.addTests(loader.loadTestsFromTestCase(UnitTests))
+    suite.addTests(loader.loadTestsFromTestCase(CommandTests))
+    result = unittest.TextTestRunner(verbosity=2).run(suite)
+    sys.exit(0 if result.wasSuccessful() else 1)

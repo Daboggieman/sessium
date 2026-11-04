@@ -114,10 +114,11 @@ FOLDER="$(ask "Folder on your Drive for backups" "$DEF_FOLDER" \
   '^[^/\\:*?"<>|]{1,100}$' \
   'folder name cannot contain any of: / \ : * ? " < > |')"
 
+RECONFIGURE=0
 if REMOTE_EXISTS "$REMOTE"; then
   read -r -p "Remote '$REMOTE' already exists. Reconfigure (re-authorize) it? [y/N]: " yn
   case "$yn" in
-    y|Y) rclone config delete "$REMOTE" && ok "removed old remote '$REMOTE'" ;;
+    y|Y) RECONFIGURE=1 ;;
     *)   ok "keeping existing remote — running tests only"; run_tests "$REMOTE" "$FOLDER"
          echo "Next step: $HOME/sessium/push.sh"; exit 0 ;;
   esac
@@ -152,6 +153,12 @@ fi
 ok "token captured and validated"
 
 # ------------------------------------------------------- 6. write the remote
+# The old section is deleted only now — after the new token is validated — so
+# a failed OAuth can never leave this machine without a working remote.
+if [ "$RECONFIGURE" = "1" ]; then
+  rclone config delete "$REMOTE"
+  ok "removed old remote '$REMOTE'"
+fi
 mkdir -p "$(dirname "$CONFIG_FILE")"
 touch "$CONFIG_FILE"
 chmod 600 "$CONFIG_FILE"
