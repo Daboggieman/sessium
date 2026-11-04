@@ -7,8 +7,9 @@ directory on disk (FAKE_DRIVE_ROOT) that mirrors the Drive folder layout:
     $FAKE_DRIVE_ROOT/<folder>/projects/<munged-path>/<session>.jsonl
 
 Supported: version, lsd <remote>:, lsf <remote>:<path>, lsjson [--recursive]
-[--hash] <remote>:<path>. Everything else exits 1 — deliberately, so tests
-catch sessium calling something new before the stub learns it.
+[--hash] <remote>:<path>, copyto <src> <dst> (src/dst may be local or
+remote:...). Everything else exits 1 — deliberately, so tests catch sessium
+calling something new before the stub learns it.
 """
 import hashlib
 import json
@@ -51,7 +52,7 @@ def entry(path: Path, display: str, want_hash: bool) -> dict:
         "Size": stat.st_size if path.is_file() else 0,
         "MimeType": "inode/directory" if path.is_dir() else "application/octet-stream",
         "ModTime": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).strftime(
-            "%Y-%m-%dT%H:%M:%S.000000000Z"
+            "%Y-%m-%dT%H:%M:%S.%f000Z"          # ns precision, like real rclone
         ),
         "IsDir": path.is_dir(),
         "Hashes": {},
@@ -89,6 +90,17 @@ def main() -> None:
         want_hash = "--hash" in rest
         positional = [a for a in rest if not a.startswith("--")]
         list_dir_json(split_remote(positional[0]), recursive, want_hash)
+        return
+    if args[0] == "copyto":
+        src, dst = args[1], args[2]
+        src_path = split_remote(src) if ":" in src else Path(src)
+        dst_path = split_remote(dst) if ":" in dst else Path(dst)
+        if not src_path.is_file():
+            print(f"file not found: {src_path}", file=sys.stderr)
+            sys.exit(1)
+        dst_path.parent.mkdir(parents=True, exist_ok=True)
+        # a byte-for-byte copy keeps md5s consistent, like the real transport
+        dst_path.write_bytes(src_path.read_bytes())
         return
     print(f"fake_rclone: unsupported command: {' '.join(args)}", file=sys.stderr)
     sys.exit(1)

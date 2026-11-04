@@ -4,7 +4,7 @@
 tree is the "repo", Google Drive (via rclone) is the "remote", and `sessium`
 is the CLI that pushes, pulls, diffs and resolves sessions between them.
 
-**Status:** approved (decisions locked 2026-11-03, see §8). Phase 0 done; **Phase 1 done** — `linux/sessium` implements list/status/check/setup with a hermetic test suite (`tests/`, 12 tests, fake rclone + fake Drive); verified against real local data. Phase 2 (ledger, push/pull/sync) next.
+**Status:** approved (decisions locked 2026-11-03, see §8). Phase 0 done; Phases 1–2 done — `linux/sessium` covers list/status/check/setup + ledger-driven push/pull/sync with conflict resolution (newest-wins, revert copies), verified by a 22-test suite including a two-machine simulation (`tests/`). Real-Drive verification of sync pending the OAuth re-setup. Phase 3 (diff/resolve/revert/adopt) next.
 
 ---
 

@@ -12,7 +12,8 @@ sessium can tell "changed here" from "changed there" from "both changed".
     ledger         ~/.local/state/sessium/state.json
 
 Phase 1 commands: list, status, check, setup.
-Phase 2 adds: push, pull, sync (the ledger starts working then).
+Phase 2 adds: push, pull, sync — the ledger at ~/.local/state/sessium/state.json
+records last-synced md5s and drives the classification.
 """
 
 from __future__ import annotations
@@ -125,6 +126,69 @@ def drive_url(cfg: dict, sub: str = "") -> str:
 
 
 # ---------------------------------------------------------------------------
+# the ledger — sessium's ".git" state (schema v1, see SPEC.md)
+# ---------------------------------------------------------------------------
+
+LEDGER_VERSION = 1
+
+
+def ledger_key(project: str, sid: str) -> str:
+    return f"{project}/{sid}"
+
+
+def new_ledger() -> dict:
+    return {"version": LEDGER_VERSION, "sessions": {}}
+
+
+def load_ledger() -> dict:
+    path = state_path()
+    if not path.is_file():
+        return new_ledger()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or not isinstance(data.get("sessions"), dict):
+            raise ValueError("not a sessium ledger")
+        return data
+    except (json.JSONDecodeError, OSError, ValueError) as exc:
+        warn(f"ledger {path} unreadable ({exc}) — starting fresh; matching "
+             "sessions will be re-recorded via the bootstrap rule")
+        return new_ledger()
+
+
+def save_ledger(ledger: dict) -> None:
+    path = state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    ledger["version"] = LEDGER_VERSION
+    path.write_text(
+        json.dumps(ledger, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+
+def record_sync(ledger: dict, project: str, sid: str,
+                local_md5: str, remote_md5: str) -> None:
+    ledger.setdefault("sessions", {})[ledger_key(project, sid)] = {
+        "project": project,
+        "id": sid,
+        "local_md5": local_md5,
+        "remote_md5": remote_md5,
+        "last_synced": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+
+def record_bootstrap(ledger: dict, rows: list) -> int:
+    """PLAN §2 bootstrap rule: matching copies with no ledger record are
+    recorded as in-sync — no prompts, no day-one mass conflict. Only the
+    write commands (push/pull/sync) record; status stays read-only."""
+    n = 0
+    for row in rows:
+        if row["state"] == "in-sync" and not row["entry"]:
+            record_sync(ledger, row["project"], row["id"],
+                        row["local"]["md5"], row["remote"]["md5"])
+            n += 1
+    return n
+
+
+# ---------------------------------------------------------------------------
 # rclone wrapper — the only door to the outside world
 # ---------------------------------------------------------------------------
 
@@ -166,19 +230,43 @@ def md5_of(path: Path, chunk: int = 1 << 20) -> str:
     return digest.hexdigest()
 
 
-def parse_rclone_time(value: str) -> str:
+def parse_rclone_time(value: str):
     """rclone ModTime is RFC3339 with nanoseconds; trim the fraction to
     microseconds (keeping any timezone offset) so datetime.fromisoformat
-    accepts it on every Python 3 we support."""
+    accepts it on every Python 3 we support. Returns an aware UTC datetime,
+    or None when unparseable."""
     if not value:
-        return ""
+        return None
     value = re.sub(r"\.(\d{6})\d+", r".\1", value)
     try:
         return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(
             timezone.utc
-        ).strftime("%Y-%m-%d %H:%M")
+        )
     except ValueError:
-        return value[:16]
+        return None
+
+
+def mtime_of(session: dict):
+    """A session's mtime as an aware UTC datetime — local copies store an
+    epoch float, remote copies a datetime (or None)."""
+    value = session.get("mtime")
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value
+    try:
+        return datetime.fromtimestamp(value, tz=timezone.utc)
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
+def fmt_time(value) -> str:
+    """Display form for an epoch float, a datetime, or nothing."""
+    if value is None or value == "":
+        return "-"
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d %H:%M")
+    return fmt_local_time(value)
 
 
 # ---------------------------------------------------------------------------
@@ -281,39 +369,104 @@ def remote_sessions(cfg: dict) -> dict:
     return result
 
 
-def classify(local_map: dict, remote_map: dict) -> list:
-    """One row per (project, session) present on either side.
+def classify_row(project: str, sid: str, local, remote, entry) -> dict:
+    """Classify one (project, session) against its ledger record (PLAN §2)."""
+    if entry:
+        l_match = bool(local) and entry.get("local_md5") == local["md5"]
+        r_match = bool(remote) and entry.get("remote_md5") == remote["md5"]
+        if local and remote:
+            if l_match and r_match:
+                state = "in-sync"
+            elif l_match:
+                state = "pull"       # only the remote copy moved
+            elif r_match:
+                state = "push"       # only the local copy moved
+            else:
+                state = "conflict"   # both sides moved
+        elif local:
+            state = "new-here"       # remote copy vanished → re-upload
+        else:
+            state = "new-there"      # local copy vanished → re-download
+    elif local and remote:
+        # no record: bootstrap rule says matching copies are in-sync, and
+        # genuinely divergent copies are a first-sight conflict
+        state = "in-sync" if (local["md5"] and local["md5"] == remote["md5"]) \
+            else "conflict"
+    else:
+        state = "new-here" if local else "new-there"
+    return {
+        "project": project,
+        "id": sid,
+        "state": state,
+        "local": local,
+        "remote": remote,
+        "entry": entry,
+    }
 
-    Phase 1 states (no ledger yet):
-      in-sync      same md5 on both sides
-      local-only   exists here, not on Drive
-      remote-only  exists on Drive, not here
-      diverged     both sides have a copy and they differ — Phase 2's ledger
-                   will say whether that's a plain push/pull or a conflict
-    """
+
+def classify_ledger(local_map: dict, remote_map: dict, ledger: dict) -> list:
+    """One row per (project, session) present on either side, classified
+    against the ledger. States: in-sync / push / pull / conflict /
+    new-here / new-there."""
+    sessions = ledger.get("sessions", {})
     rows = []
-    projects = sorted(set(local_map) | set(remote_map))
-    for project in projects:
+    for project in sorted(set(local_map) | set(remote_map)):
         here = {s["id"]: s for s in local_map.get(project, [])}
         there = {s["id"]: s for s in remote_map.get(project, [])}
         for sid in sorted(set(here) | set(there)):
-            local, remote = here.get(sid), there.get(sid)
-            if local and not remote:
-                state = "local-only"
-            elif remote and not local:
-                state = "remote-only"
-            elif local["md5"] and remote["md5"] and local["md5"] == remote["md5"]:
-                state = "in-sync"
-            else:
-                state = "diverged"
-            rows.append({
-                "project": project,
-                "id": sid,
-                "state": state,
-                "local": local,
-                "remote": remote,
-            })
+            entry = sessions.get(ledger_key(project, sid))
+            rows.append(classify_row(project, sid, here.get(sid), there.get(sid), entry))
     return rows
+
+
+# ---------------------------------------------------------------------------
+# transfers — the only code that moves session bytes
+# ---------------------------------------------------------------------------
+
+def local_session_path(project: str, sid: str) -> Path:
+    return claude_dir() / "projects" / project / f"{sid}.jsonl"
+
+
+def upload_session(cfg: dict, project: str, sid: str, local_path: str) -> None:
+    rclone("copyto", local_path, drive_url(cfg, f"projects/{project}/{sid}.jsonl"),
+           timeout=300)
+
+
+def download_session(cfg: dict, project: str, sid: str, local_path: str) -> None:
+    Path(local_path).parent.mkdir(parents=True, exist_ok=True)
+    rclone("copyto", drive_url(cfg, f"projects/{project}/{sid}.jsonl"), local_path,
+           timeout=300)
+
+
+def revert_path(project: str, sid: str) -> Path:
+    """A not-yet-taken name in the project's revert/ folder. Revert copies
+    live under <claude-dir>/projects/<project>/revert/ so they never pollute
+    the session listing (which only globs top-level *.jsonl)."""
+    d = claude_dir() / "projects" / project / "revert"
+    d.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    dst = d / f"{sid}.revert-{stamp}.jsonl"
+    n = 0
+    while dst.exists():                      # two conflicts within one second
+        n += 1
+        dst = d / f"{sid}.revert-{stamp}-{n}.jsonl"
+    return dst
+
+
+def save_local_revert(project: str, sid: str, src: Path) -> Path:
+    """Preserve a losing LOCAL copy: move it into revert/."""
+    dst = revert_path(project, sid)
+    src.replace(dst)
+    return dst
+
+
+def save_remote_revert(cfg: dict, project: str, sid: str) -> Path:
+    """Preserve a losing REMOTE copy: download it into revert/ before the
+    upload overwrites it on Drive."""
+    dst = revert_path(project, sid)
+    rclone("copyto", drive_url(cfg, f"projects/{project}/{sid}.jsonl"), str(dst),
+           timeout=300)
+    return dst
 
 
 # ---------------------------------------------------------------------------
@@ -341,9 +494,11 @@ def fmt_local_time(mtime: float) -> str:
 def fmt_state(state: str) -> str:
     return {
         "in-sync": "in-sync",
-        "local-only": "local-only",
-        "remote-only": "remote-only",
-        "diverged": "DIVERGED",
+        "push": "push",
+        "pull": "pull",
+        "new-here": "new-here",
+        "new-there": "new-there",
+        "conflict": "CONFLICT",
     }.get(state, state)
 
 
@@ -353,12 +508,10 @@ def fmt_state(state: str) -> str:
 
 def cmd_list(args) -> int:
     """Inventory of local sessions (no Drive access)."""
-    local_map = local_sessions()
-    if args.project:
-        local_map = {k: v for k, v in local_map.items() if k == args.project}
-        if not local_map:
-            fail(f"no local project folder named {args.project!r}")
-            return 1
+    local_map = filter_map(local_sessions(), args.project)
+    if args.project and not local_map:
+        fail(f"no local project folder named {args.project!r}")
+        return 1
     total = 0
     for project, sessions in local_map.items():
         if not sessions:
@@ -375,30 +528,33 @@ def cmd_list(args) -> int:
     return 0
 
 
+def filter_map(session_map: dict, project) -> dict:
+    """--project filter: keep only that munged project folder."""
+    if not project:
+        return session_map
+    return {k: v for k, v in session_map.items() if k == project}
+
+
 def cmd_status(args) -> int:
-    """Compare local sessions against Drive (and the ledger once Phase 2 lands)."""
+    """Compare local sessions against Drive, classified by the ledger."""
     cfg = load_config()
-    local_map = local_sessions()
-    if args.project:
-        local_map = {k: v for k, v in local_map.items() if k == args.project}
+    local_map = filter_map(local_sessions(), args.project)
     try:
-        remote_map = remote_sessions(cfg)
-        if args.project:
-            remote_map = {k: v for k, v in remote_map.items() if k == args.project}
+        remote_map = filter_map(remote_sessions(cfg), args.project)
     except RcloneError as exc:
         warn(f"cannot reach Drive right now: {exc}")
         warn("showing local-only view — run 'sessium check' for details")
         remote_map = {}
 
-    rows = classify(local_map, remote_map)
+    rows = classify_ledger(local_map, remote_map, load_ledger())
     counts = {}
     for row in rows:
         counts[row["state"]] = counts.get(row["state"], 0) + 1
 
     say(f"remote: {drive_url(cfg)}")
+    summary = "   ".join(f"{fmt_state(k)}: {v}" for k, v in sorted(counts.items()))
     say(f"projects: {len(set(local_map) | set(remote_map))}   "
-        f"sessions: {len(rows)}   "
-        + "   ".join(f"{fmt_state(k)}: {v}" for k, v in sorted(counts.items())) or "")
+        f"sessions: {len(rows)}" + (f"   {summary}" if summary else ""))
     if not rows:
         say("Nothing to report — no sessions on either side (filtered).")
         return 0
@@ -407,19 +563,15 @@ def cmd_status(args) -> int:
     header = f"  {'STATE':<12}{'ID':<10}{'MODIFIED':<18}{'SIZE':>9}  PROJECT"
     say(header)
     for row in sorted(rows, key=lambda r: (r["project"], r["state"], r["id"])):
-        local = row["local"]
-        remote = row["remote"]
-        source = local or remote
-        if isinstance(source.get("mtime"), float):
-            modified = fmt_local_time(source["mtime"])
-        else:
-            modified = source.get("mtime") or "-"
+        source = row["local"] or row["remote"]
+        modified = fmt_time(source.get("mtime"))
         size = human_size(source.get("size", 0))
         say(f"  {fmt_state(row['state']):<12}{short_id(row['id']):<10}"
             f"{modified:<18}{size:>9}  {row['project']}")
-    if counts.get("diverged"):
-        say("\n[!] DIVERGED sessions need the ledger (Phase 2) to tell whether "
-            "they are a plain push, a pull, or a real conflict.")
+    if counts.get("conflict"):
+        say("\n[!] CONFLICT sessions: both copies changed since the last sync. "
+            "Run 'sessium sync' to resolve (newest wins unless you answer the "
+            "prompt; the losing copy is kept in revert/).")
     return 0
 
 
@@ -464,13 +616,249 @@ def cmd_check(args) -> int:
     ok(f"local repo: {len(projects)} project(s), {session_count} session(s) "
        f"under {claude_dir() / 'projects'}")
 
-    # 6. ledger (Phase 2)
+    # 6. ledger
     if state_path().is_file():
         ok(f"ledger: {state_path()}")
     else:
-        say(f"     ledger not created yet (Phase 2) — expected at {state_path()}")
+        say(f"     ledger not created yet — push/pull/sync will create it "
+            f"at {state_path()}")
 
     return 0
+
+
+def transfer_summary(pushed: int, pulled: int, conflicts_skipped: int,
+                     in_sync: int, failures: int) -> str:
+    parts = [f"pushed: {pushed}", f"pulled: {pulled}"]
+    if conflicts_skipped:
+        parts.append(f"conflicts skipped: {conflicts_skipped}")
+    parts.append(f"in-sync: {in_sync}")
+    if failures:
+        parts.append(f"FAILED: {failures}")
+    return "   ".join(parts)
+
+
+def cmd_push(args) -> int:
+    """Upload new/changed sessions to Drive. Never overwrites a remote copy
+    that changed on its own — conflicts are skipped (use sync/resolve)."""
+    cfg = load_config()
+    local_map = filter_map(local_sessions(), args.project)
+    try:
+        remote_map = filter_map(remote_sessions(cfg), args.project)
+    except RcloneError as exc:
+        fail(f"cannot reach Drive: {exc}")
+        return 1
+    ledger = load_ledger()
+    rows = classify_ledger(local_map, remote_map, ledger)
+
+    pushed = conflicts = failures = 0
+    ledger_dirty = False
+    for row in rows:
+        label = f"{row['project']}/{short_id(row['id'])}"
+        if row["state"] == "conflict":
+            conflicts += 1
+            warn(f"skipped CONFLICT {label} — 'sessium sync' or 'sessium "
+                 "resolve' decides it")
+            continue
+        if row["state"] not in ("push", "new-here"):
+            continue
+        try:
+            upload_session(cfg, row["project"], row["id"], row["local"]["path"])
+            record_sync(ledger, row["project"], row["id"],
+                        row["local"]["md5"], row["local"]["md5"])
+            ledger_dirty = True
+            pushed += 1
+            ok(f"pushed {label} ({human_size(row['local']['size'])})")
+        except RcloneError as exc:
+            warn(f"push failed {label}: {exc}")
+            failures += 1
+
+    # bootstrap rule: matching copies with no record are recorded, not pushed
+    if record_bootstrap(ledger, rows):
+        ledger_dirty = True
+    if ledger_dirty:
+        save_ledger(ledger)
+    in_sync = sum(1 for r in rows if r["state"] == "in-sync")
+    say(transfer_summary(pushed, 0, conflicts, in_sync, failures))
+    return 1 if failures else 0
+
+
+def cmd_pull(args) -> int:
+    """Download new/changed sessions from Drive. Local copies that changed on
+    their own are left alone — conflicts are skipped (use sync/resolve)."""
+    cfg = load_config()
+    local_map = filter_map(local_sessions(), args.project)
+    try:
+        remote_map = filter_map(remote_sessions(cfg), args.project)
+    except RcloneError as exc:
+        fail(f"cannot reach Drive: {exc}")
+        return 1
+    ledger = load_ledger()
+    rows = classify_ledger(local_map, remote_map, ledger)
+
+    pulled = conflicts = failures = 0
+    ledger_dirty = False
+    for row in rows:
+        label = f"{row['project']}/{short_id(row['id'])}"
+        if row["state"] == "conflict":
+            conflicts += 1
+            warn(f"skipped CONFLICT {label} — 'sessium sync' or 'sessium "
+                 "resolve' decides it")
+            continue
+        if row["state"] not in ("pull", "new-there"):
+            continue
+        path = local_session_path(row["project"], row["id"])
+        try:
+            download_session(cfg, row["project"], row["id"], str(path))
+            record_sync(ledger, row["project"], row["id"],
+                        row["remote"]["md5"], row["remote"]["md5"])
+            ledger_dirty = True
+            pulled += 1
+            ok(f"pulled {label} ({human_size(row['remote']['size'])})")
+        except RcloneError as exc:
+            warn(f"pull failed {label}: {exc}")
+            failures += 1
+
+    if record_bootstrap(ledger, rows):
+        ledger_dirty = True
+    if ledger_dirty:
+        save_ledger(ledger)
+    in_sync = sum(1 for r in rows if r["state"] == "in-sync")
+    say(transfer_summary(0, pulled, conflicts, in_sync, failures))
+    return 1 if failures else 0
+
+
+def want_interactive(args) -> bool:
+    """Prompts on a terminal by default; --interactive forces them (tests,
+    scripted runs with piped answers)."""
+    return bool(args.interactive) or sys.stdin.isatty()
+
+
+def ask_conflict(row: dict) -> str:
+    """Interactive conflict prompt → 'local' | 'remote' | 'auto' | 'skip'.
+    Empty answer = 'auto' (newest wins)."""
+    local, remote = row["local"], row["remote"]
+    say(f"\nCONFLICT {row['project']}/{short_id(row['id'])} — both copies "
+        "changed since the last sync")
+    say(f"  local   {fmt_time(mtime_of(local))}  {human_size(local['size'])}")
+    say(f"  remote  {fmt_time(mtime_of(remote))}  {human_size(remote['size'])}")
+    while True:
+        try:
+            ans = input("  [L]ocal / [R]emote / [B]oth (newest wins) / [S]kip? "
+                        ).strip().lower()
+        except EOFError:
+            return "skip"
+        if ans in ("l", "local"):
+            return "local"
+        if ans in ("r", "remote"):
+            return "remote"
+        if ans in ("b", "both", ""):
+            return "auto"
+        if ans in ("s", "skip"):
+            return "skip"
+        say("  answer l, r, b, or s")
+
+
+def resolve_conflict(row: dict, interactive: bool) -> str:
+    """'local' | 'remote' | 'auto' | 'skip'. With a prompt, the user picks;
+    otherwise 'auto' — newest wins, tie goes to local (applied in one place,
+    apply_conflict)."""
+    if interactive:
+        return ask_conflict(row)
+    return "auto"
+
+
+def apply_conflict(cfg: dict, row: dict, choice: str, ledger: dict) -> str:
+    """Execute a conflict choice; the losing copy is always preserved in the
+    project's revert/ folder. Returns a human label for the log line."""
+    project, sid = row["project"], row["id"]
+    local, remote = row["local"], row["remote"]
+    if choice == "local":
+        save_remote_revert(cfg, project, sid)
+        upload_session(cfg, project, sid, local["path"])
+        record_sync(ledger, project, sid, local["md5"], local["md5"])
+        return "local wins"
+    if choice == "remote":
+        saved = save_local_revert(project, sid, Path(local["path"]))
+        download_session(cfg, project, sid, local["path"])
+        record_sync(ledger, project, sid, remote["md5"], remote["md5"])
+        return f"remote wins (local kept as {saved.name})"
+    # 'auto' / 'both' — newest wins, tie goes to local
+    rt, lt = mtime_of(remote), mtime_of(local)
+    if rt is not None and (lt is None or rt > lt):
+        saved = save_local_revert(project, sid, Path(local["path"]))
+        download_session(cfg, project, sid, local["path"])
+        record_sync(ledger, project, sid, remote["md5"], remote["md5"])
+        return f"remote wins (newer; local kept as {saved.name})"
+    save_remote_revert(cfg, project, sid)
+    upload_session(cfg, project, sid, local["path"])
+    record_sync(ledger, project, sid, local["md5"], local["md5"])
+    return "local wins (newer)"
+
+
+def cmd_sync(args) -> int:
+    """The workhorse: pull what changed there, push what changed here,
+    resolve conflicts (newest wins automatically, prompts on a terminal)."""
+    cfg = load_config()
+    local_map = filter_map(local_sessions(), args.project)
+    try:
+        remote_map = filter_map(remote_sessions(cfg), args.project)
+    except RcloneError as exc:
+        fail(f"cannot reach Drive: {exc}")
+        return 1
+    ledger = load_ledger()
+    rows = classify_ledger(local_map, remote_map, ledger)
+    interactive = want_interactive(args)
+
+    pushed = pulled = resolved = skipped = failures = 0
+    ledger_dirty = False
+    for row in rows:
+        label = f"{row['project']}/{short_id(row['id'])}"
+        state = row["state"]
+        try:
+            if state == "in-sync":
+                if not row["entry"]:            # bootstrap: record, no action
+                    record_sync(ledger, row["project"], row["id"],
+                                row["local"]["md5"], row["remote"]["md5"])
+                    ledger_dirty = True
+                continue
+            if state in ("push", "new-here"):
+                upload_session(cfg, row["project"], row["id"],
+                               row["local"]["path"])
+                record_sync(ledger, row["project"], row["id"],
+                            row["local"]["md5"], row["local"]["md5"])
+                ledger_dirty = True
+                pushed += 1
+                ok(f"pushed {label}")
+            elif state in ("pull", "new-there"):
+                path = local_session_path(row["project"], row["id"])
+                download_session(cfg, row["project"], row["id"], str(path))
+                record_sync(ledger, row["project"], row["id"],
+                            row["remote"]["md5"], row["remote"]["md5"])
+                ledger_dirty = True
+                pulled += 1
+                ok(f"pulled {label}")
+            else:  # conflict
+                choice = resolve_conflict(row, interactive)
+                if choice == "skip":
+                    skipped += 1
+                    warn(f"skipped {label} — still diverged, run "
+                         f"'sessium resolve {short_id(row['id'])}' later")
+                    continue
+                outcome = apply_conflict(cfg, row, choice, ledger)
+                ledger_dirty = True
+                resolved += 1
+                ok(f"resolved {label}: {outcome}")
+        except RcloneError as exc:
+            warn(f"{state} failed {label}: {exc}")
+            failures += 1
+
+    if ledger_dirty:
+        save_ledger(ledger)
+    in_sync = sum(1 for r in rows if r["state"] == "in-sync")
+    say(transfer_summary(pushed, pulled, 0, in_sync, failures)
+        + (f"   resolved: {resolved}" if resolved else "")
+        + (f"   skipped: {skipped}" if skipped else ""))
+    return 1 if failures else 0
 
 
 def cmd_setup(args) -> int:
@@ -509,6 +897,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_check = sub.add_parser("check", help="read-only self-test of the whole setup")
     p_check.set_defaults(func=cmd_check)
+
+    p_push = sub.add_parser("push", help="upload new/changed sessions to Drive")
+    p_push.add_argument("--project", metavar="MUNGED", help="only this project folder")
+    p_push.set_defaults(func=cmd_push)
+
+    p_pull = sub.add_parser("pull", help="download new/changed sessions from Drive")
+    p_pull.add_argument("--project", metavar="MUNGED", help="only this project folder")
+    p_pull.set_defaults(func=cmd_pull)
+
+    p_sync = sub.add_parser(
+        "sync", help="push + pull in one pass, resolving conflicts")
+    p_sync.add_argument("--project", metavar="MUNGED", help="only this project folder")
+    p_sync.add_argument("--interactive", action="store_true",
+                        help="force conflict prompts even without a terminal")
+    p_sync.set_defaults(func=cmd_sync)
 
     p_setup = sub.add_parser("setup", help="run the platform installer (rclone + OAuth)")
     p_setup.add_argument("--check-only", action="store_true",

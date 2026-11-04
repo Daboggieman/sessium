@@ -79,10 +79,11 @@ class Fixture:
         return e
 
 
-def run_sessium(env: dict, *args: str):
+def run_sessium(env: dict, *args, stdin_text=None):
     return subprocess.run(
         [sys.executable, str(SESSIUM), *args],
         capture_output=True, text=True, env=env, timeout=60,
+        input=stdin_text,
     )
 
 
@@ -111,13 +112,14 @@ class UnitTests(unittest.TestCase):
         self.assertEqual(self.mod.human_size(3 * 1024 * 1024), "3.0MB")
 
     def test_parse_rclone_time_variants(self):
+        from datetime import datetime, timezone
         self.assertEqual(self.mod.parse_rclone_time("2026-11-03T22:50:00.123456789Z"),
-                         "2026-11-03 22:50")
+                         datetime(2026, 11, 3, 22, 50, 0, 123456, tzinfo=timezone.utc))
         # a +01:00 offset must survive parsing (converted to UTC), not be sliced off
         self.assertEqual(self.mod.parse_rclone_time("2026-11-03T23:50:00+01:00"),
-                         "2026-11-03 22:50")
-        self.assertEqual(self.mod.parse_rclone_time(""), "")
-        self.assertEqual(self.mod.parse_rclone_time("garbage"), "garbage"[:16])
+                         datetime(2026, 11, 3, 22, 50, tzinfo=timezone.utc))
+        self.assertIsNone(self.mod.parse_rclone_time(""))
+        self.assertIsNone(self.mod.parse_rclone_time("garbage"))
 
     def test_extract_text(self):
         self.assertEqual(self.mod.extract_text("plain"), "plain")
@@ -147,14 +149,14 @@ class CommandTests(unittest.TestCase):
 
     def test_status_all_states(self):
         self.fx.write_local("aaa-same", SESSION_WITH_TITLE)
-        self.fx.write_remote("aaa-same", SESSION_WITH_TITLE)      # in-sync
-        self.fx.write_local("bbb-local", SESSION_ONLY_COMMANDS)   # local-only
-        self.fx.write_remote("ccc-remote", SESSION_WITH_BLOCKS)   # remote-only
+        self.fx.write_remote("aaa-same", SESSION_WITH_TITLE)      # in-sync (bootstrap)
+        self.fx.write_local("bbb-local", SESSION_ONLY_COMMANDS)   # new-here
+        self.fx.write_remote("ccc-remote", SESSION_WITH_BLOCKS)   # new-there
         self.fx.write_local("ddd-diverged", SESSION_WITH_TITLE)
-        self.fx.write_remote("ddd-diverged", SESSION_ONLY_COMMANDS)  # diverged
+        self.fx.write_remote("ddd-diverged", SESSION_ONLY_COMMANDS)  # conflict
         proc = run_sessium(self.fx.env(), "status")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        for state in ("in-sync: 1", "local-only: 1", "remote-only: 1", "DIVERGED: 1"):
+        for state in ("in-sync: 1", "new-here: 1", "new-there: 1", "CONFLICT: 1"):
             self.assertIn(state, proc.stdout)
 
     def test_status_remote_unreachable_stays_local(self):
@@ -164,7 +166,7 @@ class CommandTests(unittest.TestCase):
         proc = run_sessium(env, "status")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("local-only view", proc.stderr)
-        self.assertIn("local-only: 1", proc.stdout)
+        self.assertIn("new-here: 1", proc.stdout)
 
     def test_list_titles(self):
         self.fx.write_local("aaa", SESSION_WITH_TITLE)
@@ -208,6 +210,196 @@ class CommandTests(unittest.TestCase):
         proc = run_sessium(self.fx.env(), "check")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("1 project(s), 2 session(s)", proc.stdout)
+
+
+# --------------------------------------------------- two-machine sync tests
+
+PROJ = "-home-test-proj"
+
+
+class SyncTests(unittest.TestCase):
+    """PLAN §7 Phase 2 verification: a scripted two-machine simulation.
+    Machines A and B each have their own fake ~/.claude and ledger but share
+    one fake Drive; every sessium run happens through the real CLI."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.drive = self.tmp / "drive"
+        (self.drive / "backup" / "projects" / PROJ).mkdir(parents=True)
+        self.a = self._machine("a")
+        self.b = self._machine("b")
+        (self.tmp / "config.json").write_text(json.dumps({
+            "rclone_remote": "fake", "drive_folder": "backup"}), encoding="utf-8")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _machine(self, name: str) -> dict:
+        claude = self.tmp / f"machine-{name}" / ".claude"
+        (claude / "projects" / PROJ).mkdir(parents=True, exist_ok=True)
+        return {"claude": claude, "state": self.tmp / f"machine-{name}" / "state.json"}
+
+    def env(self, machine: dict) -> dict:
+        e = os.environ.copy()
+        e.update({
+            "SESSIUM_CLAUDE_DIR": str(machine["claude"]),
+            "SESSIUM_STATE": str(machine["state"]),
+            "SESSIUM_RCLONE_BIN": str(FAKE_RCLONE),
+            "SESSIUM_CONFIG": str(self.tmp / "config.json"),
+            "FAKE_DRIVE_ROOT": str(self.drive),
+        })
+        return e
+
+    def local_file(self, machine: dict, sid: str) -> Path:
+        return machine["claude"] / "projects" / PROJ / f"{sid}.jsonl"
+
+    def drive_file(self, sid: str) -> Path:
+        return self.drive / "backup" / "projects" / PROJ / f"{sid}.jsonl"
+
+    def revert_files(self, machine: dict, sid: str) -> list:
+        d = machine["claude"] / "projects" / PROJ / "revert"
+        return sorted(d.glob(f"{sid}.revert-*")) if d.is_dir() else []
+
+    def ledger(self, machine: dict) -> dict:
+        return json.loads(machine["state"].read_text(encoding="utf-8"))
+
+    def _baseline_conflict(self):
+        """A pushes a session; B pulls; both edit. Whoever pushes LAST owns
+        the newer Drive mtime."""
+        self.local_file(self.a, "aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
+        self.assertEqual(run_sessium(self.env(self.a), "push").returncode, 0)
+        self.assertEqual(run_sessium(self.env(self.b), "pull").returncode, 0)
+
+    def test_push_then_pull_roundtrip(self):
+        self.local_file(self.a, "aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
+        p = run_sessium(self.env(self.a), "push")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertTrue(self.drive_file("aaa").is_file())
+        self.assertIn(f"{PROJ}/aaa", self.ledger(self.a)["sessions"])
+        p = run_sessium(self.env(self.b), "pull")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(self.local_file(self.b, "aaa").read_text(encoding="utf-8"),
+                         SESSION_WITH_TITLE)
+        p = run_sessium(self.env(self.b), "status")
+        self.assertIn("in-sync: 1", p.stdout)
+
+    def test_bootstrap_records_without_prompt(self):
+        # identical copies everywhere, no ledger on either machine yet
+        for m in (self.a, self.b):
+            self.local_file(m, "aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
+        self.drive_file("aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
+        p = run_sessium(self.env(self.a), "sync")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("in-sync: 1", p.stdout)
+        self.assertIn(f"{PROJ}/aaa", self.ledger(self.a)["sessions"])
+        self.assertEqual(self.revert_files(self.a, "aaa"), [])   # nothing quarantined
+
+    def test_local_edit_syncs_up(self):
+        self._baseline_conflict()          # just the baseline here
+        self.local_file(self.a, "aaa").write_text(
+            SESSION_WITH_TITLE + "A's extra line\n", encoding="utf-8")
+        p = run_sessium(self.env(self.a), "sync")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("pushed: 1", p.stdout)
+        self.assertEqual(self.drive_file("aaa").read_text(encoding="utf-8"),
+                         SESSION_WITH_TITLE + "A's extra line\n")
+        p = run_sessium(self.env(self.b), "sync")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(self.local_file(self.b, "aaa").read_text(encoding="utf-8"),
+                         SESSION_WITH_TITLE + "A's extra line\n")
+
+    def test_conflict_remote_newer_wins(self):
+        self._baseline_conflict()
+        self.local_file(self.a, "aaa").write_text("A was here\n", encoding="utf-8")  # T1
+        self.local_file(self.b, "aaa").write_text("B was here\n", encoding="utf-8")
+        self.assertEqual(run_sessium(self.env(self.b), "push").returncode, 0)  # T2 > T1
+        p = run_sessium(self.env(self.a), "sync")     # non-tty → newest wins
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("remote wins", p.stdout)
+        self.assertEqual(self.local_file(self.a, "aaa").read_text(encoding="utf-8"),
+                         "B was here\n")
+        rev = self.revert_files(self.a, "aaa")
+        self.assertEqual(len(rev), 1)
+        self.assertEqual(rev[0].read_text(encoding="utf-8"), "A was here\n")
+        entry = self.ledger(self.a)["sessions"][f"{PROJ}/aaa"]
+        self.assertEqual(entry["local_md5"], entry["remote_md5"])
+
+    def test_conflict_local_newer_wins(self):
+        self._baseline_conflict()
+        self.local_file(self.b, "aaa").write_text("B was here\n", encoding="utf-8")
+        self.assertEqual(run_sessium(self.env(self.b), "push").returncode, 0)  # T1
+        self.local_file(self.a, "aaa").write_text("A was here\n", encoding="utf-8")  # T2 > T1
+        p = run_sessium(self.env(self.a), "sync")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("local wins", p.stdout)
+        self.assertEqual(self.drive_file("aaa").read_text(encoding="utf-8"),
+                         "A was here\n")
+        rev = self.revert_files(self.a, "aaa")
+        self.assertEqual(len(rev), 1)
+        self.assertEqual(rev[0].read_text(encoding="utf-8"), "B was here\n")
+
+    def test_conflict_interactive_choice(self):
+        self._baseline_conflict()
+        self.local_file(self.b, "aaa").write_text("B was here\n", encoding="utf-8")
+        self.assertEqual(run_sessium(self.env(self.b), "push").returncode, 0)  # newer
+        self.local_file(self.a, "aaa").write_text("A was here\n", encoding="utf-8")
+        p = run_sessium(self.env(self.a), "sync", "--interactive", stdin_text="L\n")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("local wins", p.stdout)
+        self.assertEqual(self.drive_file("aaa").read_text(encoding="utf-8"),
+                         "A was here\n")
+        rev = self.revert_files(self.a, "aaa")       # losing REMOTE copy preserved
+        self.assertEqual(len(rev), 1)
+        self.assertEqual(rev[0].read_text(encoding="utf-8"), "B was here\n")
+
+    def test_conflict_interactive_skip(self):
+        self._baseline_conflict()
+        self.local_file(self.a, "aaa").write_text("A was here\n", encoding="utf-8")
+        self.local_file(self.b, "aaa").write_text("B was here\n", encoding="utf-8")
+        self.assertEqual(run_sessium(self.env(self.b), "push").returncode, 0)
+        p = run_sessium(self.env(self.a), "sync", "--interactive", stdin_text="S\n")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("skipped: 1", p.stdout)
+        self.assertEqual(self.local_file(self.a, "aaa").read_text(encoding="utf-8"),
+                         "A was here\n")             # nothing touched
+        # the ledger still says what it said after the baseline push: local
+        # md5 = the original content, NOT A's unsynced edit
+        import hashlib
+        baseline_md5 = hashlib.md5(SESSION_WITH_TITLE.encode()).hexdigest()
+        entry = self.ledger(self.a)["sessions"][f"{PROJ}/aaa"]
+        self.assertEqual(entry["local_md5"], baseline_md5)
+
+    def test_push_skips_conflict(self):
+        self._baseline_conflict()
+        self.local_file(self.a, "aaa").write_text("A was here\n", encoding="utf-8")
+        self.drive_file("aaa").write_text("B was here\n", encoding="utf-8")
+        p = run_sessium(self.env(self.a), "push")
+        self.assertEqual(p.returncode, 0, p.stderr)      # skipping isn't failing
+        self.assertIn("conflicts skipped: 1", p.stdout)
+        self.assertEqual(self.drive_file("aaa").read_text(encoding="utf-8"),
+                         "B was here\n")                 # Drive untouched
+
+    def test_ledger_corrupt_starts_fresh(self):
+        self.local_file(self.a, "aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
+        self.assertEqual(run_sessium(self.env(self.a), "push").returncode, 0)
+        Path(self.a["state"]).write_text("{not json", encoding="utf-8")
+        p = run_sessium(self.env(self.a), "sync")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("unreadable", p.stderr)            # loudly warned
+        self.assertIn("in-sync: 1", p.stdout)            # bootstrap re-recorded
+        self.assertIn(f"{PROJ}/aaa", self.ledger(self.a)["sessions"])
+
+    def test_status_ledger_states(self):
+        self.local_file(self.a, "aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
+        self.local_file(self.a, "bbb").write_text(SESSION_ONLY_COMMANDS, encoding="utf-8")
+        self.assertEqual(run_sessium(self.env(self.a), "push").returncode, 0)
+        self.local_file(self.a, "aaa").write_text("A edited\n", encoding="utf-8")
+        self.drive_file("bbb").write_text("B edited\n", encoding="utf-8")
+        p = run_sessium(self.env(self.a), "status")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("push: 1", p.stdout)
+        self.assertIn("pull: 1", p.stdout)
 
 
 if __name__ == "__main__":

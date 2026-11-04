@@ -6,12 +6,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from test_sessium import UnitTests, CommandTests  # noqa: E402
+from test_sessium import UnitTests, CommandTests, SyncTests  # noqa: E402
 
 if __name__ == "__main__":
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
     suite.addTests(loader.loadTestsFromTestCase(UnitTests))
     suite.addTests(loader.loadTestsFromTestCase(CommandTests))
+    suite.addTests(loader.loadTestsFromTestCase(SyncTests))
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     sys.exit(0 if result.wasSuccessful() else 1)
