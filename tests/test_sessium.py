@@ -217,10 +217,10 @@ class CommandTests(unittest.TestCase):
 PROJ = "-home-test-proj"
 
 
-class SyncTests(unittest.TestCase):
-    """PLAN §7 Phase 2 verification: a scripted two-machine simulation.
-    Machines A and B each have their own fake ~/.claude and ledger but share
-    one fake Drive; every sessium run happens through the real CLI."""
+class SyncBase(unittest.TestCase):
+    """Shared two-machine fixture: machines A and B each have their own fake
+    ~/.claude and ledger but share one fake Drive; every sessium run happens
+    through the real CLI."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()

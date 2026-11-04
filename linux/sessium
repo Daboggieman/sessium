@@ -12,8 +12,10 @@ sessium can tell "changed here" from "changed there" from "both changed".
     ledger         ~/.local/state/sessium/state.json
 
 Phase 1 commands: list, status, check, setup.
-Phase 2 adds: push, pull, sync — the ledger at ~/.local/state/sessium/state.json
-records last-synced md5s and drives the classification.
+Phase 2 commands: push, pull, sync — the ledger at
+~/.local/state/sessium/state.json records last-synced md5s and drives
+classification.
+Phase 3 commands: diff, resolve, revert, adopt.
 """
 
 from __future__ import annotations
@@ -23,8 +25,10 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -196,11 +200,18 @@ class RcloneError(Exception):
     pass
 
 
-def rclone(*args: str, timeout: int = 120, check: bool = True) -> subprocess.CompletedProcess:
+def rclone(*args: str, timeout: int = 120, check: bool = True, to_file=None):
+    """Run rclone. With to_file=<path>, stdout streams into that file (used
+    for `rclone cat` of big transcripts) instead of being captured."""
     cmd = [rclone_bin(), *args]
     debug(" ".join(cmd))
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        if to_file:
+            with open(to_file, "wb") as handle:
+                proc = subprocess.run(cmd, stdout=handle,
+                                      stderr=subprocess.PIPE, timeout=timeout)
+        else:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except FileNotFoundError as exc:
         raise RcloneError(
             f"rclone not found (tried: {rclone_bin()!r}) — install it, or point "
@@ -209,8 +220,11 @@ def rclone(*args: str, timeout: int = 120, check: bool = True) -> subprocess.Com
     except subprocess.TimeoutExpired as exc:
         raise RcloneError(f"rclone timed out after {timeout}s: {' '.join(args[:2])}") from exc
     if check and proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout).strip().splitlines()
-        tail = detail[-1][:200] if detail else "(no output)"
+        detail = proc.stderr or proc.stdout or ""
+        if isinstance(detail, bytes):
+            detail = detail.decode("utf-8", "replace")
+        lines = detail.strip().splitlines()
+        tail = lines[-1][:200] if lines else "(no output)"
         raise RcloneError(f"rclone {' '.join(args[:2])} failed (rc={proc.returncode}): {tail}")
     return proc
 
@@ -423,8 +437,70 @@ def classify_ledger(local_map: dict, remote_map: dict, ledger: dict) -> list:
 # transfers — the only code that moves session bytes
 # ---------------------------------------------------------------------------
 
+def find_sessions(prefix: str, local_map: dict, remote_map: dict) -> list:
+    """Rows whose session id starts with prefix. Callers turn zero/multiple
+    matches into their own error."""
+    rows = classify_ledger(local_map, remote_map, load_ledger())
+    return [r for r in rows if r["id"].startswith(prefix)]
+
+
+def find_one_session(args_session: str, local_map: dict, remote_map: dict):
+    """resolve/diff share this: exactly one match or a printed error."""
+    rows = find_sessions(args_session, local_map, remote_map)
+    if not rows:
+        fail(f"no session id starts with {args_session!r}")
+        return None
+    if len(rows) > 1:
+        fail(f"ambiguous id prefix {args_session!r} — matches:")
+        for row in rows:
+            say(f"  {row['project']}/{row['id']}")
+        return None
+    return rows[0]
+
+
 def local_session_path(project: str, sid: str) -> Path:
     return claude_dir() / "projects" / project / f"{sid}.jsonl"
+
+
+# ---------------------------------------------------------------------------
+# transcript inspection (diff)
+# ---------------------------------------------------------------------------
+
+def inspect_transcript(path: Path) -> dict:
+    """Message count + last user/assistant text, streaming (transcripts can
+    be tens of MB). Meta entries and tool wrappers don't count."""
+    count = 0
+    last = ""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if entry.get("type") not in ("user", "assistant") or entry.get("isMeta"):
+                    continue
+                text = extract_text((entry.get("message") or {}).get("content")).strip()
+                if not text:
+                    continue
+                count += 1
+                last = text
+    except OSError:
+        pass
+    return {"messages": count, "last": " ".join(last.split())[:70]}
+
+
+def fetch_remote_transcript(cfg: dict, project: str, sid: str) -> Path:
+    """Download a transcript for inspection; caller removes the temp file."""
+    fd, name = tempfile.mkstemp(prefix=f"sessium-{sid[:8]}-")
+    os.close(fd)
+    path = Path(name)
+    rclone("cat", drive_url(cfg, f"projects/{project}/{sid}.jsonl"),
+           timeout=300, to_file=str(path))
+    return path
 
 
 def upload_session(cfg: dict, project: str, sid: str, local_path: str) -> None:
@@ -861,6 +937,179 @@ def cmd_sync(args) -> int:
     return 1 if failures else 0
 
 
+def cmd_diff(args) -> int:
+    """Side-by-side local vs remote vs last-synced for one session."""
+    cfg = load_config()
+    try:
+        remote_map = remote_sessions(cfg)
+    except RcloneError as exc:
+        fail(f"cannot reach Drive: {exc}")
+        return 1
+    row = find_one_session(args.session, local_sessions(), remote_map)
+    if row is None:
+        return 1
+    project, sid = row["project"], row["id"]
+    say(f"session {sid}")
+    say(f"  project     {project}")
+    say(f"  state       {fmt_state(row['state'])}")
+    for side, sess in (("local", row["local"]), ("remote", row["remote"])):
+        if not sess:
+            say(f"  {side:<9}  (absent)")
+            continue
+        if side == "local":
+            info = inspect_transcript(Path(sess["path"]))
+        else:
+            tmp = fetch_remote_transcript(cfg, project, sid)
+            try:
+                info = inspect_transcript(tmp)
+            finally:
+                tmp.unlink(missing_ok=True)
+        say(f"  {side:<9}  {human_size(sess['size'])}  {fmt_time(mtime_of(sess))}"
+            f"  {info['messages']} msgs")
+        if info["last"]:
+            say(f"            last: {info['last']}")
+    entry = row["entry"]
+    if entry:
+        say(f"  ledger      last synced {entry.get('last_synced', '?')}  "
+            f"local_md5 {(entry.get('local_md5') or '')[:12]}  "
+            f"remote_md5 {(entry.get('remote_md5') or '')[:12]}")
+    else:
+        say("  ledger      no record yet")
+    return 0
+
+
+def cmd_resolve(args) -> int:
+    """Manually resolve one conflicted session: [L]ocal / [R]emote / [B]oth /
+    [S]kip. The losing copy always lands in revert/."""
+    cfg = load_config()
+    try:
+        remote_map = remote_sessions(cfg)
+    except RcloneError as exc:
+        fail(f"cannot reach Drive: {exc}")
+        return 1
+    row = find_one_session(args.session, local_sessions(), remote_map)
+    if row is None:
+        return 1
+    if row["state"] != "conflict":
+        say(f"{row['project']}/{row['id']} is {fmt_state(row['state'])} — "
+            "nothing to resolve")
+        return 0
+    choice = ask_conflict(row)
+    if choice == "skip":
+        warn("skipped — session left diverged")
+        return 0
+    ledger = load_ledger()
+    outcome = apply_conflict(cfg, row, choice, ledger)
+    save_ledger(ledger)
+    ok(f"resolved {row['project']}/{short_id(row['id'])}: {outcome}")
+    return 0
+
+
+def cmd_revert(args) -> int:
+    """List a session's revert copies and swap the chosen one back in.
+    The copy being replaced is itself moved to revert/ first, so nothing
+    is ever lost by reverting."""
+    prefix = args.session
+    found = []
+    root = claude_dir() / "projects"
+    if root.is_dir():
+        for project in sorted(root.iterdir()):
+            rdir = project / "revert"
+            if not rdir.is_dir():
+                continue
+            for path in sorted(rdir.glob("*.revert-*.jsonl")):
+                if path.name.startswith(prefix):
+                    found.append((project.name, path))
+    if not found:
+        fail(f"no revert copies match {prefix!r}")
+        return 1
+    keys = sorted({(proj, path.name.split(".revert-")[0]) for proj, path in found})
+    if len(keys) > 1:
+        fail(f"ambiguous id prefix {prefix!r} — matches:")
+        for proj, sid in keys:
+            say(f"  {proj}/{sid}")
+        return 1
+    project, sid = keys[0]
+    copies = [path for proj, path in found if proj == project]
+    say(f"revert copies of {sid} ({project}):")
+    for i, path in enumerate(copies, 1):
+        say(f"  {i}. {path.name}  {human_size(path.stat().st_size)}  "
+            f"{fmt_time(path.stat().st_mtime)}")
+    try:
+        raw = input("number to restore (or q to cancel): ").strip().lower()
+    except EOFError:
+        raw = "q"
+    if raw in ("q", "quit", ""):
+        say("cancelled — nothing changed")
+        return 0
+    if not raw.isdigit() or not (1 <= int(raw) <= len(copies)):
+        fail(f"not a valid choice: {raw!r}")
+        return 1
+    chosen = copies[int(raw) - 1]
+    target = local_session_path(project, sid)
+    if target.exists():                       # preserve what it replaces
+        save_local_revert(project, sid, target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    chosen.replace(target)
+    ok(f"restored {chosen.name} → {target}")
+    ledger = load_ledger()
+    entry = ledger.get("sessions", {}).get(ledger_key(project, sid))
+    if entry:
+        # local copy changed on purpose; leave remote_md5 so next sync pushes
+        entry["local_md5"] = md5_of(target)
+        save_ledger(ledger)
+        say("next: 'sessium sync' pushes the restored copy to Drive")
+    return 0
+
+
+def cmd_adopt(args) -> int:
+    """Copy sessions pulled under another machine's munged project folder
+    into this machine's, so `claude --resume` can see them. Never deletes
+    and never clobbers a different existing copy."""
+    src = args.source
+    repo = os.path.abspath(os.path.expanduser(args.repo_path))
+    dest = munge(repo)
+    root = claude_dir() / "projects"
+    src_dir = root / src
+    if not src_dir.is_dir():
+        fail(f"no project folder {src!r} under {root}")
+        if root.is_dir():
+            say("available folders:")
+            for p in sorted(root.iterdir()):
+                if p.is_dir():
+                    say(f"  {p.name}")
+        return 1
+    if src == dest:
+        say(f"already matches this machine's path ({dest}) — nothing to do")
+        return 0
+    copied = already = 0
+    for item in sorted(src_dir.iterdir()):
+        if item.name == "revert":
+            continue                          # machine-local quarantines
+        target = root / dest / item.name
+        if item.is_file() and item.suffix == ".jsonl":
+            if target.exists():
+                if md5_of(target) == md5_of(item):
+                    already += 1
+                else:
+                    warn(f"kept both: {item.name} differs from the copy already "
+                         f"at the destination")
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(item, target)
+            copied += 1
+        elif item.is_dir():
+            if target.exists():
+                warn(f"folder {item.name}/ already exists at the destination "
+                     "— left as is")
+                continue
+            shutil.copytree(item, target)
+            copied += 1
+    say(f"adopted {src} → {dest}: {copied} copied, {already} already present")
+    say(f"next: cd {repo} && claude --resume")
+    return 0
+
+
 def cmd_setup(args) -> int:
     """Delegate to the platform installer (setup-ubuntu.sh on Linux)."""
     script = Path(__file__).resolve().parent.parent / "setup-ubuntu.sh"
@@ -912,6 +1161,26 @@ def build_parser() -> argparse.ArgumentParser:
     p_sync.add_argument("--interactive", action="store_true",
                         help="force conflict prompts even without a terminal")
     p_sync.set_defaults(func=cmd_sync)
+
+    p_diff = sub.add_parser("diff", help="local vs remote vs ledger for one session")
+    p_diff.add_argument("session", metavar="ID", help="session id (prefix ok)")
+    p_diff.set_defaults(func=cmd_diff)
+
+    p_resolve = sub.add_parser("resolve", help="manually resolve a conflicted session")
+    p_resolve.add_argument("session", metavar="ID", help="session id (prefix ok)")
+    p_resolve.set_defaults(func=cmd_resolve)
+
+    p_revert = sub.add_parser("revert", help="restore a losing copy from revert/")
+    p_revert.add_argument("session", metavar="ID", help="session id (prefix ok)")
+    p_revert.set_defaults(func=cmd_revert)
+
+    p_adopt = sub.add_parser(
+        "adopt", help="rehome sessions pulled for another machine's repo path")
+    p_adopt.add_argument("source", metavar="MUNGED",
+                         help="munged project folder as pulled from Drive")
+    p_adopt.add_argument("repo_path", metavar="PATH",
+                         help="this machine's actual path for that repo")
+    p_adopt.set_defaults(func=cmd_adopt)
 
     p_setup = sub.add_parser("setup", help="run the platform installer (rclone + OAuth)")
     p_setup.add_argument("--check-only", action="store_true",
