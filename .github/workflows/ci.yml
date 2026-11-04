@@ -1,0 +1,52 @@
+# sessium CI — runs on every push to master and every PR.
+#
+# linux:   the full hermetic Python test suite (34+ tests).
+# windows: parse-checks sessium.ps1, then runs the same hermetic engine
+#          round-trip through the PowerShell port using the fake rclone
+#          stub — real Windows verification without owning a Windows box.
+
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Run test suite
+        run: python3 tests/run_tests.py
+
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Parse-check sessium.ps1
+        run: |
+          $errs = $null
+          $null = [System.Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path $PWD "windows" | Join-Path -ChildPath "sessium.ps1"),
+            [ref]$null, [ref]$errs)
+          if ($errs.Count) {
+            $errs | ForEach-Object { Write-Host "$($_.Extent.StartLineNumber): $($_.Message)" }
+            exit 1
+          }
+          Write-Host "sessium.ps1 parses clean"
+      - name: Windows wrapper for the fake rclone stub
+        run: |
+          Set-Content -Path "$PWD/tests/fake_rclone.cmd" `
+            -Value "@python `"$PWD\tests\fake_rclone`" %*"
+      - name: Hermetic engine round-trip (smoke)
+        run: ./tests/ci_smoke.ps1

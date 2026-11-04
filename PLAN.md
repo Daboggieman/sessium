@@ -4,7 +4,7 @@
 tree is the "repo", Google Drive (via rclone) is the "remote", and `sessium`
 is the CLI that pushes, pulls, diffs and resolves sessions between them.
 
-**Status:** approved (decisions locked 2026-11-03, see §8). Phase 0 done; Phases 1–3 done — `linux/sessium` covers list/status/check/setup, ledger-driven push/pull/sync with conflict resolution (newest-wins, revert copies), and diff/resolve/revert/adopt; the legacy `push.sh`/`pull.sh`/`restore-session.sh` are archived. Verified by a 34-test suite including a two-machine simulation (`tests/`). Phase 4 written — `windows/sessium.ps1` (+ `sessium.cmd` shim, `install.ps1`) implements SPEC.md; structurally verified (bracket balance, 5.1-compat review) but needs a real Windows box for the dry-run pass. Real-Drive verification of sync pending the OAuth re-setup. Phase 5 (polish) next.
+**Status:** approved (decisions locked 2026-11-03, see §8). Phases 0–4 done — `linux/sessium` (all 11 commands, ledger sync engine, 34-test suite with two-machine simulation) and `windows/sessium.ps1` (structurally verified; runtime verification via CI pending). A major feature work order was approved 2026-11-04 — **the feature-by-feature tracker now lives in `docs/BUILD.md`**; PLAN.md keeps the concept, decisions and phases only.
 
 ---
 
@@ -128,6 +128,7 @@ sessium/
 - **Phase 3 — Linux finish:** `diff`, `resolve`, `revert`, `adopt`; move `push.sh`/`pull.sh`/`restore-session.sh` into `archive/`. *Verify: same simulation, plus adopting this very session.*
 - **Phase 4 — Windows version:** `windows/sessium.ps1` implementing SPEC.md. *Verify: on a Windows box (yours or a VM); here we verify syntax + dry-run paths only.*
 - **Phase 5 — polish:** `--json` output for scripting, `--quiet` cron mode, shell completions, examples, screenshot-worthy README.
+- **Phases 6+ — feature era (2026-11-04 work order):** CI, search (+seeker), snapshots/history, scheduled sync, hooks, encryption, export/web viewer, onboard, release engineering — tracked batch-by-batch in `docs/BUILD.md` §2.
 
 ## 8. Decisions (made 2026-11-03)
 

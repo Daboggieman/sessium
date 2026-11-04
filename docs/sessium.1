@@ -1,0 +1,149 @@
+.\" Manual page for sessium.
+.\" View with:  man docs/sessium.1
+.TH SESSIUM 1 "2026-11-04" "sessium 0.1.0" "User Commands"
+.SH NAME
+sessium \- git-like version control for Claude Code sessions, with Google Drive as the remote
+.SH SYNOPSIS
+.B sessium
+.I command
+.RI [ args ]
+.SH DESCRIPTION
+.B sessium
+backs up Claude Code conversations to Google Drive (via
+.BR rclone (1))
+and restores them on any machine. Your
+.I ~/.claude/projects
+tree is the "repo", Drive is the "remote", and a per-machine ledger
+(~/.local/state/sessium/state.json) records what was last synced — the
+".git" of the arrangement.
+.PP
+A session id is the transcript file's UUID stem. A prefix of it is accepted
+wherever an
+.I id
+argument appears. A project's
+.I munged
+name is its absolute path with every "/" replaced by "\-" (leading slash
+included), e.g. \fI/home/me/repo\fR → \fI\-home\-me\-repo\fR. Windows munges
+every separator and the drive colon the same way.
+.SH COMMANDS
+.TP
+.BR list " [\-\-titles] [\-\-project " \fImunged\fR "]"
+List every session found locally or on Drive, newest first. With
+.B \-\-titles
+shows each session's first real user message. Alias:
+.BR log .
+.TP
+.BR status " [\-\-project " \fImunged\fR "]"
+Classify every session against the ledger and Drive: in-sync, push, pull,
+CONFLICT, new-here, new-there. Read-only; never touches anything.
+.TP
+.B check
+Six-step self-test: rclone present, remote reachable, folder exists, local
+claude dir, ledger, session counts.
+.TP
+.BR setup " [\-\-check\-only]"
+Run setup\-ubuntu.sh (interactive rclone install + Drive OAuth).
+.TP
+.BR push " [\-\-project " \fImunged\fR "]"
+Upload new and locally-changed sessions. Conflicts are
+.B skipped
+with a warning — sync or resolve decides them. Never deletes from Drive.
+.TP
+.BR pull " [\-\-project " \fImunged\fR "]"
+Download new and remotely-changed sessions. Skips conflicts like push.
+.TP
+.BR sync " [\-\-interactive] [\-\-project " \fImunged\fR "]"
+Push and pull what changed in one pass, and
+.B decide conflicts:
+on a terminal it prompts
+.BR [L]ocal / [R]emote / [B]oth " "(newest " wins ") / [S]kip ;
+without one (cron, pipes) the newest copy wins automatically. The losing
+copy is never deleted — it becomes a revert file.
+.TP
+.BR diff " <id> [\-\-project " \fImunged\fR "]"
+Show one session side by side: local vs remote size, mtime, message count,
+last snippet, and the ledger's record.
+.TP
+.BR resolve " <id> [\-\-interactive]"
+Manually decide a conflicted session (same prompt as sync). Non-conflicted
+sessions are a no-op.
+.TP
+.B revert " <id>"
+List the session's revert copies (kept when conflicts were resolved) and
+swap the chosen one back in; the copy it replaces is itself kept. Afterwards
+.B sessium sync
+pushes the restored copy.
+.TP
+.BR adopt " <munged-folder> <repo-path>"
+Rehome sessions pulled for a different machine path so
+.B claude \-\-resume
+finds them here: copies transcripts and data folders (never the machine-local
+revert/) under this machine's munged name. Identical files are skipped,
+differing ones are kept
+.B both
+(yours untouched).
+.TP
+.B open " <id>"
+Resume helper: resolve the session's project path and print the
+.B cd + claude \-\-resume
+command line to bring that conversation back up here.
+.TP
+.BR search " <query> [\-\-project " \fImunged\fR "] [\-\-limit N] [\-\-semantic]"
+Search sessions: title matches outrank body matches. With
+.B \-\-semantic
+(and seeker configured) queries a self-hosted seeker engine for semantic
+matching instead of literal text.
+.TP
+.B version
+Print the version.
+.SH OPTIONS
+.TP
+.B \-\-project " " \fImunged\fR
+Restrict a command to one project. Munged names start with "\-", which is
+handled correctly in both space and equals forms.
+.TP
+.B \-\-json
+Machine-readable output (list, status, diff, search). Schema in SPEC.md §9.
+.TP
+.B \-\-dry\-run
+Print exactly what the command would do — push, pull, sync, revert, adopt —
+and change nothing.
+.TP
+.B \-\-interactive
+Force the conflict prompt even when no terminal is attached.
+.TP
+.B \-\-debug
+Print every rclone invocation.
+.TP
+.B \-\-titles
+(list) Show session titles.
+.SH ENVIRONMENT
+.TP
+.B SESSIUM_CLAUDE_DIR
+Claude data root (default ~/.claude).
+.TP
+.B SESSIUM_CONFIG
+Config file path (default ~/.config/sessium/config.json).
+.TP
+.B SESSIUM_STATE
+Ledger path (default ~/.local/state/sessium/state.json).
+.TP
+.B SESSIUM_RCLONE_BIN
+rclone binary (default "rclone" on PATH).
+.SH FILES
+.TP
+.I ~/.config/sessium/config.json
+{"rclone_remote": "...", "drive_folder": "..."}; legacy ~/sessium/config.sh
+(DRIVE_REMOTE / DRIVE_DIR) still read as a fallback.
+.TP
+.I ~/.local/state/sessium/state.json
+The ledger — per-machine, never synced.
+.TP
+.I ~/.claude/projects/<munged>/revert/
+Machine-local revert copies; never synced.
+.SH EXIT STATUS
+0 on success — skips are not failures. 1 on real failures. 130 when
+interrupted.
+.SH SEE ALSO
+rclone(1), claude(1). Project docs: README.md, SPEC.md, PLAN.md,
+docs/BUILD.md in the repository.
