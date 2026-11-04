@@ -8,8 +8,8 @@ directory on disk (FAKE_DRIVE_ROOT) that mirrors the Drive folder layout:
 
 Supported: version, lsd <remote>:, lsf <remote>:<path>, lsjson [--recursive]
 [--hash] <remote>:<path>, copyto <src> <dst> (src/dst may be local or
-remote:...). Everything else exits 1 — deliberately, so tests catch sessium
-calling something new before the stub learns it.
+remote:...), cat <remote>:<path>. Everything else exits 1 — deliberately, so
+tests catch sessium calling something new before the stub learns it.
 """
 import hashlib
 import json
@@ -90,6 +90,13 @@ def main() -> None:
         want_hash = "--hash" in rest
         positional = [a for a in rest if not a.startswith("--")]
         list_dir_json(split_remote(positional[0]), recursive, want_hash)
+        return
+    if args[0] == "cat":
+        target = split_remote(args[1])
+        if not target.is_file():
+            print(f"file not found: {target}", file=sys.stderr)
+            sys.exit(1)
+        sys.stdout.write(target.read_text(encoding="utf-8"))
         return
     if args[0] == "copyto":
         src, dst = args[1], args[2]

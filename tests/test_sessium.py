@@ -271,6 +271,9 @@ class SyncBase(unittest.TestCase):
         self.assertEqual(run_sessium(self.env(self.a), "push").returncode, 0)
         self.assertEqual(run_sessium(self.env(self.b), "pull").returncode, 0)
 
+class SyncTests(SyncBase):
+    """Phase 2: ledger, push/pull/sync, conflict resolution."""
+
     def test_push_then_pull_roundtrip(self):
         self.local_file(self.a, "aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
         p = run_sessium(self.env(self.a), "push")
@@ -400,6 +403,132 @@ class SyncBase(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn("push: 1", p.stdout)
         self.assertIn("pull: 1", p.stdout)
+
+
+class Phase3Tests(SyncBase):
+    """Phase 3: diff, resolve, revert, adopt."""
+
+    def _conflict(self):
+        """Baseline + both sides edited, remote pushed last (remote newer)."""
+        self._baseline_conflict()
+        self.local_file(self.a, "aaa").write_text("A was here\n", encoding="utf-8")
+        self.local_file(self.b, "aaa").write_text("B was here\n", encoding="utf-8")
+        self.assertEqual(run_sessium(self.env(self.b), "push").returncode, 0)
+
+    def test_diff_shows_sides_and_state(self):
+        self._conflict()
+        p = run_sessium(self.env(self.a), "diff", "aaa")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("CONFLICT", p.stdout)
+        self.assertIn("local", p.stdout)
+        self.assertIn("remote", p.stdout)
+        self.assertIn("last synced", p.stdout)      # A's ledger has the baseline
+
+    def test_diff_ambiguous_prefix(self):
+        self._baseline_conflict()
+        self.local_file(self.a, "aab").write_text(SESSION_ONLY_COMMANDS,
+                                                  encoding="utf-8")
+        p = run_sessium(self.env(self.a), "diff", "aa")
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("ambiguous", p.stderr)
+
+    def test_resolve_takes_remote(self):
+        self._conflict()
+        p = run_sessium(self.env(self.a), "resolve", "aaa", stdin_text="R\n")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("remote wins", p.stdout)
+        self.assertEqual(self.local_file(self.a, "aaa").read_text(encoding="utf-8"),
+                         "B was here\n")
+        rev = self.revert_files(self.a, "aaa")
+        self.assertEqual(len(rev), 1)
+        self.assertEqual(rev[0].read_text(encoding="utf-8"), "A was here\n")
+
+    def test_resolve_takes_local(self):
+        self._conflict()
+        p = run_sessium(self.env(self.a), "resolve", "aaa", stdin_text="L\n")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("local wins", p.stdout)
+        self.assertEqual(self.drive_file("aaa").read_text(encoding="utf-8"),
+                         "A was here\n")
+
+    def test_resolve_not_conflicted_is_noop(self):
+        self._baseline_conflict()
+        p = run_sessium(self.env(self.a), "resolve", "aaa", stdin_text="L\n")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("nothing to resolve", p.stdout)
+
+    def test_revert_swaps_back(self):
+        self._conflict()
+        self.assertEqual(run_sessium(self.env(self.a), "resolve", "aaa",
+                                     stdin_text="R\n").returncode, 0)
+        # now local == remote ("B was here"); A's copy sits in revert/
+        p = run_sessium(self.env(self.a), "revert", "aaa", stdin_text="1\n")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(self.local_file(self.a, "aaa").read_text(encoding="utf-8"),
+                         "A was here\n")             # the loser is back
+        rev = self.revert_files(self.a, "aaa")       # what it replaced
+        self.assertEqual(len(rev), 1)
+        self.assertEqual(rev[0].read_text(encoding="utf-8"), "B was here\n")
+        import hashlib
+        entry = self.ledger(self.a)["sessions"][f"{PROJ}/aaa"]
+        self.assertEqual(entry["local_md5"],
+                         hashlib.md5(b"A was here\n").hexdigest())
+
+    def test_revert_cancel_keeps_everything(self):
+        self._conflict()
+        self.assertEqual(run_sessium(self.env(self.a), "resolve", "aaa",
+                                     stdin_text="R\n").returncode, 0)
+        p = run_sessium(self.env(self.a), "revert", "aaa", stdin_text="q\n")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("cancelled", p.stdout)
+        self.assertEqual(len(self.revert_files(self.a, "aaa")), 1)
+
+    def test_revert_no_copies(self):
+        self._baseline_conflict()
+        p = run_sessium(self.env(self.a), "revert", "zzz")
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("no revert copies", p.stderr)
+
+    def test_adopt_copies_into_machine_path(self):
+        old = "-home-oldmachine-proj"
+        old_dir = self.b["claude"] / "projects" / old
+        old_dir.mkdir(parents=True)
+        (old_dir / "sss.jsonl").write_text(SESSION_WITH_TITLE, encoding="utf-8")
+        (old_dir / "memory").mkdir()
+        (old_dir / "memory" / "MEMORY.md").write_text("# mem\n", encoding="utf-8")
+        p = run_sessium(self.env(self.b), "adopt", old, "/home/other/repo")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        new_dir = self.b["claude"] / "projects" / "-home-other-repo"
+        self.assertTrue((new_dir / "sss.jsonl").is_file())
+        self.assertEqual((new_dir / "memory" / "MEMORY.md").read_text(encoding="utf-8"),
+                         "# mem\n")
+        # adopt copies, never moves
+        self.assertTrue((old_dir / "sss.jsonl").is_file())
+        self.assertIn("cd /home/other/repo", p.stdout)
+
+    def test_adopt_skips_differing_copy(self):
+        old = "-home-oldmachine-proj"
+        old_dir = self.b["claude"] / "projects" / old
+        old_dir.mkdir(parents=True)
+        (old_dir / "sss.jsonl").write_text("incoming version\n", encoding="utf-8")
+        dest = self.b["claude"] / "projects" / "-home-other-repo"
+        dest.mkdir(parents=True)
+        (dest / "sss.jsonl").write_text("local version\n", encoding="utf-8")
+        p = run_sessium(self.env(self.b), "adopt", old, "/home/other/repo")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("kept both", p.stderr)
+        self.assertEqual((dest / "sss.jsonl").read_text(encoding="utf-8"),
+                         "local version\n")
+
+    def test_adopt_noop_when_path_matches(self):
+        p = run_sessium(self.env(self.b), "adopt", PROJ, "/home/test/proj")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("nothing to do", p.stdout)
+
+    def test_adopt_unknown_source_lists_folders(self):
+        p = run_sessium(self.env(self.b), "adopt", "-nope", "/home/x/repo")
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("available folders", p.stdout)
 
 
 if __name__ == "__main__":
