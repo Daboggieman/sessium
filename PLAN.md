@@ -4,7 +4,7 @@
 tree is the "repo", Google Drive (via rclone) is the "remote", and `sessium`
 is the CLI that pushes, pulls, diffs and resolves sessions between them.
 
-**Status:** approved (decisions locked 2026-11-03, see §8). Phase 0 done; Phases 1–3 done — `linux/sessium` covers list/status/check/setup, ledger-driven push/pull/sync with conflict resolution (newest-wins, revert copies), and diff/resolve/revert/adopt; the legacy `push.sh`/`pull.sh`/`restore-session.sh` are archived. Verified by a 34-test suite including a two-machine simulation (`tests/`). Real-Drive verification of sync pending the OAuth re-setup. Phase 4 (Windows version) next.
+**Status:** approved (decisions locked 2026-11-03, see §8). Phase 0 done; Phases 1–3 done — `linux/sessium` covers list/status/check/setup, ledger-driven push/pull/sync with conflict resolution (newest-wins, revert copies), and diff/resolve/revert/adopt; the legacy `push.sh`/`pull.sh`/`restore-session.sh` are archived. Verified by a 34-test suite including a two-machine simulation (`tests/`). Phase 4 written — `windows/sessium.ps1` (+ `sessium.cmd` shim, `install.ps1`) implements SPEC.md; structurally verified (bracket balance, 5.1-compat review) but needs a real Windows box for the dry-run pass. Real-Drive verification of sync pending the OAuth re-setup. Phase 5 (polish) next.
 
 ---
 

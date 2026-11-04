@@ -80,6 +80,8 @@ both machines changed the same session:
 
 - `linux/sessium` — the Linux CLI (installed to `~/.local/bin/sessium` by
   `install.sh`)
+- `windows/sessium.ps1` — the Windows CLI (`sessium.cmd` shim; `install.ps1`
+  copies both to `%USERPROFILE%\sessium` and adds it to your PATH)
 - `tests/` — hermetic test suite; `python3 tests/run_tests.py` (fake rclone,
   fake two-machine Drive, nothing touches your real `~/.claude`)
 - `setup-ubuntu.sh` / `setup-windows.ps1` — one-command interactive installers
