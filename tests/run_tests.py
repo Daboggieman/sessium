@@ -6,7 +6,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from test_sessium import UnitTests, CommandTests, SyncTests, Phase3Tests  # noqa: E402
+from test_sessium import (  # noqa: E402
+    UnitTests, CommandTests, SyncTests, Phase3Tests, Batch3Tests,
+)
 
 if __name__ == "__main__":
     loader = unittest.TestLoader()
@@ -15,5 +17,6 @@ if __name__ == "__main__":
     suite.addTests(loader.loadTestsFromTestCase(CommandTests))
     suite.addTests(loader.loadTestsFromTestCase(SyncTests))
     suite.addTests(loader.loadTestsFromTestCase(Phase3Tests))
+    suite.addTests(loader.loadTestsFromTestCase(Batch3Tests))
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     sys.exit(0 if result.wasSuccessful() else 1)

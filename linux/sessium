@@ -29,6 +29,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
+import urllib.error
+import urllib.request
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -98,7 +102,8 @@ def munge(project_path: str) -> str:
 
 def load_config() -> dict:
     """Effective config. Precedence: config.json > legacy sessium/config.sh > defaults."""
-    cfg = {"rclone_remote": "gdrive", "drive_folder": "claude-backup"}
+    cfg = {"rclone_remote": "gdrive", "drive_folder": "claude-backup",
+           "seeker_url": "", "seeker_token": ""}
     path = config_path()
     if path.is_file():
         try:
@@ -190,6 +195,60 @@ def record_bootstrap(ledger: dict, rows: list) -> int:
                         row["local"]["md5"], row["remote"]["md5"])
             n += 1
     return n
+
+
+# ---------------------------------------------------------------------------
+# transfer lock — one mutating transfer at a time (cron vs manual collision)
+# ---------------------------------------------------------------------------
+
+LOCK_STALE_SECONDS = 600
+
+
+class LockBusy(Exception):
+    pass
+
+
+@contextmanager
+def transfer_lock(dry_run: bool = False):
+    """Serialize push/pull/sync per machine with a lock file next to the
+    ledger. --dry-run mutates nothing and never locks. A lock older than
+    LOCK_STALE_SECONDS is treated as a crashed run and broken with a
+    warning; a fresh one is a hard error."""
+    if dry_run:
+        yield
+        return
+    lock = state_path().parent / "sync.lock"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    while True:
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            break
+        except FileExistsError:
+            try:
+                age = time.time() - lock.stat().st_mtime
+            except OSError:
+                continue                       # vanished between the calls
+            if age > LOCK_STALE_SECONDS:
+                warn(f"breaking stale lock {lock} ({age / 60:.0f} min old — "
+                     "likely a crashed run)")
+                try:
+                    lock.unlink()
+                except OSError:
+                    pass
+                continue
+            raise LockBusy(
+                f"another sessium transfer holds {lock} — wait for it, or "
+                "delete the file if that run is dead")
+    try:
+        os.write(fd, f"pid {os.getpid()} started "
+                     f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n".encode())
+        os.close(fd)
+        yield
+    finally:
+        try:
+            lock.unlink()
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -493,6 +552,30 @@ def inspect_transcript(path: Path) -> dict:
     return {"messages": count, "last": " ".join(last.split())[:70]}
 
 
+def session_cwd(path: Path, max_lines: int = 50) -> str:
+    """The repo path recorded in the transcript's entries (Claude Code stamps
+    a `cwd` on most lines). This is how `open` maps a session back to its
+    repo without having to reverse the lossy munging."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            for index, line in enumerate(handle):
+                if index >= max_lines:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                cwd = entry.get("cwd")
+                if isinstance(cwd, str) and cwd:
+                    return cwd
+    except OSError:
+        pass
+    return ""
+
+
 def fetch_remote_transcript(cfg: dict, project: str, sid: str) -> Path:
     """Download a transcript for inspection; caller removes the temp file."""
     fd, name = tempfile.mkstemp(prefix=f"sessium-{sid[:8]}-")
@@ -546,6 +629,35 @@ def save_remote_revert(cfg: dict, project: str, sid: str) -> Path:
 
 
 # ---------------------------------------------------------------------------
+# history — content-addressed snapshots of every replaced copy (SPEC §10)
+# ---------------------------------------------------------------------------
+
+def history_dir(project: str, sid: str) -> Path:
+    return claude_dir() / "projects" / project / sid / "history"
+
+
+def snapshot_history(project: str, sid: str, src: Path) -> Path | None:
+    """Keep the bytes of a copy that is about to be (or was just) replaced,
+    content-addressed: <seq>-<md5[:8]>.jsonl. Identical content lands under
+    an identical name — the second save is a free dedup no-op. Never touches
+    the ledger. Returns the new snapshot, or None when it already existed."""
+    try:
+        digest = md5_of(src)
+    except OSError:
+        return None
+    hdir = history_dir(project, sid)
+    hdir.mkdir(parents=True, exist_ok=True)
+    suffix = f"-{digest[:8]}.jsonl"
+    for existing in hdir.glob("*.jsonl"):
+        if existing.name.endswith(suffix):
+            return None                    # these bytes are already kept
+    seq = len(list(hdir.glob("*.jsonl"))) + 1
+    dst = hdir / f"{seq:04d}-{digest[:8]}.jsonl"
+    shutil.copy2(src, dst)                 # copy: the source lives in revert/
+    return dst
+
+
+# ---------------------------------------------------------------------------
 # formatting
 # ---------------------------------------------------------------------------
 
@@ -578,6 +690,24 @@ def fmt_state(state: str) -> str:
     }.get(state, state)
 
 
+def iso_time(value) -> str | None:
+    """JSON-safe UTC timestamp from an epoch float, a datetime, or nothing
+    (SPEC §9 --json rows always carry mtimes in this form)."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        return datetime.fromtimestamp(
+            value, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
+def emit_json(data) -> None:
+    print(json.dumps(data, indent=2, sort_keys=True))
+
+
 # ---------------------------------------------------------------------------
 # commands
 # ---------------------------------------------------------------------------
@@ -588,6 +718,23 @@ def cmd_list(args) -> int:
     if args.project and not local_map:
         fail(f"no local project folder named {args.project!r}")
         return 1
+    if getattr(args, "json", False):
+        rows = []
+        for project, sessions in local_map.items():
+            for s in sessions:
+                row = {
+                    "project": project,
+                    "id": s["id"],
+                    "path": s["path"],
+                    "size": s["size"],
+                    "mtime": iso_time(s["mtime"]),
+                }
+                if args.titles:
+                    row["title"] = session_title(Path(s["path"]))
+                rows.append(row)
+        rows.sort(key=lambda r: r["mtime"] or "", reverse=True)
+        emit_json(rows)
+        return 0
     total = 0
     for project, sessions in local_map.items():
         if not sessions:
@@ -615,17 +762,45 @@ def cmd_status(args) -> int:
     """Compare local sessions against Drive, classified by the ledger."""
     cfg = load_config()
     local_map = filter_map(local_sessions(), args.project)
+    reachable = True
     try:
         remote_map = filter_map(remote_sessions(cfg), args.project)
     except RcloneError as exc:
         warn(f"cannot reach Drive right now: {exc}")
         warn("showing local-only view — run 'sessium check' for details")
         remote_map = {}
+        reachable = False
 
     rows = classify_ledger(local_map, remote_map, load_ledger())
     counts = {}
     for row in rows:
         counts[row["state"]] = counts.get(row["state"], 0) + 1
+
+    if getattr(args, "json", False):
+        emit_json({
+            "remote": drive_url(cfg),
+            "reachable": reachable,
+            "projects": len(set(local_map) | set(remote_map)),
+            "sessions": len(rows),
+            "counts": counts,
+            "rows": [{
+                "project": r["project"],
+                "id": r["id"],
+                "state": r["state"],
+                "local": None if not r["local"] else {
+                    "size": r["local"]["size"],
+                    "md5": r["local"]["md5"],
+                    "mtime": iso_time(r["local"]["mtime"]),
+                },
+                "remote": None if not r["remote"] else {
+                    "size": r["remote"]["size"],
+                    "md5": r["remote"]["md5"],
+                    "mtime": iso_time(r["remote"]["mtime"]),
+                },
+                "last_synced": (r["entry"] or {}).get("last_synced"),
+            } for r in sorted(rows, key=lambda r: (r["project"], r["id"]))],
+        })
+        return 0
 
     say(f"remote: {drive_url(cfg)}")
     summary = "   ".join(f"{fmt_state(k)}: {v}" for k, v in sorted(counts.items()))
@@ -717,90 +892,103 @@ def cmd_push(args) -> int:
     """Upload new/changed sessions to Drive. Never overwrites a remote copy
     that changed on its own — conflicts are skipped (use sync/resolve)."""
     cfg = load_config()
-    local_map = filter_map(local_sessions(), args.project)
-    try:
-        remote_map = filter_map(remote_sessions(cfg), args.project)
-    except RcloneError as exc:
-        fail(f"cannot reach Drive: {exc}")
-        return 1
-    ledger = load_ledger()
-    rows = classify_ledger(local_map, remote_map, ledger)
-
-    pushed = conflicts = failures = 0
-    ledger_dirty = False
-    for row in rows:
-        label = f"{row['project']}/{short_id(row['id'])}"
-        if row["state"] == "conflict":
-            conflicts += 1
-            warn(f"skipped CONFLICT {label} — 'sessium sync' or 'sessium "
-                 "resolve' decides it")
-            continue
-        if row["state"] not in ("push", "new-here"):
-            continue
+    with transfer_lock(args.dry_run):
+        local_map = filter_map(local_sessions(), args.project)
         try:
-            upload_session(cfg, row["project"], row["id"], row["local"]["path"])
-            record_sync(ledger, row["project"], row["id"],
-                        row["local"]["md5"], row["local"]["md5"])
-            ledger_dirty = True
-            pushed += 1
-            ok(f"pushed {label} ({human_size(row['local']['size'])})")
+            remote_map = filter_map(remote_sessions(cfg), args.project)
         except RcloneError as exc:
-            warn(f"push failed {label}: {exc}")
-            failures += 1
+            fail(f"cannot reach Drive: {exc}")
+            return 1
+        ledger = load_ledger()
+        rows = classify_ledger(local_map, remote_map, ledger)
 
-    # bootstrap rule: matching copies with no record are recorded, not pushed
-    if record_bootstrap(ledger, rows):
-        ledger_dirty = True
-    if ledger_dirty:
-        save_ledger(ledger)
-    in_sync = sum(1 for r in rows if r["state"] == "in-sync")
-    say(transfer_summary(pushed, 0, conflicts, in_sync, failures))
-    return 1 if failures else 0
+        pushed = conflicts = failures = 0
+        ledger_dirty = False
+        for row in rows:
+            label = f"{row['project']}/{short_id(row['id'])}"
+            if row["state"] == "conflict":
+                conflicts += 1
+                warn(f"skipped CONFLICT {label} — 'sessium sync' or 'sessium "
+                     "resolve' decides it")
+                continue
+            if row["state"] not in ("push", "new-here"):
+                continue
+            if args.dry_run:
+                say(f"would push {label} ({human_size(row['local']['size'])})")
+                pushed += 1
+                continue
+            try:
+                upload_session(cfg, row["project"], row["id"],
+                               row["local"]["path"])
+                record_sync(ledger, row["project"], row["id"],
+                            row["local"]["md5"], row["local"]["md5"])
+                ledger_dirty = True
+                pushed += 1
+                ok(f"pushed {label} ({human_size(row['local']['size'])})")
+            except RcloneError as exc:
+                warn(f"push failed {label}: {exc}")
+                failures += 1
+
+        # bootstrap rule: matching copies with no record are recorded, not pushed
+        if not args.dry_run and record_bootstrap(ledger, rows):
+            ledger_dirty = True
+        if ledger_dirty:
+            save_ledger(ledger)
+        in_sync = sum(1 for r in rows if r["state"] == "in-sync")
+        say(("dry-run: " if args.dry_run else "")
+            + transfer_summary(pushed, 0, conflicts, in_sync, failures))
+        return 1 if failures else 0
 
 
 def cmd_pull(args) -> int:
     """Download new/changed sessions from Drive. Local copies that changed on
     their own are left alone — conflicts are skipped (use sync/resolve)."""
     cfg = load_config()
-    local_map = filter_map(local_sessions(), args.project)
-    try:
-        remote_map = filter_map(remote_sessions(cfg), args.project)
-    except RcloneError as exc:
-        fail(f"cannot reach Drive: {exc}")
-        return 1
-    ledger = load_ledger()
-    rows = classify_ledger(local_map, remote_map, ledger)
-
-    pulled = conflicts = failures = 0
-    ledger_dirty = False
-    for row in rows:
-        label = f"{row['project']}/{short_id(row['id'])}"
-        if row["state"] == "conflict":
-            conflicts += 1
-            warn(f"skipped CONFLICT {label} — 'sessium sync' or 'sessium "
-                 "resolve' decides it")
-            continue
-        if row["state"] not in ("pull", "new-there"):
-            continue
-        path = local_session_path(row["project"], row["id"])
+    with transfer_lock(args.dry_run):
+        local_map = filter_map(local_sessions(), args.project)
         try:
-            download_session(cfg, row["project"], row["id"], str(path))
-            record_sync(ledger, row["project"], row["id"],
-                        row["remote"]["md5"], row["remote"]["md5"])
-            ledger_dirty = True
-            pulled += 1
-            ok(f"pulled {label} ({human_size(row['remote']['size'])})")
+            remote_map = filter_map(remote_sessions(cfg), args.project)
         except RcloneError as exc:
-            warn(f"pull failed {label}: {exc}")
-            failures += 1
+            fail(f"cannot reach Drive: {exc}")
+            return 1
+        ledger = load_ledger()
+        rows = classify_ledger(local_map, remote_map, ledger)
 
-    if record_bootstrap(ledger, rows):
-        ledger_dirty = True
-    if ledger_dirty:
-        save_ledger(ledger)
-    in_sync = sum(1 for r in rows if r["state"] == "in-sync")
-    say(transfer_summary(0, pulled, conflicts, in_sync, failures))
-    return 1 if failures else 0
+        pulled = conflicts = failures = 0
+        ledger_dirty = False
+        for row in rows:
+            label = f"{row['project']}/{short_id(row['id'])}"
+            if row["state"] == "conflict":
+                conflicts += 1
+                warn(f"skipped CONFLICT {label} — 'sessium sync' or 'sessium "
+                     "resolve' decides it")
+                continue
+            if row["state"] not in ("pull", "new-there"):
+                continue
+            path = local_session_path(row["project"], row["id"])
+            if args.dry_run:
+                say(f"would pull {label} ({human_size(row['remote']['size'])})")
+                pulled += 1
+                continue
+            try:
+                download_session(cfg, row["project"], row["id"], str(path))
+                record_sync(ledger, row["project"], row["id"],
+                            row["remote"]["md5"], row["remote"]["md5"])
+                ledger_dirty = True
+                pulled += 1
+                ok(f"pulled {label} ({human_size(row['remote']['size'])})")
+            except RcloneError as exc:
+                warn(f"pull failed {label}: {exc}")
+                failures += 1
+
+        if not args.dry_run and record_bootstrap(ledger, rows):
+            ledger_dirty = True
+        if ledger_dirty:
+            save_ledger(ledger)
+        in_sync = sum(1 for r in rows if r["state"] == "in-sync")
+        say(("dry-run: " if args.dry_run else "")
+            + transfer_summary(0, pulled, conflicts, in_sync, failures))
+        return 1 if failures else 0
 
 
 def want_interactive(args) -> bool:
@@ -843,18 +1031,30 @@ def resolve_conflict(row: dict, interactive: bool) -> str:
     return "auto"
 
 
+def describe_conflict(row: dict) -> str:
+    """What apply_conflict's newest-wins default would do — for --dry-run,
+    which shows the decision it would make without making it."""
+    rt, lt = mtime_of(row["remote"]), mtime_of(row["local"])
+    if rt is not None and (lt is None or rt > lt):
+        return "remote wins (newer; local kept as revert)"
+    return "local wins (newer; remote kept as revert)"
+
+
 def apply_conflict(cfg: dict, row: dict, choice: str, ledger: dict) -> str:
-    """Execute a conflict choice; the losing copy is always preserved in the
-    project's revert/ folder. Returns a human label for the log line."""
+    """Execute a conflict choice; the losing copy is always preserved — in
+    revert/ (swap-back quarantine) and again in history/ (content-addressed
+    timeline, SPEC §10). Returns a human label for the log line."""
     project, sid = row["project"], row["id"]
     local, remote = row["local"], row["remote"]
     if choice == "local":
-        save_remote_revert(cfg, project, sid)
+        kept = save_remote_revert(cfg, project, sid)
+        snapshot_history(project, sid, kept)
         upload_session(cfg, project, sid, local["path"])
         record_sync(ledger, project, sid, local["md5"], local["md5"])
         return "local wins"
     if choice == "remote":
         saved = save_local_revert(project, sid, Path(local["path"]))
+        snapshot_history(project, sid, saved)
         download_session(cfg, project, sid, local["path"])
         record_sync(ledger, project, sid, remote["md5"], remote["md5"])
         return f"remote wins (local kept as {saved.name})"
@@ -862,10 +1062,12 @@ def apply_conflict(cfg: dict, row: dict, choice: str, ledger: dict) -> str:
     rt, lt = mtime_of(remote), mtime_of(local)
     if rt is not None and (lt is None or rt > lt):
         saved = save_local_revert(project, sid, Path(local["path"]))
+        snapshot_history(project, sid, saved)
         download_session(cfg, project, sid, local["path"])
         record_sync(ledger, project, sid, remote["md5"], remote["md5"])
         return f"remote wins (newer; local kept as {saved.name})"
-    save_remote_revert(cfg, project, sid)
+    kept = save_remote_revert(cfg, project, sid)
+    snapshot_history(project, sid, kept)
     upload_session(cfg, project, sid, local["path"])
     record_sync(ledger, project, sid, local["md5"], local["md5"])
     return "local wins (newer)"
@@ -875,66 +1077,122 @@ def cmd_sync(args) -> int:
     """The workhorse: pull what changed there, push what changed here,
     resolve conflicts (newest wins automatically, prompts on a terminal)."""
     cfg = load_config()
-    local_map = filter_map(local_sessions(), args.project)
-    try:
-        remote_map = filter_map(remote_sessions(cfg), args.project)
-    except RcloneError as exc:
-        fail(f"cannot reach Drive: {exc}")
-        return 1
-    ledger = load_ledger()
-    rows = classify_ledger(local_map, remote_map, ledger)
-    interactive = want_interactive(args)
-
-    pushed = pulled = resolved = skipped = failures = 0
-    ledger_dirty = False
-    for row in rows:
-        label = f"{row['project']}/{short_id(row['id'])}"
-        state = row["state"]
+    with transfer_lock(args.dry_run):
+        local_map = filter_map(local_sessions(), args.project)
         try:
-            if state == "in-sync":
-                if not row["entry"]:            # bootstrap: record, no action
-                    record_sync(ledger, row["project"], row["id"],
-                                row["local"]["md5"], row["remote"]["md5"])
-                    ledger_dirty = True
-                continue
-            if state in ("push", "new-here"):
-                upload_session(cfg, row["project"], row["id"],
-                               row["local"]["path"])
-                record_sync(ledger, row["project"], row["id"],
-                            row["local"]["md5"], row["local"]["md5"])
-                ledger_dirty = True
-                pushed += 1
-                ok(f"pushed {label}")
-            elif state in ("pull", "new-there"):
-                path = local_session_path(row["project"], row["id"])
-                download_session(cfg, row["project"], row["id"], str(path))
-                record_sync(ledger, row["project"], row["id"],
-                            row["remote"]["md5"], row["remote"]["md5"])
-                ledger_dirty = True
-                pulled += 1
-                ok(f"pulled {label}")
-            else:  # conflict
-                choice = resolve_conflict(row, interactive)
-                if choice == "skip":
-                    skipped += 1
-                    warn(f"skipped {label} — still diverged, run "
-                         f"'sessium resolve {short_id(row['id'])}' later")
-                    continue
-                outcome = apply_conflict(cfg, row, choice, ledger)
-                ledger_dirty = True
-                resolved += 1
-                ok(f"resolved {label}: {outcome}")
+            remote_map = filter_map(remote_sessions(cfg), args.project)
         except RcloneError as exc:
-            warn(f"{state} failed {label}: {exc}")
-            failures += 1
+            fail(f"cannot reach Drive: {exc}")
+            return 1
+        ledger = load_ledger()
+        rows = classify_ledger(local_map, remote_map, ledger)
+        interactive = want_interactive(args) and not args.dry_run
 
-    if ledger_dirty:
-        save_ledger(ledger)
-    in_sync = sum(1 for r in rows if r["state"] == "in-sync")
-    say(transfer_summary(pushed, pulled, 0, in_sync, failures)
-        + (f"   resolved: {resolved}" if resolved else "")
-        + (f"   skipped: {skipped}" if skipped else ""))
-    return 1 if failures else 0
+        pushed = pulled = resolved = skipped = failures = 0
+        ledger_dirty = False
+        for row in rows:
+            label = f"{row['project']}/{short_id(row['id'])}"
+            state = row["state"]
+            try:
+                if state == "in-sync":
+                    if args.dry_run:
+                        continue
+                    if not row["entry"]:        # bootstrap: record, no action
+                        record_sync(ledger, row["project"], row["id"],
+                                    row["local"]["md5"], row["remote"]["md5"])
+                        ledger_dirty = True
+                    continue
+                if state in ("push", "new-here"):
+                    if args.dry_run:
+                        say(f"would push {label} "
+                            f"({human_size(row['local']['size'])})")
+                        pushed += 1
+                        continue
+                    upload_session(cfg, row["project"], row["id"],
+                                   row["local"]["path"])
+                    record_sync(ledger, row["project"], row["id"],
+                                row["local"]["md5"], row["local"]["md5"])
+                    ledger_dirty = True
+                    pushed += 1
+                    ok(f"pushed {label}")
+                elif state in ("pull", "new-there"):
+                    path = local_session_path(row["project"], row["id"])
+                    if args.dry_run:
+                        say(f"would pull {label} "
+                            f"({human_size(row['remote']['size'])})")
+                        pulled += 1
+                        continue
+                    download_session(cfg, row["project"], row["id"], str(path))
+                    record_sync(ledger, row["project"], row["id"],
+                                row["remote"]["md5"], row["remote"]["md5"])
+                    ledger_dirty = True
+                    pulled += 1
+                    ok(f"pulled {label}")
+                else:  # conflict
+                    if args.dry_run:
+                        say(f"would resolve {label}: {describe_conflict(row)}")
+                        resolved += 1
+                        continue
+                    choice = resolve_conflict(row, interactive)
+                    if choice == "skip":
+                        skipped += 1
+                        warn(f"skipped {label} — still diverged, run "
+                             f"'sessium resolve {short_id(row['id'])}' later")
+                        continue
+                    outcome = apply_conflict(cfg, row, choice, ledger)
+                    ledger_dirty = True
+                    resolved += 1
+                    ok(f"resolved {label}: {outcome}")
+            except RcloneError as exc:
+                warn(f"{state} failed {label}: {exc}")
+                failures += 1
+
+        if ledger_dirty:
+            save_ledger(ledger)
+        in_sync = sum(1 for r in rows if r["state"] == "in-sync")
+        say(("dry-run: " if args.dry_run else "")
+            + transfer_summary(pushed, pulled, 0, in_sync, failures)
+            + (f"   resolved: {resolved}" if resolved else "")
+            + (f"   skipped: {skipped}" if skipped else ""))
+        return 1 if failures else 0
+
+
+def transcript_messages(path: Path) -> list:
+    """The conversation as (role, text) pairs — non-meta user/assistant
+    lines, command/ide wrappers excluded. This is what --messages diffs."""
+    out = []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if entry.get("type") not in ("user", "assistant") or entry.get("isMeta"):
+                    continue
+                text = extract_text((entry.get("message") or {}).get("content")).strip()
+                if not text or text.startswith(NOISE_PREFIXES):
+                    continue
+                out.append((entry["type"], " ".join(text.split())))
+    except OSError:
+        pass
+    return out
+
+
+def message_divergence(local_msgs: list, remote_msgs: list) -> dict:
+    """Transcripts are append-mostly: the common prefix IS the last-synced
+    content. Report what each side added past it."""
+    common = 0
+    for a, b in zip(local_msgs, remote_msgs):
+        if a != b:
+            break
+        common += 1
+    return {"common": common,
+            "local_added": local_msgs[common:],
+            "remote_added": remote_msgs[common:]}
 
 
 def cmd_diff(args) -> int:
@@ -949,25 +1207,87 @@ def cmd_diff(args) -> int:
     if row is None:
         return 1
     project, sid = row["project"], row["id"]
+
+    infos = {}
+    tmp_remote = None
+    try:
+        for side in ("local", "remote"):
+            sess = row[side]
+            if not sess:
+                infos[side] = {"messages": 0, "last": ""}
+            elif side == "local":
+                infos[side] = inspect_transcript(Path(sess["path"]))
+            else:
+                tmp_remote = fetch_remote_transcript(cfg, project, sid)
+                infos[side] = inspect_transcript(tmp_remote)
+
+        preview = None
+        if getattr(args, "messages", False):
+            if not row["local"] or not row["remote"]:
+                warn("--messages needs both copies present (pull first if "
+                     "the remote side is missing)")
+            else:
+                divergence = message_divergence(
+                    transcript_messages(Path(row["local"]["path"])),
+                    transcript_messages(tmp_remote))
+                preview = divergence
+    finally:
+        if tmp_remote is not None:
+            tmp_remote.unlink(missing_ok=True)
+
+    if getattr(args, "json", False):
+        entry = row["entry"]
+        emit_json({
+            "project": project,
+            "id": sid,
+            "state": row["state"],
+            "local": None if not row["local"] else {
+                "path": row["local"]["path"],
+                "size": row["local"]["size"],
+                "md5": row["local"].get("md5", ""),
+                "mtime": iso_time(row["local"]["mtime"]),
+                "messages": infos["local"]["messages"],
+                "last": infos["local"]["last"],
+            },
+            "remote": None if not row["remote"] else {
+                "size": row["remote"]["size"],
+                "md5": row["remote"].get("md5", ""),
+                "mtime": iso_time(row["remote"]["mtime"]),
+                "messages": infos["remote"]["messages"],
+                "last": infos["remote"]["last"],
+            },
+            "ledger": None if not entry else {
+                "last_synced": entry.get("last_synced"),
+                "local_md5": entry.get("local_md5"),
+                "remote_md5": entry.get("remote_md5"),
+            },
+            **({"preview": preview} if preview is not None else {}),
+        })
+        return 0
+
     say(f"session {sid}")
     say(f"  project     {project}")
     say(f"  state       {fmt_state(row['state'])}")
     for side, sess in (("local", row["local"]), ("remote", row["remote"])):
+        info = infos[side]
         if not sess:
             say(f"  {side:<9}  (absent)")
             continue
-        if side == "local":
-            info = inspect_transcript(Path(sess["path"]))
-        else:
-            tmp = fetch_remote_transcript(cfg, project, sid)
-            try:
-                info = inspect_transcript(tmp)
-            finally:
-                tmp.unlink(missing_ok=True)
         say(f"  {side:<9}  {human_size(sess['size'])}  {fmt_time(mtime_of(sess))}"
             f"  {info['messages']} msgs")
         if info["last"]:
             say(f"            last: {info['last']}")
+    if preview is not None:
+        common = preview["common"]
+        say(f"  conversation  common prefix: {common} message(s) — "
+            "everything past it is unsynced")
+        for who in ("local", "remote"):
+            msgs = preview[f"{who}_added"]
+            say(f"    {who} adds {len(msgs)}")
+            for role, text in msgs[:12]:
+                say(f"      + {role:<9} {text[:100]}")
+            if len(msgs) > 12:
+                say(f"      … {len(msgs) - 12} more")
     entry = row["entry"]
     if entry:
         say(f"  ledger      last synced {entry.get('last_synced', '?')}  "
@@ -1035,6 +1355,9 @@ def cmd_revert(args) -> int:
     for i, path in enumerate(copies, 1):
         say(f"  {i}. {path.name}  {human_size(path.stat().st_size)}  "
             f"{fmt_time(path.stat().st_mtime)}")
+    if args.dry_run:
+        say("dry-run: would prompt for which copy to restore — nothing changed")
+        return 0
     try:
         raw = input("number to restore (or q to cancel): ").strip().lower()
     except EOFError:
@@ -1062,12 +1385,105 @@ def cmd_revert(args) -> int:
     return 0
 
 
-def cmd_adopt(args) -> int:
-    """Copy sessions pulled under another machine's munged project folder
-    into this machine's, so `claude --resume` can see them. Never deletes
+def cmd_checkout(args) -> int:
+    """Restore a content-addressed history snapshot (see `sessium log <id>`).
+    The copy it displaces is snapshotted first, so checkout never loses
+    bytes either."""
+    cfg = load_config()
+    try:
+        remote_map = remote_sessions(cfg)
+    except RcloneError as exc:
+        warn(f"cannot reach Drive right now: {exc} — searching locally only")
+        remote_map = {}
+    row = find_one_session(args.session, local_sessions(), remote_map)
+    if row is None:
+        return 1
+    project, sid = row["project"], row["id"]
+    hdir = history_dir(project, sid)
+    snaps = sorted(hdir.glob("*.jsonl")) if hdir.is_dir() else []
+    if not snaps:
+        fail(f"no history for {short_id(sid)} — snapshots appear when a sync "
+             "overwrites a copy that had unsynced changes")
+        return 1
+    chosen = None
+    for path in snaps:
+        if path.name.split("-", 1)[0].lstrip("0") == str(args.seq).lstrip("0"):
+            chosen = path
+            break
+    if chosen is None:
+        fail(f"no snapshot #{args.seq} for {short_id(sid)} — available:")
+        for path in snaps:
+            say(f"  {path.stem}  {human_size(path.stat().st_size)}")
+        return 1
+    if args.dry_run:
+        say(f"dry-run: would restore {chosen.name} → {local_session_path(project, sid)}")
+        return 0
+    target = local_session_path(project, sid)
+    if target.exists():                       # preserve what it replaces
+        displaced = save_local_revert(project, sid, target)
+        snapshot_history(project, sid, displaced)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    chosen.replace(target)
+    ok(f"restored {chosen.name} → {target}")
+    ledger = load_ledger()
+    entry = ledger.get("sessions", {}).get(ledger_key(project, sid))
+    if entry:
+        entry["local_md5"] = md5_of(target)   # local changed on purpose
+        save_ledger(ledger)
+        say("next: 'sessium sync' pushes the restored copy to Drive")
+    return 0
+
+
+def cmd_gc(args) -> int:
+    """Prune revert/ + history/ copies beyond --keep N most recent per
+    session (default 10). Canonical transcripts and the ledger are never
+    touched. --dry-run lists what would go."""
+    keep = args.keep
+    root = claude_dir() / "projects"
+    doomed = []
+    if root.is_dir():
+        for project in sorted(root.iterdir()):
+            if not project.is_dir():
+                continue
+            groups = {}
+            rdir = project / "revert"
+            if rdir.is_dir():
+                for path in rdir.glob("*.jsonl"):
+                    sid = path.name.split(".revert-")[0]
+                    groups.setdefault(sid, []).append(path)
+            for sid_dir in sorted(project.iterdir()):
+                hdir = sid_dir / "history"
+                if sid_dir.is_dir() and hdir.is_dir():
+                    for path in hdir.glob("*.jsonl"):
+                        groups.setdefault(sid_dir.name, []).append(path)
+            for sid, paths in sorted(groups.items()):
+                paths.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                for path in paths[keep:]:
+                    doomed.append((project.name, sid, path))
+    if not doomed:
+        say("nothing to prune")
+        return 0
+    for project, sid, path in doomed:
+        if args.dry_run:
+            say(f"would prune {project}/{sid}: {path}")
+        else:
+            try:
+                path.unlink()
+                ok(f"pruned {project}/{sid}: {path.name}")
+            except OSError as exc:
+                warn(f"could not prune {path}: {exc}")
+    if args.dry_run:
+        say(f"dry-run: {len(doomed)} file(s) would be pruned — nothing changed")
+    else:
+        say(f"pruned {len(doomed)} file(s); kept {keep} most recent per session")
+    return 0
+
+
+def do_adopt(src: str, repo: str, dry_run: bool = False) -> int:
+    """Copy a munged project folder's sessions under this machine's name for
+    `repo`. Shared by `sessium adopt` and `sessium open --adopt`; with
+    dry_run it prints what it would copy and touches nothing. Never deletes
     and never clobbers a different existing copy."""
-    src = args.source
-    repo = os.path.abspath(os.path.expanduser(args.repo_path))
     dest = munge(repo)
     root = claude_dir() / "projects"
     src_dir = root / src
@@ -1095,6 +1511,10 @@ def cmd_adopt(args) -> int:
                     warn(f"kept both: {item.name} differs from the copy already "
                          f"at the destination")
                 continue
+            if dry_run:
+                say(f"would copy {item.name}")
+                copied += 1
+                continue
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(item, target)
             copied += 1
@@ -1103,11 +1523,26 @@ def cmd_adopt(args) -> int:
                 warn(f"folder {item.name}/ already exists at the destination "
                      "— left as is")
                 continue
+            if dry_run:
+                say(f"would copy folder {item.name}/")
+                copied += 1
+                continue
             shutil.copytree(item, target)
             copied += 1
-    say(f"adopted {src} → {dest}: {copied} copied, {already} already present")
-    say(f"next: cd {repo} && claude --resume")
+    say(("dry-run: " if dry_run else "")
+        + f"adopted {src} → {dest}: {copied} copied, {already} already present")
+    if not dry_run:
+        say(f"next: cd {repo} && claude --resume")
     return 0
+
+
+def cmd_adopt(args) -> int:
+    """Copy sessions pulled under another machine's munged project folder
+    into this machine's, so `claude --resume` can see them. Never deletes
+    and never clobbers a different existing copy."""
+    return do_adopt(args.source,
+                    os.path.abspath(os.path.expanduser(args.repo_path)),
+                    args.dry_run)
 
 
 def cmd_setup(args) -> int:
@@ -1119,6 +1554,259 @@ def cmd_setup(args) -> int:
     passthrough = ["--check-only"] if args.check_only else []
     result = subprocess.run(["bash", str(script), *passthrough])
     return result.returncode
+
+
+def cmd_version(args) -> int:
+    say(f"sessium {VERSION}")
+    return 0
+
+
+def cmd_open(args) -> int:
+    """Print (or with --go, run) the resume command for a session. The repo
+    path comes from the transcript's own `cwd` stamps, so this works across
+    machines despite the lossy munging. --adopt rehomes the sessions first
+    when the repo isn't at this machine's matching path."""
+    cfg = load_config()
+    try:
+        remote_map = remote_sessions(cfg)
+    except RcloneError as exc:
+        warn(f"cannot reach Drive right now: {exc} — searching locally only")
+        remote_map = {}
+    row = find_one_session(args.session, local_sessions(), remote_map)
+    if row is None:
+        return 1
+    if not row["local"]:
+        fail(f"{row['project']}/{row['id']} is not on this machine — "
+             "run 'sessium pull' first")
+        return 1
+    cwd = session_cwd(Path(row["local"]["path"]))
+    if not cwd:
+        # lossy inverse of munge(), as a last resort — flagged as a guess
+        proj = row["project"]
+        cwd = ("/" + proj[1:].replace("-", "/")) if proj.startswith("-") \
+            else proj.replace("-", "/")
+        warn(f"transcript has no cwd stamp — guessing {cwd}")
+    if args.adopt and not Path(cwd).is_dir():
+        say(f"repo path {cwd} does not exist here — adopting sessions first")
+        rc = do_adopt(row["project"], cwd, args.dry_run)
+        if rc != 0:
+            return rc
+    resume = f"cd {cwd} && claude --resume {row['id']}"
+    if args.go:
+        return subprocess.run(resume, shell=True).returncode
+    say(resume)
+    return 0
+
+
+def cmd_log(args) -> int:
+    """No id: git-style alias for `list`. With an id: list the session's
+    content-addressed history snapshots (taken whenever a sync overwrites a
+    copy that had unsynced changes)."""
+    if not args.session:
+        return cmd_list(args)
+    cfg = load_config()
+    try:
+        remote_map = remote_sessions(cfg)
+    except RcloneError as exc:
+        warn(f"cannot reach Drive right now: {exc} — searching locally only")
+        remote_map = {}
+    row = find_one_session(args.session, local_sessions(), remote_map)
+    if row is None:
+        return 1
+    project, sid = row["project"], row["id"]
+    hdir = claude_dir() / "projects" / project / sid / "history"
+    snaps = sorted(hdir.glob("*.jsonl")) if hdir.is_dir() else []
+    if not snaps:
+        say(f"no history yet for {short_id(sid)} — snapshots appear here "
+            "when a sync overwrites a copy that had unsynced changes")
+        return 0
+    say(f"history of {sid} ({project}):")
+    for path in snaps:
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        say(f"  {path.stem}  {human_size(stat.st_size)}  "
+            f"{fmt_time(stat.st_mtime)}")
+    say(f"restore one with: sessium checkout {short_id(sid)} <seq>")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# search — literal over local transcripts; semantic via seeker when configured
+# ---------------------------------------------------------------------------
+
+NOISE_PREFIXES = ("<command-", "<local-command", "<ide_")
+DEFAULT_SEARCH_LIMIT = 20
+
+
+def search_body(path: Path, query: str) -> str:
+    """First jsonl-aware hit of query in a transcript's message text, as a
+    ±snippet. Skips meta entries and command wrappers. One hit per file —
+    a session matches once, its rank decides ordering."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if entry.get("type") not in ("user", "assistant") or entry.get("isMeta"):
+                    continue
+                text = extract_text((entry.get("message") or {}).get("content")).strip()
+                if not text or text.startswith(NOISE_PREFIXES):
+                    continue
+                if query in text.lower():
+                    return snippet_around(text, query)
+    except OSError:
+        pass
+    return ""
+
+
+def snippet_around(text: str, query: str, width: int = 60) -> str:
+    lowered = text.lower()
+    idx = lowered.find(query)
+    if idx < 0:
+        return " ".join(text.split())[:width]
+    start = max(0, idx - width // 2)
+    end = min(len(text), start + width * 2)
+    body = " ".join(text[start:end].split())
+    return ("…" if start > 0 else "") + body + ("…" if end < len(text) else "")
+
+
+def search_local(args) -> list:
+    """Literal search over local transcripts. Title matches outrank body
+    matches; Drive-only sessions need a pull first (documented)."""
+    local_map = filter_map(local_sessions(), args.project)
+    query = args.query.lower()
+    hits = []
+    for project, sessions in sorted(local_map.items()):
+        for s in sorted(sessions, key=lambda x: x["mtime"], reverse=True):
+            path = Path(s["path"])
+            title = session_title(path)
+            body_hit = ""
+            if query in title.lower():
+                where = "title"
+            else:
+                body_hit = search_body(path, query)
+                where = "body" if body_hit else None
+            if where is None:
+                continue
+            hits.append({
+                "project": project,
+                "id": s["id"],
+                "title": title,
+                "snippet": body_hit,
+                "where": where,
+                "mtime": iso_time(s["mtime"]),
+            })
+    # rank first (title beats body), newest first within a rank — the second
+    # sort is stable, so it preserves the mtime order inside each rank
+    hits.sort(key=lambda h: h["mtime"] or "", reverse=True)
+    hits.sort(key=lambda h: 0 if h["where"] == "title" else 1)
+    return hits
+
+
+def seeker_request(cfg: dict, path: str, payload: dict) -> dict:
+    """POST JSON to the self-hosted seeker engine (Tailscale-only,
+    bearer-auth; contract in SPEC §5)."""
+    headers = {"Content-Type": "application/json"}
+    if cfg.get("seeker_token"):
+        headers["Authorization"] = f"Bearer {cfg['seeker_token']}"
+    req = urllib.request.Request(
+        cfg["seeker_url"].rstrip("/") + path,
+        data=json.dumps(payload).encode("utf-8"),
+        headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def seeker_not_configured() -> int:
+    fail("seeker not configured — put \"seeker_url\" (and \"seeker_token\") "
+         "in config.json; literal search works without it")
+    return 1
+
+
+def semantic_search(args, cfg: dict) -> list:
+    """Query the seeker engine and map chunk hits back to session ids."""
+    out = seeker_request(cfg, "/v1/search", {
+        "query": args.query, "limit": args.limit, "source": "sessium"})
+    hits = []
+    for hit in out.get("results", out.get("hits", [])):
+        if not isinstance(hit, dict):
+            continue
+        src = str(hit.get("path") or hit.get("source") or "")
+        m = re.search(r"projects/([^/]+)/([^/]+)\.jsonl", src)
+        if not m:
+            continue
+        hits.append({
+            "project": m.group(1),
+            "id": m.group(2),
+            "title": " ".join(str(hit.get("title", "")).split())[:70],
+            "snippet": " ".join(str(hit.get("text", "")).split())[:140],
+            "where": "semantic",
+            "mtime": None,
+        })
+    return hits
+
+
+def print_search_hits(hits: list, limit: int) -> None:
+    if not hits:
+        say("no matches")
+        return
+    for h in hits[:limit]:
+        stamp = h["mtime"] or "-"
+        say(f"  {short_id(h['id'])}  {stamp}  {h['where']:<8}  {h['project']}")
+        if h["title"]:
+            say(f"      {h['title']}")
+        if h["snippet"]:
+            say(f"      {h['snippet']}")
+
+
+def cmd_search(args) -> int:
+    """Search sessions: literal (title > body) always; --semantic queries
+    seeker when configured. Local transcripts only — pull first to include
+    Drive-only sessions."""
+    cfg = load_config()
+    if args.semantic:
+        if not cfg.get("seeker_url"):
+            return seeker_not_configured()
+        try:
+            hits = semantic_search(args, cfg)
+        except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
+            fail(f"seeker unreachable at {cfg['seeker_url']}: {exc}")
+            return 1
+    else:
+        hits = search_local(args)
+    if getattr(args, "json", False):
+        emit_json(hits[:args.limit])
+        return 0
+    say(f"search {args.query!r} — {len(hits)} match(es)"
+        + ("  (local transcripts; pull first for Drive-only sessions)"
+           if not args.semantic else "  (via seeker)"))
+    print_search_hits(hits, args.limit)
+    return 0
+
+
+def cmd_seek(args) -> int:
+    """Register/sync the local projects tree as a seeker source."""
+    cfg = load_config()
+    if not cfg.get("seeker_url"):
+        return seeker_not_configured()
+    source = str(claude_dir() / "projects")
+    try:
+        out = seeker_request(cfg, "/v1/sources",
+                             {"name": "sessium", "path": source})
+    except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
+        fail(f"seeker unreachable at {cfg['seeker_url']}: {exc}")
+        return 1
+    ok(f"seeker source synced: {source}")
+    if isinstance(out, dict) and out.get("status"):
+        say(f"  seeker said: {out['status']}")
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -1138,10 +1826,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_list = sub.add_parser("list", help="inventory of local sessions")
     p_list.add_argument("--project", metavar="MUNGED", help="only this project folder")
     p_list.add_argument("--titles", action="store_true", help="extract a title per session")
+    p_list.add_argument("--json", action="store_true", help="machine-readable output (SPEC §9)")
     p_list.set_defaults(func=cmd_list)
 
     p_status = sub.add_parser("status", help="compare local vs Drive vs ledger")
     p_status.add_argument("--project", metavar="MUNGED", help="only this project folder")
+    p_status.add_argument("--json", action="store_true", help="machine-readable output (SPEC §9)")
     p_status.set_defaults(func=cmd_status)
 
     p_check = sub.add_parser("check", help="read-only self-test of the whole setup")
@@ -1149,10 +1839,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_push = sub.add_parser("push", help="upload new/changed sessions to Drive")
     p_push.add_argument("--project", metavar="MUNGED", help="only this project folder")
+    p_push.add_argument("--dry-run", action="store_true",
+                        help="print actions, change nothing")
     p_push.set_defaults(func=cmd_push)
 
     p_pull = sub.add_parser("pull", help="download new/changed sessions from Drive")
     p_pull.add_argument("--project", metavar="MUNGED", help="only this project folder")
+    p_pull.add_argument("--dry-run", action="store_true",
+                        help="print actions, change nothing")
     p_pull.set_defaults(func=cmd_pull)
 
     p_sync = sub.add_parser(
@@ -1160,10 +1854,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_sync.add_argument("--project", metavar="MUNGED", help="only this project folder")
     p_sync.add_argument("--interactive", action="store_true",
                         help="force conflict prompts even without a terminal")
+    p_sync.add_argument("--dry-run", action="store_true",
+                        help="print actions (incl. conflict decisions), change nothing")
     p_sync.set_defaults(func=cmd_sync)
 
     p_diff = sub.add_parser("diff", help="local vs remote vs ledger for one session")
     p_diff.add_argument("session", metavar="ID", help="session id (prefix ok)")
+    p_diff.add_argument("--json", action="store_true", help="machine-readable output (SPEC §9)")
     p_diff.set_defaults(func=cmd_diff)
 
     p_resolve = sub.add_parser("resolve", help="manually resolve a conflicted session")
@@ -1172,6 +1869,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_revert = sub.add_parser("revert", help="restore a losing copy from revert/")
     p_revert.add_argument("session", metavar="ID", help="session id (prefix ok)")
+    p_revert.add_argument("--dry-run", action="store_true",
+                          help="list copies, prompt for nothing")
     p_revert.set_defaults(func=cmd_revert)
 
     p_adopt = sub.add_parser(
@@ -1180,6 +1879,8 @@ def build_parser() -> argparse.ArgumentParser:
                          help="munged project folder as pulled from Drive")
     p_adopt.add_argument("repo_path", metavar="PATH",
                          help="this machine's actual path for that repo")
+    p_adopt.add_argument("--dry-run", action="store_true",
+                         help="print actions, change nothing")
     p_adopt.set_defaults(func=cmd_adopt)
 
     p_setup = sub.add_parser("setup", help="run the platform installer (rclone + OAuth)")
@@ -1187,13 +1888,39 @@ def build_parser() -> argparse.ArgumentParser:
                          help="pass through: verify existing setup, no prompts")
     p_setup.set_defaults(func=cmd_setup)
 
+    p_version = sub.add_parser("version", help="print the version")
+    p_version.set_defaults(func=cmd_version)
+
+    p_log = sub.add_parser("log", help="alias for list — or, with an id, that "
+                                        "session's history snapshots")
+    p_log.add_argument("session", metavar="ID", nargs="?", default=None,
+                       help="session id (prefix ok): show its history instead")
+    p_log.add_argument("--project", metavar="MUNGED", help="only this project folder")
+    p_log.add_argument("--titles", action="store_true", help="extract a title per session")
+    p_log.set_defaults(func=cmd_log)
+
+    p_open = sub.add_parser("open", help="print the resume command for a session")
+    p_open.add_argument("session", metavar="ID", help="session id (prefix ok)")
+    p_open.add_argument("--adopt", action="store_true",
+                        help="rehome sessions first when the repo path differs")
+    p_open.add_argument("--go", action="store_true",
+                        help="run the resume command, not just print it")
+    p_open.add_argument("--dry-run", action="store_true",
+                        help="with --adopt: print actions, change nothing")
+    p_open.set_defaults(func=cmd_open)
+
     return parser
+
+
+ADOPT_FLAG_TOKENS = ("--dry-run", "-h", "--help")
 
 
 def preprocess_argv(argv: list) -> list:
     """Munged path arguments always begin with '-' (e.g. -home-recoding-Kairo-v1),
     which argparse would mistake for a flag. Rewrite '--project -foo' into
-    '--project=-foo', and shield adopt's source positional behind '--'."""
+    '--project=-foo', and for adopt hoist its known flags ahead of a '--'
+    that shields the leading-dash source positional (everything after '--'
+    would otherwise be gobbled as positionals)."""
     out = []
     i = 0
     while i < len(argv):
@@ -1201,13 +1928,16 @@ def preprocess_argv(argv: list) -> list:
             out.append(f"--project={argv[i + 1]}")
             i += 2
             continue
-        if (argv[i] == "adopt" and i + 1 < len(argv)
-                and argv[i + 1].startswith("-")
-                and argv[i + 1] not in ("-h", "--help")):
-            out.append(argv[i])
-            out.append("--")
-            i += 1
-            continue
+        if argv[i] == "adopt":
+            flags, rest = [], []
+            for tok in argv[i + 1:]:
+                (flags if tok in ADOPT_FLAG_TOKENS else rest).append(tok)
+            out.append("adopt")
+            out.extend(flags)
+            if rest and rest[0].startswith("-"):
+                out.append("--")
+            out.extend(rest)
+            break
         out.append(argv[i])
         i += 1
     return out
@@ -1223,6 +1953,9 @@ def main(argv=None) -> int:
     try:
         return args.func(args)
     except RcloneError as exc:
+        fail(str(exc))
+        return 1
+    except LockBusy as exc:
         fail(str(exc))
         return 1
     except KeyboardInterrupt:

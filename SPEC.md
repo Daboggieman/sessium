@@ -113,9 +113,18 @@ Transcripts are never line-merged.
 ## 7. Command surface (parity target)
 
 `list`, `status`, `check`, `setup` (phase 1) · `push`, `pull`, `sync`
-(phase 2) · `diff`, `resolve`, `revert`, `adopt` (phase 3). All take
-`--project <munged>`; `sync` additionally `--interactive`. Exit codes: `0`
-success (skips are not failures), `1` real failures, `130` interrupted.
+(phase 2) · `diff`, `resolve`, `revert`, `adopt` (phase 3) · `version`,
+`log` (no id: alias for `list`; with an id: history snapshots), `open`
+(Batch 3). All tree-walking commands take `--project <munged>`. `--json`
+(SPEC §9) on `list`, `status`, `diff`; `--dry-run` on `push`, `pull`,
+`sync`, `revert`, `adopt`, `open`; `sync` additionally `--interactive`.
+Exit codes: `0` success (skips are not failures), `1` real failures,
+`130` interrupted.
+
+`push`/`pull`/`sync` hold a per-machine lock file (`sync.lock` beside the
+ledger) so a scheduled run and a manual run can't transfer concurrently;
+`--dry-run` never locks. A lock older than 10 minutes is broken with a
+warning (crashed run); a fresh one is a hard error.
 
 ## 8. Transport rules
 
@@ -125,3 +134,46 @@ All Drive I/O goes through rclone; the only commands used are
 downloads are `copyto` of exact paths (rclone creates missing parent
 folders). After a successful transfer, both ledger md5s are set to the
 transferred copy's md5.
+
+## 9. `--json` output schema
+
+`--json` (on `list`, `status`, `diff`, and `search` once Batch 4 lands)
+prints ONE JSON document on stdout — indent 2, keys sorted — and nothing
+else. Human chatter stays on stderr. All mtimes are UTC
+`%Y-%m-%dT%H:%M:%SZ` strings or `null`, so both versions serialize
+identically. Consumers must ignore unknown keys (the schema is additive).
+
+- **`list --json [--titles]`** — array, newest first:
+  `[{ "project", "id", "path", "size", "mtime", ("title") }]`.
+  `title` is present only with `--titles`.
+
+- **`status --json`** — object:
+  `{ "remote", "reachable", "projects", "sessions",
+     "counts": { "<state>": n },
+     "rows": [ { "project", "id", "state",
+                 "local":  { "size", "md5", "mtime" } | null,
+                 "remote": { "size", "md5", "mtime" } | null,
+                 "last_synced": "<utc>" | null } ] }`
+  `reachable: false` means rows were classified against a local-only view
+  (Drive unreachable).
+
+- **`diff <id> --json`** — object:
+  `{ "project", "id", "state",
+     "local":  { "path", "size", "md5", "mtime", "messages", "last" } | null,
+     "remote": { "size", "md5", "mtime", "messages", "last" } | null,
+     "ledger": { "last_synced", "local_md5", "remote_md5" } | null }`
+
+- **`search <q> --json`** (Batch 4) — array of
+  `{ "project", "id", "title", "snippet", "where": "title" | "body",
+     "mtime" }`, best match first.
+
+## 10. History snapshots (Batch 4)
+
+When a transfer overwrites a copy that had unsynced changes, the replaced
+bytes are ALSO kept content-addressed under the session's data folder:
+`projects/<munged>/<sid>/history/<seq>-<md5-8>.jsonl` (`seq` zero-padded
+4 digits, in order taken). Identical content ⇒ identical name ⇒ free dedup.
+History writes never touch the ledger. `sessium log <id>` lists them;
+`sessium checkout <id> <seq>` swaps one back (the displaced copy is itself
+snapshotted first). `revert/` and `history/` are machine-local, never
+synced, and excluded from adopt.

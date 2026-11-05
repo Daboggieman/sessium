@@ -531,5 +531,194 @@ class Phase3Tests(SyncBase):
         self.assertIn("available folders", p.stdout)
 
 
+# ------------------------------------------------------- Batch 3: foundations
+
+class Batch3Tests(SyncBase):
+    """--json output, --dry-run, the transfer lock, version/log/open."""
+
+    def test_version_subcommand(self):
+        p = run_sessium(self.env(self.a), "version")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertTrue(p.stdout.startswith("sessium "), p.stdout)
+
+    def test_log_alias_lists_like_list(self):
+        self.local_file(self.a, "aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
+        listed = run_sessium(self.env(self.a), "list")
+        logged = run_sessium(self.env(self.a), "log")
+        self.assertEqual(logged.returncode, 0, logged.stderr)
+        self.assertEqual(listed.stdout, logged.stdout)
+
+    def test_list_json_schema(self):
+        self.local_file(self.a, "aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
+        p = run_sessium(self.env(self.a), "list", "--json")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        rows = json.loads(p.stdout)
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        for key in ("project", "id", "path", "size", "mtime"):
+            self.assertIn(key, row)
+        self.assertEqual(row["id"], "aaa")
+        self.assertNotIn("title", row)            # --titles gates it
+        p = run_sessium(self.env(self.a), "list", "--json", "--titles")
+        rows = json.loads(p.stdout)
+        self.assertEqual(rows[0]["title"], "hey, build me a spaceship")
+
+    def test_status_json_schema(self):
+        self.local_file(self.a, "aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
+        self.drive_file("bbb").write_text(SESSION_ONLY_COMMANDS, encoding="utf-8")
+        p = run_sessium(self.env(self.a), "status", "--json")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        doc = json.loads(p.stdout)
+        self.assertTrue(doc["reachable"])
+        self.assertEqual(doc["counts"], {"new-here": 1, "new-there": 1})
+        self.assertEqual(len(doc["rows"]), 2)
+        by_id = {r["id"]: r for r in doc["rows"]}
+        self.assertEqual(by_id["aaa"]["state"], "new-here")
+        self.assertIsNone(by_id["bbb"]["local"])
+        self.assertIsNone(by_id["aaa"]["last_synced"])
+        self.assertRegex(by_id["aaa"]["local"]["mtime"], r"\d{4}-\d{2}-\d{2}T")
+
+    def test_status_json_reports_unreachable(self):
+        env = self.env(self.a)
+        env["SESSIUM_RCLONE_BIN"] = "/bin/false"
+        self.local_file(self.a, "aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
+        p = run_sessium(env, "status", "--json")
+        self.assertEqual(p.returncode, 0)
+        doc = json.loads(p.stdout)
+        self.assertFalse(doc["reachable"])
+        self.assertEqual(doc["rows"][0]["state"], "new-here")
+
+    def test_diff_json_after_push(self):
+        self.local_file(self.a, "aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
+        self.assertEqual(run_sessium(self.env(self.a), "push").returncode, 0)
+        p = run_sessium(self.env(self.a), "diff", "aaa", "--json")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        doc = json.loads(p.stdout)
+        self.assertEqual(doc["state"], "in-sync")
+        # diff counts user+assistant non-meta lines, incl. command wrappers
+        self.assertEqual(doc["local"]["messages"], 3)
+        self.assertEqual(doc["local"]["last"], "ok")
+        self.assertIsNotNone(doc["remote"])
+        self.assertEqual(doc["ledger"]["local_md5"], doc["ledger"]["remote_md5"])
+
+    def test_dry_run_push_touches_nothing(self):
+        self.local_file(self.a, "aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
+        p = run_sessium(self.env(self.a), "push", "--dry-run")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("would push", p.stdout)
+        self.assertIn("dry-run: pushed: 1", p.stdout)
+        self.assertFalse(self.drive_file("aaa").exists())
+        self.assertFalse(self.a["state"].exists())      # ledger untouched
+
+    def test_dry_run_pull_touches_nothing(self):
+        self.drive_file("aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
+        p = run_sessium(self.env(self.a), "pull", "--dry-run")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("would pull", p.stdout)
+        self.assertFalse(self.local_file(self.a, "aaa").exists())
+
+    def test_dry_run_sync_describes_conflict_without_deciding(self):
+        self._baseline_conflict()
+        self.local_file(self.a, "aaa").write_text("A was here\n", encoding="utf-8")
+        self.local_file(self.b, "aaa").write_text("B was here\n", encoding="utf-8")
+        self.assertEqual(run_sessium(self.env(self.b), "push").returncode, 0)
+        p = run_sessium(self.env(self.a), "sync", "--dry-run")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("would resolve", p.stdout)
+        self.assertIn("remote wins", p.stdout)
+        # nothing actually happened
+        self.assertEqual(self.local_file(self.a, "aaa").read_text(encoding="utf-8"),
+                         "A was here\n")
+        self.assertEqual(self.revert_files(self.a, "aaa"), [])
+        # the ledger entry is still the pre-conflict baseline push's record
+        import hashlib
+        entry = self.ledger(self.a)["sessions"][f"{PROJ}/aaa"]
+        self.assertEqual(entry["local_md5"], entry["remote_md5"])
+        self.assertNotEqual(entry["local_md5"],
+                            hashlib.md5(b"A was here\n").hexdigest())
+
+    def test_dry_run_adopt_lists_actions(self):
+        old = "-home-oldmachine-proj"
+        old_dir = self.a["claude"] / "projects" / old
+        old_dir.mkdir(parents=True)
+        (old_dir / "sss.jsonl").write_text("incoming\n", encoding="utf-8")
+        (old_dir / "sss").mkdir()                       # a data folder too
+        p = run_sessium(self.env(self.a), "adopt", old, "/home/test/proj",
+                        "--dry-run")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("would copy sss.jsonl", p.stdout)
+        self.assertIn("would copy folder sss/", p.stdout)
+        self.assertFalse((self.a["claude"] / "projects" / PROJ / "sss.jsonl").exists())
+
+    def test_lock_blocks_second_transfer(self):
+        self.local_file(self.a, "aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
+        lock = self.a["state"].parent / "sync.lock"
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        lock.write_text("pid 1\n", encoding="utf-8")
+        p = run_sessium(self.env(self.a), "push")
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("another sessium transfer", p.stderr)
+        self.assertFalse(self.drive_file("aaa").exists())
+        # dry-run ignores the lock entirely
+        p = run_sessium(self.env(self.a), "push", "--dry-run")
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    def test_stale_lock_is_broken(self):
+        import time as _time
+        self.local_file(self.a, "aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
+        lock = self.a["state"].parent / "sync.lock"
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        lock.write_text("pid 1 (long dead)\n", encoding="utf-8")
+        old = _time.time() - 3600
+        os.utime(lock, (old, old))
+        p = run_sessium(self.env(self.a), "push")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("stale lock", p.stderr)
+        self.assertTrue(self.drive_file("aaa").exists())
+        self.assertFalse(lock.exists())                 # released after the run
+
+    def test_lock_released_after_run(self):
+        self.local_file(self.a, "aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
+        self.assertEqual(run_sessium(self.env(self.a), "push").returncode, 0)
+        lock = self.a["state"].parent / "sync.lock"
+        self.assertFalse(lock.exists())
+        # a second run is not blocked by the first
+        self.local_file(self.a, "bbb").write_text(SESSION_ONLY_COMMANDS, encoding="utf-8")
+        p = run_sessium(self.env(self.a), "push")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("pushed: 1", p.stdout)
+
+    def test_open_prints_resume_command(self):
+        sid = "ccc"
+        entry = json.dumps({"type": "user", "cwd": "/home/test/proj",
+                            "message": {"content": "hello"}})
+        self.local_file(self.a, sid).write_text(entry + "\n", encoding="utf-8")
+        p = run_sessium(self.env(self.a), "open", sid)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn(f"cd /home/test/proj && claude --resume ", p.stdout)
+        # the full id is printed, not the prefix
+        self.assertIn(sid, p.stdout)
+
+    def test_open_adopt_chains_rehome(self):
+        sid = "ddd"
+        old = "-home-oldmachine-proj"
+        old_dir = self.a["claude"] / "projects" / old
+        old_dir.mkdir(parents=True)
+        entry = json.dumps({"type": "user", "cwd": "/home/test/proj",
+                            "message": {"content": "hello"}})
+        (old_dir / f"{sid}.jsonl").write_text(entry + "\n", encoding="utf-8")
+        p = run_sessium(self.env(self.a), "open", sid, "--adopt")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("adopting sessions first", p.stdout)
+        self.assertTrue((self.a["claude"] / "projects" / PROJ / f"{sid}.jsonl").is_file())
+        self.assertIn(f"cd /home/test/proj && claude --resume {sid}", p.stdout)
+
+    def test_open_requires_local_copy(self):
+        self.drive_file("aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
+        p = run_sessium(self.env(self.a), "open", "aaa")
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("sessium pull", p.stderr)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
