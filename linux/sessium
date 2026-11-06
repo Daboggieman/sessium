@@ -1854,7 +1854,12 @@ def cmd_export(args) -> int:
         if not args.session:
             fail("give a session id, or --all for every local session")
             return 1
-        row = find_one_session(args.session, local_map, {})
+        cfg = load_config()
+        try:
+            remote_map = remote_sessions(cfg)
+        except RcloneError:
+            remote_map = {}
+        row = find_one_session(args.session, local_map, remote_map)
         if row is None:
             return 1
         if row["local"] is None:

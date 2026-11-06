@@ -1241,11 +1241,12 @@ class Batch6Tests(SyncBase):
         env["SESSIUM_SYSTEMD_DIR"] = str(self.tmp / "systemd")   # nothing installed
         p = run_sessium(env, "onboard")
         self.assertEqual(p.returncode, 0, p.stderr)
+        report = p.stdout + p.stderr      # warns land on stderr
         for marker in ("rclone present", "encryption: off", "Drive reachable",
                        "no sessions found", "ledger: empty",
                        "sync timer: not installed", "Stop hook: not installed",
                        "suggested next steps"):
-            self.assertIn(marker, p.stdout)
+            self.assertIn(marker, report)
 
     def test_onboard_all_set(self):
         self._write_two()
