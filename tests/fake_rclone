@@ -7,8 +7,8 @@ directory on disk (FAKE_DRIVE_ROOT) that mirrors the Drive folder layout:
     $FAKE_DRIVE_ROOT/<folder>/projects/<munged-path>/<session>.jsonl
 
 Supported: version, lsd <remote>:, lsf <remote>:<path>, lsjson [--recursive]
-[--hash] <remote>:<path>, copyto <src> <dst> (src/dst may be local or
-remote:...), cat <remote>:<path>. Everything else exits 1 — deliberately, so
+[--hash] <remote>:<path>, copyto <src> <dst>, copy <src-dir> <dst-dir>
+[--update], cat <remote>:<path>. Everything else exits 1 — deliberately, so
 tests catch sessium calling something new before the stub learns it.
 """
 import hashlib
@@ -108,6 +108,23 @@ def main() -> None:
         dst_path.parent.mkdir(parents=True, exist_ok=True)
         # a byte-for-byte copy keeps md5s consistent, like the real transport
         dst_path.write_bytes(src_path.read_bytes())
+        return
+    if args[0] == "copy":
+        # recursive dir copy, like real rclone; --update skips files that are
+        # newer on the destination (per-file newest-wins, what sync --only uses)
+        update = "--update" in args
+        positional = [a for a in args[1:] if not a.startswith("-")]
+        src_dir = split_remote(positional[0]) if ":" in positional[0] else Path(positional[0])
+        dst_dir = split_remote(positional[1]) if ":" in positional[1] else Path(positional[1])
+        if not src_dir.is_dir():
+            print(f"directory not found: {src_dir}", file=sys.stderr)
+            sys.exit(1)
+        for f in sorted(p for p in src_dir.rglob("*") if p.is_file()):
+            target = dst_dir / f.relative_to(src_dir)
+            if update and target.is_file() and target.stat().st_mtime > f.stat().st_mtime:
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(f.read_bytes())
         return
     print(f"fake_rclone: unsupported command: {' '.join(args)}", file=sys.stderr)
     sys.exit(1)

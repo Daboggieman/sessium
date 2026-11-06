@@ -1073,11 +1073,69 @@ def apply_conflict(cfg: dict, row: dict, choice: str, ledger: dict) -> str:
     return "local wins (newer)"
 
 
+def sync_only(cfg: dict, what: str, dry_run: bool) -> int:
+    """Fast lane (--only memory / --only skills): two-way rclone copy
+    --update of the small precious folders — per-file newest-wins, never
+    deletes, no ledger (folder-level sync; sessions keep the md5 machine)."""
+    claude = claude_dir()
+    pairs = []                                    # (local_dir, drive_path)
+    if what == "memory":
+        root = claude / "projects"
+        if root.is_dir():
+            for project in sorted(root.iterdir()):
+                mem = project / "memory"
+                if project.is_dir() and mem.is_dir():
+                    pairs.append((mem, drive_url(cfg, f"projects/{project.name}/memory")))
+        try:
+            proc = rclone("lsjson", "--recursive", drive_url(cfg, "projects"))
+            entries = json.loads(proc.stdout or "[]")
+        except (RcloneError, json.JSONDecodeError) as exc:
+            fail(f"cannot reach Drive: {exc}")
+            return 1
+        for entry in entries:
+            m = re.match(r"projects/([^/]+)/memory/", entry.get("Path", ""))
+            if not m:
+                continue
+            local_mem = root / m.group(1) / "memory"
+            if not local_mem.is_dir():
+                pairs.append((local_mem, drive_url(cfg, f"projects/{m.group(1)}/memory")))
+    else:  # skills
+        pairs.append((claude / "skills", drive_url(cfg, "config/skills")))
+
+    if not pairs:
+        say(f"nothing to sync for --only {what}")
+        return 0
+    transferred = 0
+    failures = 0
+    for local_dir, remote_dir in pairs:
+        if dry_run:
+            say(f"would two-way sync {local_dir}  <->  {remote_dir}")
+            continue
+        try:
+            local_dir.mkdir(parents=True, exist_ok=True)
+            rclone("copy", str(local_dir) + "/", remote_dir + "/", "--update",
+                   timeout=300)
+            rclone("copy", remote_dir + "/", str(local_dir) + "/", "--update",
+                   timeout=300)
+            transferred += 1
+            ok(f"synced {what}: {local_dir.name}  <->  {remote_dir.split(':')[-1]}")
+        except RcloneError as exc:
+            warn(f"--only {what} failed for {local_dir}: {exc}")
+            failures += 1
+    if dry_run:
+        say(f"dry-run: {len(pairs)} folder(s) would be synced — nothing changed")
+    elif failures:
+        say(transfer_summary(0, 0, 0, 0, failures))
+    return 1 if failures else 0
+
+
 def cmd_sync(args) -> int:
     """The workhorse: pull what changed there, push what changed here,
     resolve conflicts (newest wins automatically, prompts on a terminal)."""
     cfg = load_config()
     with transfer_lock(args.dry_run):
+        if getattr(args, "only", None):
+            return sync_only(cfg, args.only, args.dry_run)
         local_map = filter_map(local_sessions(), args.project)
         try:
             remote_map = filter_map(remote_sessions(cfg), args.project)
@@ -1799,7 +1857,7 @@ def cmd_seek(args) -> int:
     source = str(claude_dir() / "projects")
     try:
         out = seeker_request(cfg, "/v1/sources",
-                             {"name": "sessium", "path": source})
+                             {"name": args.name or "sessium", "path": source})
     except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
         fail(f"seeker unreachable at {cfg['seeker_url']}: {exc}")
         return 1
@@ -1854,12 +1912,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_sync.add_argument("--project", metavar="MUNGED", help="only this project folder")
     p_sync.add_argument("--interactive", action="store_true",
                         help="force conflict prompts even without a terminal")
+    p_sync.add_argument("--only", choices=("memory", "skills"),
+                        help="fast lane: two-way newest-wins copy of just "
+                             "memory/ or skills/ (no ledger)")
     p_sync.add_argument("--dry-run", action="store_true",
                         help="print actions (incl. conflict decisions), change nothing")
     p_sync.set_defaults(func=cmd_sync)
 
     p_diff = sub.add_parser("diff", help="local vs remote vs ledger for one session")
     p_diff.add_argument("session", metavar="ID", help="session id (prefix ok)")
+    p_diff.add_argument("--messages", action="store_true",
+                        help="show a side-by-side message rundown for both copies")
     p_diff.add_argument("--json", action="store_true", help="machine-readable output (SPEC §9)")
     p_diff.set_defaults(func=cmd_diff)
 
@@ -1908,6 +1971,37 @@ def build_parser() -> argparse.ArgumentParser:
     p_open.add_argument("--dry-run", action="store_true",
                         help="with --adopt: print actions, change nothing")
     p_open.set_defaults(func=cmd_open)
+
+    p_checkout = sub.add_parser(
+        "checkout", help="swap a history snapshot back in (SPEC §10)")
+    p_checkout.add_argument("session", metavar="ID", help="session id (prefix ok)")
+    p_checkout.add_argument("seq", metavar="SEQ",
+                            help="snapshot sequence number, as shown by `sessium log ID`")
+    p_checkout.add_argument("--dry-run", action="store_true",
+                            help="print actions, change nothing")
+    p_checkout.set_defaults(func=cmd_checkout)
+
+    p_gc = sub.add_parser("gc", help="prune old revert/ and history/ copies")
+    p_gc.add_argument("--keep", type=int, default=10, metavar="N",
+                      help="keep the N newest copies per session (default 10)")
+    p_gc.add_argument("--dry-run", action="store_true",
+                      help="print deletions, change nothing")
+    p_gc.set_defaults(func=cmd_gc)
+
+    p_search = sub.add_parser("search", help="search local transcripts (and seeker, if set up)")
+    p_search.add_argument("query", metavar="QUERY", help="text or regex to look for")
+    p_search.add_argument("--project", metavar="MUNGED", help="only this project folder")
+    p_search.add_argument("--limit", type=int, default=DEFAULT_SEARCH_LIMIT, metavar="N",
+                          help=f"max hits per source (default {DEFAULT_SEARCH_LIMIT})")
+    p_search.add_argument("--semantic", action="store_true",
+                          help="include the seeker semantic index in results")
+    p_search.add_argument("--json", action="store_true", help="machine-readable output (SPEC §9)")
+    p_search.set_defaults(func=cmd_search)
+
+    p_seek = sub.add_parser("seek", help="register this repo with the seeker indexer")
+    p_seek.add_argument("--name", default=None, metavar="NAME",
+                        help="source name for seeker (default: this machine's hostname)")
+    p_seek.set_defaults(func=cmd_seek)
 
     return parser
 

@@ -720,5 +720,330 @@ class Batch3Tests(SyncBase):
         self.assertIn("sessium pull", p.stderr)
 
 
+# ------------------------------------------------------- batch 4: search
+
+from http.server import BaseHTTPRequestHandler, HTTPServer  # noqa: E402
+import threading  # noqa: E402
+import time  # noqa: E402
+
+
+class SeekerStub(BaseHTTPRequestHandler):
+    """Tiny seeker-engine stand-in: POST /v1/search and /v1/sources."""
+
+    last_payload = None
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        payload = json.loads(self.rfile.read(length) or b"{}")
+        SeekerStub.last_payload = payload
+        if self.path == "/v1/search":
+            out = {"results": [{"path": f"projects/{PROJ}/aaa.jsonl",
+                                "title": "stub title", "text": "stub chunk"}]}
+        elif self.path == "/v1/sources":
+            out = {"status": "ok"}
+        else:
+            self.send_response(404)
+            self.end_headers()
+            return
+        body = json.dumps(out).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+class Batch4Tests(SyncBase):
+    """search/seek, history snapshots, checkout, gc, --only, diff --messages."""
+
+    def _start_seeker(self) -> str:
+        server = HTTPServer(("127.0.0.1", 0), SeekerStub)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        return f"http://127.0.0.1:{server.server_port}"
+
+    def _with_seeker(self) -> dict:
+        cfg_path = self.tmp / "config.json"
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        cfg["seeker_url"] = self._start_seeker()
+        cfg["seeker_token"] = "t0ken"
+        cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+        return self.env(self.a)
+
+    def test_search_ranks_title_over_body(self):
+        self.local_file(self.a, "aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
+        body = "\n".join([
+            json.dumps({"type": "user", "message": {"content": "hello there"}}),
+            json.dumps({"type": "assistant", "message": {"content": "about the spaceship hull"}}),
+        ]) + "\n"
+        self.local_file(self.a, "bbb").write_text(body, encoding="utf-8")
+        p = run_sessium(self.env(self.a), "search", "spaceship")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("2 match(es)", p.stdout)
+        # title hit (aaa) outranks body hit (bbb, whose title is "hello there")
+        self.assertLess(p.stdout.find("aaa"), p.stdout.find("bbb"))
+
+    def test_search_json_schema(self):
+        self.local_file(self.a, "aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
+        p = run_sessium(self.env(self.a), "search", "spaceship", "--json")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        rows = json.loads(p.stdout)
+        self.assertEqual(len(rows), 1)
+        for key in ("project", "id", "title", "snippet", "where", "mtime"):
+            self.assertIn(key, rows[0])
+        self.assertEqual(rows[0]["project"], PROJ)
+        self.assertEqual(rows[0]["id"], "aaa")
+        self.assertEqual(rows[0]["where"], "title")
+        self.assertEqual(rows[0]["snippet"], "")     # title hit: no body snippet
+
+    def test_search_no_matches(self):
+        p = run_sessium(self.env(self.a), "search", "zzz-nothing")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("no matches", p.stdout)
+
+    def test_search_semantic_requires_config(self):
+        p = run_sessium(self.env(self.a), "search", "x", "--semantic")
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("seeker not configured", p.stderr)
+
+    def test_search_semantic_maps_hits_back(self):
+        env = self._with_seeker()
+        p = run_sessium(env, "search", "anything", "--semantic", "--json")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        rows = json.loads(p.stdout)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["project"], PROJ)
+        self.assertEqual(rows[0]["id"], "aaa")
+        self.assertEqual(rows[0]["where"], "semantic")
+        self.assertEqual(rows[0]["title"], "stub title")
+        self.assertEqual(rows[0]["snippet"], "stub chunk")
+        self.assertIsNone(rows[0]["mtime"])
+
+    def test_seek_registers_source(self):
+        env = self._with_seeker()
+        p = run_sessium(env, "seek")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("seeker source synced", p.stdout)
+        self.assertIn("seeker said: ok", p.stdout)
+        self.assertEqual(SeekerStub.last_payload,
+                         {"name": "sessium", "path": str(self.a["claude"] / "projects")})
+        p = run_sessium(env, "seek", "--name", "custom-name")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(SeekerStub.last_payload["name"], "custom-name")
+
+    # ------------------------------------------- history snapshots (SPEC §10)
+
+    def _diverged_two_editors(self):
+        """Baseline conflict, then both sides edit, B pushes last → when A
+        syncs, remote wins and A's losing copy must land in revert/ AND
+        history/."""
+        self._baseline_conflict()
+        self.local_file(self.a, "aaa").write_text("A was here\n", encoding="utf-8")
+        self.local_file(self.b, "aaa").write_text("B was here\n", encoding="utf-8")
+        self.assertEqual(run_sessium(self.env(self.b), "push").returncode, 0)
+        p = run_sessium(self.env(self.a), "sync")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        return p
+
+    def test_conflict_snapshots_loser_to_history(self):
+        p = self._diverged_two_editors()
+        self.assertIn("remote wins", p.stdout)
+        self.assertEqual(self.local_file(self.a, "aaa").read_text(encoding="utf-8"),
+                         "B was here\n")
+        self.assertEqual(len(self.revert_files(self.a, "aaa")), 1)
+        hdir = self.a["claude"] / "projects" / PROJ / "aaa" / "history"
+        snaps = sorted(hdir.glob("*.jsonl"))
+        self.assertEqual(len(snaps), 1)
+        import hashlib
+        self.assertEqual(snaps[0].name,
+                         f"0001-{hashlib.md5(b'A was here\n').hexdigest()[:8]}.jsonl")
+        self.assertEqual(snaps[0].read_text(encoding="utf-8"), "A was here\n")
+
+    def test_log_id_lists_history(self):
+        self._diverged_two_editors()
+        p = run_sessium(self.env(self.a), "log", "aaa")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("history of aaa", p.stdout)
+        self.assertIn("0001-", p.stdout)
+        self.assertIn("sessium checkout aaa <seq>", p.stdout)
+
+    def test_log_id_without_history(self):
+        self.local_file(self.a, "aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
+        p = run_sessium(self.env(self.a), "log", "aaa")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("no history yet", p.stdout)
+
+    def test_checkout_restores_snapshot(self):
+        self._diverged_two_editors()
+        p = run_sessium(self.env(self.a), "checkout", "aaa", "1")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(self.local_file(self.a, "aaa").read_text(encoding="utf-8"),
+                         "A was here\n")
+        # the displaced live copy is itself snapshotted; the checked-out
+        # snapshot file moved in as the new live transcript
+        hdir = self.a["claude"] / "projects" / PROJ / "aaa" / "history"
+        snaps = sorted(hdir.glob("*.jsonl"))
+        self.assertEqual(len(snaps), 1)
+        self.assertEqual(snaps[0].read_text(encoding="utf-8"), "B was here\n")
+        # ledger reflects the on-purpose local change; remote untouched
+        entry = self.ledger(self.a)["sessions"][f"{PROJ}/aaa"]
+        import hashlib
+        self.assertEqual(entry["local_md5"],
+                         hashlib.md5(b"A was here\n").hexdigest())
+        self.assertEqual(entry["remote_md5"],
+                         hashlib.md5(b"B was here\n").hexdigest())
+
+    def test_checkout_dry_run(self):
+        self._diverged_two_editors()
+        p = run_sessium(self.env(self.a), "checkout", "aaa", "1", "--dry-run")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("would restore", p.stdout)
+        self.assertEqual(self.local_file(self.a, "aaa").read_text(encoding="utf-8"),
+                         "B was here\n")
+        hdir = self.a["claude"] / "projects" / PROJ / "aaa" / "history"
+        self.assertEqual(len(list(hdir.glob("*.jsonl"))), 1)
+
+    def test_checkout_unknown_seq_lists_available(self):
+        self._diverged_two_editors()
+        p = run_sessium(self.env(self.a), "checkout", "aaa", "9")
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("no snapshot #9", p.stderr)
+        self.assertIn("0001", p.stdout)          # lists what IS available
+
+    # ------------------------------------------------------------------ gc
+
+    def test_gc_prunes_old_copies(self):
+        import hashlib
+        import time
+        proj_dir = self.a["claude"] / "projects" / PROJ
+        hdir = proj_dir / "aaa" / "history"
+        hdir.mkdir(parents=True)
+        rdir = proj_dir / "revert"
+        rdir.mkdir()
+        base = time.time() - 10_000
+        for i in range(12):                      # oldest first
+            f = hdir / f"{i + 1:04d}-{hashlib.md5(f'h{i}'.encode()).hexdigest()[:8]}.jsonl"
+            f.write_text(f"hist {i}\n", encoding="utf-8")
+            os.utime(f, (base + i * 10, base + i * 10))
+        for i in (1, 2):                         # revert copies, older still
+            f = rdir / f"aaa.revert-2026010{i}-000000.jsonl"
+            f.write_text(f"revert {i}\n", encoding="utf-8")
+            os.utime(f, (base - i * 10, base - i * 10))
+        self.local_file(self.a, "aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
+        p = run_sessium(self.env(self.a), "gc", "--keep", "2")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("pruned 12 file(s)", p.stdout)
+        remaining = sorted(hdir.glob("*.jsonl")) + sorted(rdir.glob("*.jsonl"))
+        self.assertEqual(len(remaining), 2)      # the two NEWEST history files
+        for f in remaining:
+            self.assertTrue(f.stem.startswith(("0011", "0012")), f.stem)
+        self.assertTrue(self.local_file(self.a, "aaa").is_file())  # canonical safe
+
+    def test_gc_dry_run_touches_nothing(self):
+        import hashlib
+        hdir = self.a["claude"] / "projects" / PROJ / "aaa" / "history"
+        hdir.mkdir(parents=True)
+        for i in range(5):
+            f = hdir / f"{i + 1:04d}-{hashlib.md5(f'h{i}'.encode()).hexdigest()[:8]}.jsonl"
+            f.write_text(f"hist {i}\n", encoding="utf-8")
+        p = run_sessium(self.env(self.a), "gc", "--keep", "2", "--dry-run")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(p.stdout.count("would prune"), 3)
+        self.assertIn("dry-run: 3 file(s) would be pruned", p.stdout)
+        self.assertEqual(len(list(hdir.glob("*.jsonl"))), 5)
+
+    def test_gc_nothing_to_prune(self):
+        p = run_sessium(self.env(self.a), "gc")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("nothing to prune", p.stdout)
+
+    # ------------------------------------------------- --only fast lane
+
+    def test_only_memory_syncs_both_ways_without_ledger(self):
+        mem_dir = self.a["claude"] / "projects" / PROJ / "memory"
+        mem_dir.mkdir(parents=True)
+        (mem_dir / "MEMORY.md").write_text("A note\n", encoding="utf-8")
+        p = run_sessium(self.env(self.a), "sync", "--only", "memory")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        drive_mem = self.drive / "backup" / "projects" / PROJ / "memory" / "MEMORY.md"
+        self.assertTrue(drive_mem.is_file())
+        self.assertEqual(drive_mem.read_text(encoding="utf-8"), "A note\n")
+        self.assertFalse(self.a["state"].exists())   # fast lane: no ledger
+        # a newer Drive-side note flows back down
+        (drive_mem).write_text("B note\n", encoding="utf-8")
+        future = time.time() + 1000
+        os.utime(drive_mem, (future, future))
+        p = run_sessium(self.env(self.a), "sync", "--only", "memory")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual((mem_dir / "MEMORY.md").read_text(encoding="utf-8"),
+                         "B note\n")
+
+    def test_only_skills_syncs_both_ways(self):
+        skill_dir = self.a["claude"] / "skills" / "my-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("skill body\n", encoding="utf-8")
+        p = run_sessium(self.env(self.a), "sync", "--only", "skills")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        drive_skill = self.drive / "backup" / "config" / "skills" / "my-skill" / "SKILL.md"
+        self.assertTrue(drive_skill.is_file())
+        # newer Drive-side skill flows back down
+        drive_skill.write_text("skill v2\n", encoding="utf-8")
+        future = time.time() + 1000
+        os.utime(drive_skill, (future, future))
+        p = run_sessium(self.env(self.a), "sync", "--only", "skills")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual((skill_dir / "SKILL.md").read_text(encoding="utf-8"),
+                         "skill v2\n")
+
+    def test_only_dry_run_touches_nothing(self):
+        mem_dir = self.a["claude"] / "projects" / PROJ / "memory"
+        mem_dir.mkdir(parents=True)
+        (mem_dir / "MEMORY.md").write_text("A note\n", encoding="utf-8")
+        p = run_sessium(self.env(self.a), "sync", "--only", "memory", "--dry-run")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("would two-way sync", p.stdout)
+        self.assertFalse(
+            (self.drive / "backup" / "projects" / PROJ / "memory").exists())
+
+    def test_only_memory_never_touches_sessions(self):
+        # the fast lane must not classify/transfer sessions
+        self.local_file(self.a, "aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
+        mem_dir = self.a["claude"] / "projects" / PROJ / "memory"
+        mem_dir.mkdir(parents=True)
+        (mem_dir / "MEMORY.md").write_text("A note\n", encoding="utf-8")
+        p = run_sessium(self.env(self.a), "sync", "--only", "memory")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertFalse(self.drive_file("aaa").exists())   # session not pushed
+
+    # ------------------------------------------------- diff --messages
+
+    def test_diff_messages_flag(self):
+        self._baseline_conflict()
+        extra = "\n".join([
+            json.dumps({"type": "user", "message": {"content": "what next"}}),
+            json.dumps({"type": "assistant", "message": {"content": "done"}}),
+        ]) + "\n"
+        self.local_file(self.a, "aaa").write_text(
+            SESSION_WITH_TITLE + extra, encoding="utf-8")
+        p = run_sessium(self.env(self.a), "diff", "aaa", "--messages")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        # transcript_messages skips meta + wrappers: 2 common msgs
+        self.assertIn("common prefix: 2 message(s)", p.stdout)
+        self.assertIn("local adds 2", p.stdout)
+        self.assertIn("remote adds 0", p.stdout)
+        self.assertIn("+ user", p.stdout)
+        self.assertIn("+ assistant", p.stdout)
+        p = run_sessium(self.env(self.a), "diff", "aaa", "--messages", "--json")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        doc = json.loads(p.stdout)
+        self.assertEqual(doc["preview"]["common"], 2)
+        self.assertEqual(len(doc["preview"]["local_added"]), 2)
+        self.assertEqual(doc["preview"]["remote_added"], [])
+        self.assertEqual(doc["preview"]["local_added"][0], ["user", "what next"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
