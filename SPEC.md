@@ -140,6 +140,12 @@ ledger) so a scheduled run and a manual run can't transfer concurrently;
 `--dry-run` never locks. A lock older than 10 minutes is broken with a
 warning (crashed run); a fresh one is a hard error.
 
+`check --full` extends the six-step self-test with a read-only ledger audit:
+dead ledger entries (recorded, gone from both sides — informational), Drive
+orphans (never synced from this machine — informational), and an md5
+spot-check on a deterministic sample of up to 10 in-sync sessions (live
+local bytes vs the live Drive hash); a spot-check mismatch exits `1`.
+
 Automation: `sessium schedule [--interval MIN] [--off] [--print]` manages a
 systemd **user** timer running `sessium sync`; `sessium hook [--off] [--print]`
 manages a Claude Code **Stop hook** running `sessium push --quiet` (only

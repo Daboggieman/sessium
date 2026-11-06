@@ -37,9 +37,13 @@ shows each session's first real user message. Alias:
 Classify every session against the ledger and Drive: in-sync, push, pull,
 CONFLICT, new-here, new-there. Read-only; never touches anything.
 .TP
-.B check
+.BR check " [\-\-full]"
 Six-step self-test: rclone present, remote reachable, folder exists, local
-claude dir, ledger, session counts.
+claude dir, ledger, session counts. With
+.BR \-\-full ,
+additionally audits the ledger — dead entries and Drive orphans — and
+spot-verifies a sample of in-sync sessions (local bytes vs the Drive hash).
+Read-only; never touches anything.
 .TP
 .BR setup " [\-\-check\-only]"
 Run setup\-ubuntu.sh (interactive rclone install + Drive OAuth).

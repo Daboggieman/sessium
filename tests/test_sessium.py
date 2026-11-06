@@ -137,6 +137,16 @@ class UnitTests(unittest.TestCase):
             p.write_text(SESSION_ONLY_COMMANDS, encoding="utf-8")
             self.assertEqual(self.mod.session_title(p), "")
 
+    def test_pick_sample(self):
+        pick = self.mod.pick_sample
+        self.assertEqual(pick(["a", "b"], 5), ["a", "b"])          # under count: all
+        self.assertEqual(pick(list(range(4)), 4), [0, 1, 2, 3])
+        spread = pick(list(range(100)), 10)                        # deterministic, ordered
+        self.assertEqual(spread, sorted(spread))
+        self.assertEqual(len(spread), 10)
+        self.assertEqual(len(set(spread)), 10)                     # no duplicates
+        self.assertEqual(spread, list(range(0, 100, 10)))          # evenly spread
+
 
 # ------------------------------------------------------------ command tests
 
@@ -211,6 +221,55 @@ class CommandTests(unittest.TestCase):
         proc = run_sessium(self.fx.env(), "check")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("1 project(s), 2 session(s)", proc.stdout)
+
+    def test_check_full_happy_path(self):
+        self.fx.write_local("aaa", SESSION_WITH_TITLE)
+        self.fx.write_remote("aaa", SESSION_WITH_TITLE)  # bootstrap: no ledger yet
+        proc = run_sessium(self.fx.env(), "check", "--full")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("deep check (--full):", proc.stdout)
+        self.assertIn("no dead entries", proc.stdout)
+        self.assertIn("no orphans on Drive", proc.stdout)
+        self.assertIn("spot-check: 1 session(s) verified", proc.stdout)
+
+    def test_check_full_reports_orphans(self):
+        # on Drive, never synced from this machine (the other-machine case)
+        self.fx.write_remote("aaa", SESSION_WITH_TITLE)
+        proc = run_sessium(self.fx.env(), "check", "--full")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("orphans on Drive", proc.stdout)
+
+    def test_check_full_detects_dead_ledger_entries(self):
+        self.fx.write_local("aaa", SESSION_WITH_TITLE)
+        proc = run_sessium(self.fx.env(), "push")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        # the session vanishes from both sides afterwards
+        (self.fx.claude / "projects" / self.fx.project / "aaa.jsonl").unlink()
+        (self.fx.drive / "backup" / "projects" / self.fx.project / "aaa.jsonl").unlink()
+        proc = run_sessium(self.fx.env(), "check", "--full")
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+        self.assertIn("dead ledger entries: 1", proc.stderr)
+
+    def test_check_full_spot_check_mismatch_fails(self):
+        # ledger claims both sides match, but the live copies differ —
+        # exactly the drift the spot-check exists to catch
+        self.fx.write_local("aaa", SESSION_WITH_TITLE)
+        self.fx.write_remote("aaa", SESSION_ONLY_COMMANDS)
+        state = self.fx.tmp / "state.json"
+        ledger = {
+            "version": 1,
+            "sessions": {
+                f"{self.fx.project}/aaa": {
+                    "project": self.fx.project, "id": "aaa",
+                    "local_md5": "same", "remote_md5": "same",
+                    "last_synced": "2026-11-07T00:00:00Z",
+                },
+            },
+        }
+        state.write_text(json.dumps(ledger), encoding="utf-8")
+        proc = run_sessium(self.fx.env(), "check", "--full")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("!= Drive md5", proc.stderr)
 
 
 # --------------------------------------------------- two-machine sync tests

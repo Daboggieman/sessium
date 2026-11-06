@@ -131,8 +131,11 @@ not in PLAN.md or README.md.
 - ✅ **Time-travel safety**: `sessium gc [--keep N]` — prune revert/ + history/
   copies beyond N most recent per session (default 10); never touches canonical
   files; `--dry-run` supported.
-- ⬜ Deep `sessium check --full`: verify a sample of Drive md5s against local
-  records, report orphans + dead ledger entries.
+- ✅ **Deep `sessium check --full`**: read-only ledger audit on top of the
+  six-step self-test — dead ledger entries (gone from both sides),
+  orphans on Drive (never synced from this machine), and an md5
+  spot-check of a deterministic sample (≤10) of in-sync sessions
+  (live local bytes vs live Drive hash; mismatch exits 1). SPEC §7.
 - ✅ **memory/skills priority**: `sessium sync --only memory` (and `--only
   skills`) — fast lane two-way `rclone copy --update` of `projects/*/memory/`
   (and config/skills/); per-file newest-wins, never deletes, no ledger.
