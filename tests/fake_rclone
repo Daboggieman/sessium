@@ -8,8 +8,10 @@ directory on disk (FAKE_DRIVE_ROOT) that mirrors the Drive folder layout:
 
 Supported: version, lsd <remote>:, lsf <remote>:<path>, lsjson [--recursive]
 [--hash] <remote>:<path>, copyto <src> <dst>, copy <src-dir> <dst-dir>
-[--update], cat <remote>:<path>. Everything else exits 1 — deliberately, so
-tests catch sessium calling something new before the stub learns it.
+[--update], cat <remote>:<path>, config file, config create <name> <type>
+<key=val...> (logged to $FAKE_DRIVE_ROOT/rclone-config.log). Everything else
+exits 1 — deliberately, so tests catch sessium calling something new before
+the stub learns it.
 """
 import hashlib
 import json
@@ -69,6 +71,20 @@ def main() -> None:
     if args[0] == "version":
         print("rclone vFAKE-STUB-1.0")
         return
+    if args[0] == "config":
+        if args[1] == "file":
+            # real output ends with the config path; sessium takes the last line
+            print("Configuration file is stored at:")
+            print(f'{os.environ["FAKE_DRIVE_ROOT"]}/rclone.conf')
+            return
+        if args[1] == "create":
+            rest = [a for a in args[2:] if not a.startswith("-")]
+            log = Path(os.environ["FAKE_DRIVE_ROOT"]) / "rclone-config.log"
+            with open(log, "a", encoding="utf-8") as handle:
+                handle.write(" ".join(rest) + "\n")
+            return
+        print(f"fake_rclone: unsupported config subcommand: {args[1]}", file=sys.stderr)
+        sys.exit(1)
     if args[0] == "lsd":
         target = split_remote(args[1])
         if target.exists():

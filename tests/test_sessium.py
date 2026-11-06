@@ -1045,5 +1045,233 @@ class Batch4Tests(SyncBase):
         self.assertEqual(doc["preview"]["local_added"][0], ["user", "what next"])
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
+# ------------------------------------------------- batch 5: schedule/hook/crypt
+
+class Batch5Tests(SyncBase):
+    """schedule (systemd timer), hook (Stop hook), setup --encrypted (crypt)."""
+
+    def test_push_quiet_silences_chatter(self):
+        self.local_file(self.a, "aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
+        p = run_sessium(self.env(self.a), "push", "--quiet")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(p.stdout, "")
+        self.assertTrue(self.drive_file("aaa").is_file())
+        # errors/warnings stay loud even when quiet
+        self.local_file(self.a, "aaa").write_text("changed locally\n", encoding="utf-8")
+        self.drive_file("aaa").write_text("changed remotely\n", encoding="utf-8")
+        future = time.time() + 1000
+        os.utime(self.drive_file("aaa"), (future, future))
+        # stale the ledger record so both sides look changed → conflict
+        entry = self.ledger(self.a)["sessions"][f"{PROJ}/aaa"]
+        entry["local_md5"] = "stale"
+        entry["remote_md5"] = "stale"
+        self.a["state"].write_text(json.dumps(self.ledger(self.a)), encoding="utf-8")
+        p = run_sessium(self.env(self.a), "push", "--quiet")
+        self.assertEqual(p.returncode, 0)
+        self.assertEqual(p.stdout, "")
+        self.assertIn("CONFLICT", p.stderr)
+
+    def _fake_systemctl(self) -> Path:
+        bindir = self.tmp / "fake-bin"
+        bindir.mkdir()
+        stub = bindir / "systemctl"
+        stub.write_text("#!/bin/bash\n"
+                        'echo "$*" >> "$(dirname "$0")/calls.log"\n'
+                        "exit 0\n", encoding="utf-8")
+        stub.chmod(0o755)
+        return bindir
+
+    def _sched_env(self, bindir: Path) -> dict:
+        env = self.env(self.a)
+        env["SESSIUM_SYSTEMD_DIR"] = str(self.tmp / "systemd")
+        env["PATH"] = f"{bindir}:{env['PATH']}"
+        return env
+
+    def test_schedule_print_touches_nothing(self):
+        p = run_sessium(self.env(self.a), "schedule", "--print")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("ExecStart=", p.stdout)
+        self.assertIn("sessium sync", p.stdout)
+        self.assertIn("OnUnitActiveSec=30min", p.stdout)
+        self.assertIn("enable --now sessium.timer", p.stdout)
+        self.assertFalse((self.tmp / "systemd").exists())
+
+    def test_schedule_install_and_off(self):
+        env = self._sched_env(self._fake_systemctl())
+        p = run_sessium(env, "schedule", "--interval", "15")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        sdir = self.tmp / "systemd"
+        service = (sdir / "sessium.service").read_text(encoding="utf-8")
+        timer = (sdir / "sessium.timer").read_text(encoding="utf-8")
+        self.assertIn("ExecStart=", service)
+        self.assertIn("sessium sync", service)
+        self.assertIn("OnUnitActiveSec=15min", timer)
+        self.assertIn("WantedBy=timers.target", timer)
+        calls = (self.tmp / "fake-bin" / "calls.log").read_text(encoding="utf-8")
+        self.assertIn("daemon-reload", calls)
+        self.assertIn("enable --now sessium.timer", calls)
+        # --off: disable, then the unit files are gone
+        p = run_sessium(env, "schedule", "--off")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("schedule removed", p.stdout)
+        self.assertFalse((sdir / "sessium.timer").exists())
+        self.assertFalse((sdir / "sessium.service").exists())
+        calls = (self.tmp / "fake-bin" / "calls.log").read_text(encoding="utf-8")
+        self.assertIn("disable --now sessium.timer", calls)
+
+    def _settings(self) -> Path:
+        return self.a["claude"] / "settings.json"
+
+    def test_hook_install_idempotent_and_off(self):
+        self._settings().write_text(json.dumps({
+            "hooks": {"Stop": [{"matcher": "",
+                                "hooks": [{"type": "command", "command": "echo unrelated"}]}]},
+        }), encoding="utf-8")
+        p = run_sessium(self.env(self.a), "hook")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        data = json.loads(self._settings().read_text(encoding="utf-8"))
+        stop = data["hooks"]["Stop"]
+        self.assertEqual(len(stop), 2)
+        sessium_hooks = [e for e in stop if "sessium push" in json.dumps(e)]
+        self.assertEqual(len(sessium_hooks), 1)
+        self.assertIn("push --quiet", sessium_hooks[0]["hooks"][0]["command"])
+        # idempotent: a second install must not duplicate
+        self.assertEqual(run_sessium(self.env(self.a), "hook").returncode, 0)
+        data = json.loads(self._settings().read_text(encoding="utf-8"))
+        self.assertEqual(len(data["hooks"]["Stop"]), 2)
+        # --off: only the sessium entry goes
+        p = run_sessium(self.env(self.a), "hook", "--off")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        data = json.loads(self._settings().read_text(encoding="utf-8"))
+        stop = data["hooks"]["Stop"]
+        self.assertEqual(len(stop), 1)
+        self.assertEqual(stop[0]["hooks"][0]["command"], "echo unrelated")
+
+    def test_hook_off_leaves_empty_settings_clean(self):
+        p = run_sessium(self.env(self.a), "hook")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        p = run_sessium(self.env(self.a), "hook", "--off")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        data = json.loads(self._settings().read_text(encoding="utf-8"))
+        self.assertEqual(data, {})          # no hooks key left behind
+
+    def test_hook_print_touches_nothing(self):
+        p = run_sessium(self.env(self.a), "hook", "--print")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("sessium push --quiet", p.stdout)
+        self.assertFalse(self._settings().exists())
+
+    def test_setup_encrypted_switches_config(self):
+        cfg_path = self.tmp / "config.json"
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        cfg["seeker_url"] = "http://seeker.example"
+        cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+        p = run_sessium(self.env(self.a), "setup", "--encrypted")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("SAVE THIS PASSWORD", p.stdout)
+        self.assertIn("sessium-crypt", p.stdout)
+        # the crypt remote was created over the plain one, password logged
+        log = (self.drive / "rclone-config.log").read_text(encoding="utf-8")
+        self.assertRegex(log,
+                         r"sessium-crypt crypt remote=fake:backup password=\S+")
+        # sessium now points at the crypt remote; seeker_url survived
+        new_cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        self.assertEqual(new_cfg["rclone_remote"], "sessium-crypt")
+        self.assertEqual(new_cfg["drive_folder"], "")
+        self.assertEqual(new_cfg["seeker_url"], "http://seeker.example")
+
+
+# ------------------------------------------------- batch 6: export / onboard
+
+class Batch6Tests(SyncBase):
+    """export (md/html + viewer index) and onboard (setup checklist)."""
+
+    def _write_two(self):
+        self.local_file(self.a, "aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
+        self.local_file(self.a, "bbb").write_text(SESSION_ONLY_COMMANDS, encoding="utf-8")
+
+    def test_export_markdown_single(self):
+        self._write_two()
+        out = self.tmp / "exp"
+        p = run_sessium(self.env(self.a), "export", "aaa", "--out", str(out))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        md = (out / "aaa.md").read_text(encoding="utf-8")
+        self.assertIn("# hey, build me a spaceship", md)
+        self.assertIn("## user", md)
+        self.assertIn("## assistant", md)
+        self.assertIn(f"- project: `{PROJ}`", md)
+        self.assertFalse((out / "bbb.md").exists())     # single only
+
+    def test_export_all_markdown(self):
+        self._write_two()
+        out = self.tmp / "exp"
+        p = run_sessium(self.env(self.a), "export", "--all", "--out", str(out))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("exported 2 session(s)", p.stdout)
+        self.assertTrue((out / "aaa.md").is_file())
+        self.assertTrue((out / "bbb.md").is_file())
+
+    def test_export_html_viewer(self):
+        self._write_two()
+        out = self.tmp / "exp"
+        p = run_sessium(self.env(self.a), "export", "--all", "--html",
+                        "--out", str(out))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("(+ index.html)", p.stdout)
+        page = (out / "aaa.html").read_text(encoding="utf-8")
+        self.assertIn("class='msg user'", page)
+        self.assertIn("hey, build me a spaceship", page)
+        index = (out / "index.html").read_text(encoding="utf-8")
+        self.assertIn("href='aaa.html'", index)
+        self.assertIn("href='bbb.html'", index)
+
+    def test_export_requires_session_or_all(self):
+        p = run_sessium(self.env(self.a), "export")
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("--all", p.stderr)
+
+    def test_export_remote_only_fails(self):
+        self.drive_file("aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
+        p = run_sessium(self.env(self.a), "export", "aaa")
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("pull first", p.stderr)
+
+    def test_onboard_fresh_machine(self):
+        env = self.env(self.a)
+        env["SESSIUM_SYSTEMD_DIR"] = str(self.tmp / "systemd")   # nothing installed
+        p = run_sessium(env, "onboard")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        for marker in ("rclone present", "encryption: off", "Drive reachable",
+                       "no sessions found", "ledger: empty",
+                       "sync timer: not installed", "Stop hook: not installed",
+                       "suggested next steps"):
+            self.assertIn(marker, p.stdout)
+
+    def test_onboard_all_set(self):
+        self._write_two()
+        self.a["state"].write_text(json.dumps({
+            "version": 1,
+            "sessions": {f"{PROJ}/aaa": {"project": PROJ, "id": "aaa",
+                                         "local_md5": "x", "remote_md5": "x",
+                                         "last_synced": "2026-11-05T00:00:00Z"}},
+        }), encoding="utf-8")
+        sdir = self.tmp / "systemd"
+        sdir.mkdir(parents=True)
+        (sdir / "sessium.timer").write_text("[Timer]\n", encoding="utf-8")
+        (self.a["claude"] / "settings.json").write_text(
+            json.dumps({"hooks": {"Stop": [{"hooks": [
+                {"type": "command", "command": "sessium push --quiet"}]}]}}),
+            encoding="utf-8")
+        cfg_path = self.tmp / "config.json"
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        cfg["rclone_remote"] = "sessium-crypt"
+        cfg["drive_folder"] = ""
+        cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+        env = self.env(self.a)
+        env["SESSIUM_SYSTEMD_DIR"] = str(sdir)
+        p = run_sessium(env, "onboard")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        for marker in ("encryption: on", "ledger: 1 session(s)",
+                       "sync timer: installed", "Stop hook: installed",
+                       "all set"):
+            self.assertIn(marker, p.stdout)

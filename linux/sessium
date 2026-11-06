@@ -22,9 +22,11 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import html as html_
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -38,6 +40,7 @@ from pathlib import Path
 
 VERSION = "0.1.0"
 DEBUG = False
+QUIET = False
 
 
 # ---------------------------------------------------------------------------
@@ -45,11 +48,13 @@ DEBUG = False
 # ---------------------------------------------------------------------------
 
 def say(msg: str) -> None:
-    print(msg)
+    if not QUIET:
+        print(msg)
 
 
 def ok(msg: str) -> None:
-    print(f"[OK] {msg}")
+    if not QUIET:
+        print(f"[OK] {msg}")
 
 
 def warn(msg: str) -> None:
@@ -1603,8 +1608,59 @@ def cmd_adopt(args) -> int:
                     args.dry_run)
 
 
+CRYPT_NAME = "sessium-crypt"
+
+
+def setup_encrypted() -> int:
+    """Wrap the plain remote in an rclone crypt layer and point sessium at
+    it. Drive-side data beyond this point is unreadable ciphertext — the
+    password is generated here and shown exactly once."""
+    try:
+        proc = rclone("config", "file", timeout=30)
+    except RcloneError as exc:
+        fail(f"cannot run rclone: {exc}")
+        return 1
+    lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+    if not lines:
+        fail("cannot locate rclone.conf (`rclone config file` came back empty)")
+        return 1
+    conf_path = lines[-1]
+    cfg = load_config()
+    plain = f"{cfg['rclone_remote']}:{cfg['drive_folder']}"
+    password = secrets.token_urlsafe(24)
+    try:
+        rclone("config", "create", CRYPT_NAME, "crypt", f"remote={plain}",
+               f"password={password}", timeout=60)
+    except RcloneError as exc:
+        fail(f"rclone config create failed: {exc}")
+        return 1
+    new_cfg = dict(cfg)                       # keep seeker_url & friends
+    new_cfg["rclone_remote"] = CRYPT_NAME
+    new_cfg["drive_folder"] = ""              # crypt root == old plain root
+    try:
+        config_path().write_text(json.dumps(new_cfg, indent=2) + "\n",
+                                 encoding="utf-8")
+    except OSError as exc:
+        fail(f"cannot write config: {exc}")
+        return 1
+    ok(f"crypt remote '{CRYPT_NAME}' created over {plain} (rclone.conf: {conf_path})")
+    ok("sessium config switched to the crypt remote")
+    say("")
+    say("=" * 62)
+    say("SAVE THIS PASSWORD — encrypted data is unrecoverable without it:")
+    say(f"    {password}")
+    say("=" * 62)
+    say("")
+    say("next: sessium push   (re-uploads everything as ciphertext; existing")
+    say("plaintext copies stay on Drive until you delete them by hand)")
+    return 0
+
+
 def cmd_setup(args) -> int:
-    """Delegate to the platform installer (setup-ubuntu.sh on Linux)."""
+    """Delegate to the platform installer (setup-ubuntu.sh on Linux), or with
+    --encrypted wrap the working Drive remote in an rclone crypt layer."""
+    if getattr(args, "encrypted", False):
+        return setup_encrypted()
     script = Path(__file__).resolve().parent.parent / "setup-ubuntu.sh"
     if not script.is_file():
         fail(f"setup script not found at {script}")
@@ -1616,6 +1672,304 @@ def cmd_setup(args) -> int:
 
 def cmd_version(args) -> int:
     say(f"sessium {VERSION}")
+    return 0
+
+
+def script_path() -> str:
+    """Absolute path of this CLI (works installed or straight from the repo)."""
+    return str(Path(sys.argv[0]).resolve())
+
+
+def systemd_dir() -> Path:
+    """Where user unit files live (SESSIUM_SYSTEMD_DIR overrides, for tests)."""
+    return Path(os.environ.get(
+        "SESSIUM_SYSTEMD_DIR",
+        str(Path.home() / ".config" / "systemd" / "user")))
+
+
+SCHEDULE_SERVICE = """\
+[Unit]
+Description=sessium: sync Claude Code sessions to Drive
+
+[Service]
+Type=oneshot
+ExecStart={sessium} sync
+"""
+
+SCHEDULE_TIMER = """\
+[Unit]
+Description=Run sessium sync periodically
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec={interval}min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+"""
+
+
+def cmd_schedule(args) -> int:
+    """Install (or with --off remove) a systemd user timer running
+    `sessium sync` every --interval minutes (default 30). Without a terminal
+    attached sync resolves conflicts newest-wins automatically."""
+    if args.print:
+        say(SCHEDULE_SERVICE.format(sessium=script_path()).rstrip())
+        say("--- 8< ---")
+        say(SCHEDULE_TIMER.format(interval=args.interval).rstrip())
+        say("--- 8< ---")
+        say(f"units: {systemd_dir()}/sessium.service, {systemd_dir()}/sessium.timer")
+        say("next: systemctl --user daemon-reload && systemctl --user enable --now sessium.timer")
+        return 0
+    if shutil.which("systemctl") is None:
+        fail("systemctl not found — scheduling needs systemd user units")
+        return 1
+    sdir = systemd_dir()
+    sdir.mkdir(parents=True, exist_ok=True)
+    if args.off:
+        subprocess.run(["systemctl", "--user", "disable", "--now",
+                        "sessium.timer"], check=False)
+        for name in ("sessium.timer", "sessium.service"):
+            (sdir / name).unlink(missing_ok=True)
+        subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+        ok("schedule removed (sessium.timer disabled, units deleted)")
+        return 0
+    (sdir / "sessium.service").write_text(
+        SCHEDULE_SERVICE.format(sessium=script_path()), encoding="utf-8")
+    (sdir / "sessium.timer").write_text(
+        SCHEDULE_TIMER.format(interval=args.interval), encoding="utf-8")
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+    subprocess.run(["systemctl", "--user", "enable", "--now", "sessium.timer"],
+                   check=False)
+    ok(f"schedule installed: sessium.timer every {args.interval} minutes")
+    say("check: systemctl --user list-timers sessium.timer")
+    return 0
+
+
+def cmd_hook(args) -> int:
+    """Install (or with --off remove) a Claude Code Stop hook that runs
+    `sessium push --quiet` after every session turn. Edits
+    <claude-dir>/settings.json, leaving unrelated hooks alone."""
+    settings_path = claude_dir() / "settings.json"
+    try:
+        data = json.loads(settings_path.read_text(encoding="utf-8")) \
+            if settings_path.is_file() else {}
+    except (json.JSONDecodeError, OSError) as exc:
+        fail(f"cannot read {settings_path}: {exc}")
+        return 1
+    command = f"{script_path()} push --quiet"
+
+    def is_sessium_hook(entry: dict) -> bool:
+        return "sessium push" in json.dumps(entry.get("hooks", []))
+
+    stop = data.get("hooks", {}).get("Stop", [])
+    stop = [e for e in stop if not is_sessium_hook(e)]
+    if not args.off:
+        stop.append({"matcher": "",
+                     "hooks": [{"type": "command", "command": command}]})
+    if stop:
+        data.setdefault("hooks", {})["Stop"] = stop
+    else:
+        data.get("hooks", {}).pop("Stop", None)
+        if data.get("hooks") == {}:
+            data.pop("hooks", None)
+    if args.print:
+        say(f"would write {settings_path}:")
+        print(json.dumps(data, indent=2, sort_keys=True))
+        return 0
+    try:
+        settings_path.write_text(
+            json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    except OSError as exc:
+        fail(f"cannot write {settings_path}: {exc}")
+        return 1
+    if args.off:
+        ok(f"hook removed from {settings_path}")
+    else:
+        ok(f"hook installed in {settings_path}")
+        say(f"every session turn now ends with: {command}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# export — sessions as Markdown / a small static HTML viewer (Batch 6)
+# ---------------------------------------------------------------------------
+
+EXPORT_CSS = """\
+body{font-family:system-ui,sans-serif;max-width:52rem;margin:2rem auto;
+padding:0 1rem;line-height:1.55;color:#1a1a1a;background:#fafafa}
+h1{border-bottom:2px solid #ddd;padding-bottom:.3rem;font-size:1.4rem}
+.meta{color:#666;font-size:.85rem}
+.msg{margin:.8rem 0;padding:.6rem 1rem;border-radius:.5rem}
+.user{background:#e8f0fe}.assistant{background:#efefef}
+.role{font-weight:600;text-transform:uppercase;font-size:.7rem;color:#555}
+ul{padding-left:1.2rem}li{margin:.3rem 0}"""
+
+
+def render_markdown(project: str, sid: str, path: Path) -> str:
+    title = session_title(path) or sid
+    msgs = transcript_messages(path)
+    lines = [f"# {title}", "",
+             f"- project: `{project}`",
+             f"- session: `{sid}`",
+             f"- messages: {len(msgs)}",
+             "", "---", ""]
+    for role, text in msgs:
+        lines += [f"## {role}", "", text, ""]
+    return "\n".join(lines)
+
+
+def render_session_html(project: str, sid: str, path: Path) -> str:
+    title = session_title(path) or sid
+    msgs = transcript_messages(path)
+    parts = [f"<!doctype html><meta charset='utf-8'><title>{html_.escape(title)}</title>",
+             f"<style>{EXPORT_CSS}</style>",
+             f"<h1>{html_.escape(title)}</h1>",
+             f"<p class='meta'>{html_.escape(project)} · {sid} · "
+             f"{len(msgs)} message(s)</p>"]
+    for role, text in msgs:
+        parts.append(f"<div class='msg {role}'><div class='role'>{role}</div>"
+                     f"{html_.escape(text)}</div>")
+    return "\n".join(parts)
+
+
+def render_index_html(items: list) -> str:
+    lis = "\n".join(
+        f"<li><a href='{html_.escape(it['file'])}'>"
+        f"{html_.escape(it['title'] or it['id'])}</a> "
+        f"<span class='meta'>{html_.escape(it['project'])}</span></li>"
+        for it in items)
+    return ("<!doctype html><meta charset='utf-8'><title>sessium sessions</title>"
+            f"<style>{EXPORT_CSS}</style>"
+            f"<h1>sessium sessions</h1><ul>{lis}</ul>")
+
+
+def cmd_export(args) -> int:
+    """Write sessions out as Markdown (default) or HTML. --all exports every
+    local session and, with --html, adds an index.html viewer page."""
+    out = Path(args.out).expanduser()
+    local_map = filter_map(local_sessions(), args.project)
+    if not getattr(args, "all", False):
+        if not args.session:
+            fail("give a session id, or --all for every local session")
+            return 1
+        row = find_one_session(args.session, local_map, {})
+        if row is None:
+            return 1
+        if row["local"] is None:
+            fail("that session is on Drive only — pull first "
+                 "(export works on local copies)")
+            return 1
+        local_map = {row["project"]: [row["local"]]}
+    items = []
+    count = 0
+    for project, sessions in local_map.items():
+        for s in sessions:
+            src = Path(s["path"])
+            ext = "html" if args.html else "md"
+            fname = f"{s['id']}.{ext}"
+            items.append({"project": project, "id": s["id"],
+                          "title": session_title(src), "file": fname})
+    if not items:
+        say("no sessions to export")
+        return 0
+    out.mkdir(parents=True, exist_ok=True)
+    for it in items:
+        src = claude_dir() / "projects" / it["project"] / f"{it['id']}.jsonl"
+        if not src.is_file():
+            warn(f"skipped {it['id']} (local copy vanished)")
+            continue
+        text = (render_session_html(it["project"], it["id"], src) if args.html
+                else render_markdown(it["project"], it["id"], src))
+        (out / it["file"]).write_text(text, encoding="utf-8")
+        count += 1
+    if args.html and args.all:
+        (out / "index.html").write_text(render_index_html(items), encoding="utf-8")
+    say(f"exported {count} session(s) to {out.resolve()}"
+        + ("  (+ index.html)" if args.html and args.all else ""))
+    return 0
+
+
+def cmd_onboard(args) -> int:
+    """First-run report: what is set up, what is missing, what to run next.
+    Non-fatal — every check prints a line and the worst gap decides the
+    suggested next step."""
+    say("sessium onboard — setup checklist\n")
+    next_steps = []
+    try:
+        proc = rclone("version", timeout=15)
+        version = proc.stdout.splitlines()[0] if proc.stdout else "unknown"
+        ok(f"rclone present ({version})")
+    except RcloneError as exc:
+        fail(f"rclone: {exc}")
+        next_steps.append(("install rclone", "sessium setup"))
+
+    cfg = load_config()
+    encrypted = cfg["rclone_remote"] == CRYPT_NAME
+    if encrypted:
+        ok(f"encryption: on ({CRYPT_NAME})")
+    else:
+        warn("encryption: off — Drive copies are plaintext "
+             "(optional: sessium setup --encrypted)")
+
+    reachable = False
+    try:
+        rclone("lsd", f"{cfg['rclone_remote']}:", timeout=30)
+        ok(f"Drive reachable (remote '{cfg['rclone_remote']}')")
+        reachable = True
+    except RcloneError as exc:
+        fail(f"Drive not reachable: {exc}")
+        next_steps.append(("authorize rclone", "sessium setup"))
+
+    projects = local_sessions()
+    session_count = sum(len(v) for v in projects.values())
+    if session_count:
+        ok(f"local repo: {len(projects)} project(s), {session_count} session(s)")
+    else:
+        warn(f"no sessions found under {claude_dir() / 'projects'}")
+
+    ledger_path = state_path()
+    if ledger_path.is_file():
+        try:
+            n = len(json.loads(ledger_path.read_text(encoding="utf-8"))
+                    .get("sessions", {}))
+            ok(f"ledger: {n} session(s) recorded (has synced at least once)")
+        except (json.JSONDecodeError, OSError):
+            warn("ledger unreadable — it will rebuild on next sync")
+    else:
+        warn("ledger: empty — nothing synced yet "
+             "(first: sessium push, then sessium sync)")
+
+    timer = systemd_dir() / "sessium.timer"
+    if timer.is_file():
+        ok("sync timer: installed (sessium.timer)")
+    else:
+        warn("sync timer: not installed — sessium schedule (sync every 30 min)")
+        next_steps.append(("background sync", "sessium schedule"))
+
+    settings_path = claude_dir() / "settings.json"
+    hooked = False
+    try:
+        if settings_path.is_file() \
+                and "sessium push" in settings_path.read_text(encoding="utf-8"):
+            hooked = True
+    except OSError:
+        pass
+    if hooked:
+        ok("Stop hook: installed (pushes after every session turn)")
+    else:
+        warn("Stop hook: not installed — sessium hook (auto-push per turn)")
+        next_steps.append(("auto-push hook", "sessium hook"))
+
+    say("")
+    if next_steps:
+        say("suggested next steps:")
+        for what, cmd in next_steps:
+            say(f"  {cmd:<24}  # {what}")
+    else:
+        say("all set. everyday commands: status / sync / search / open")
+    say("help: sessium --help   man: man sessium")
     return 0
 
 
@@ -1899,12 +2253,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_push.add_argument("--project", metavar="MUNGED", help="only this project folder")
     p_push.add_argument("--dry-run", action="store_true",
                         help="print actions, change nothing")
+    p_push.add_argument("--quiet", action="store_true",
+                        help="chatter off (for hooks and cron); errors still print")
     p_push.set_defaults(func=cmd_push)
 
     p_pull = sub.add_parser("pull", help="download new/changed sessions from Drive")
     p_pull.add_argument("--project", metavar="MUNGED", help="only this project folder")
     p_pull.add_argument("--dry-run", action="store_true",
                         help="print actions, change nothing")
+    p_pull.add_argument("--quiet", action="store_true",
+                        help="chatter off (for hooks and cron); errors still print")
     p_pull.set_defaults(func=cmd_pull)
 
     p_sync = sub.add_parser(
@@ -1917,6 +2275,8 @@ def build_parser() -> argparse.ArgumentParser:
                              "memory/ or skills/ (no ledger)")
     p_sync.add_argument("--dry-run", action="store_true",
                         help="print actions (incl. conflict decisions), change nothing")
+    p_sync.add_argument("--quiet", action="store_true",
+                        help="chatter off (for hooks and cron); errors still print")
     p_sync.set_defaults(func=cmd_sync)
 
     p_diff = sub.add_parser("diff", help="local vs remote vs ledger for one session")
@@ -1949,6 +2309,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_setup = sub.add_parser("setup", help="run the platform installer (rclone + OAuth)")
     p_setup.add_argument("--check-only", action="store_true",
                          help="pass through: verify existing setup, no prompts")
+    p_setup.add_argument("--encrypted", action="store_true",
+                         help="wrap the Drive remote in an rclone crypt layer "
+                              "(generates a password, shows it once)")
     p_setup.set_defaults(func=cmd_setup)
 
     p_version = sub.add_parser("version", help="print the version")
@@ -2003,6 +2366,41 @@ def build_parser() -> argparse.ArgumentParser:
                         help="source name for seeker (default: this machine's hostname)")
     p_seek.set_defaults(func=cmd_seek)
 
+    p_schedule = sub.add_parser(
+        "schedule", help="install/remove a systemd user timer running `sessium sync`")
+    p_schedule.add_argument("--interval", type=int, default=30, metavar="MIN",
+                            help="minutes between syncs (default 30)")
+    p_schedule.add_argument("--off", action="store_true",
+                            help="disable the timer and remove the unit files")
+    p_schedule.add_argument("--print", action="store_true",
+                            help="print the unit files and commands, change nothing")
+    p_schedule.set_defaults(func=cmd_schedule)
+
+    p_hook = sub.add_parser(
+        "hook", help="install/remove a Claude Code Stop hook running `sessium push --quiet`")
+    p_hook.add_argument("--off", action="store_true",
+                        help="remove the sessium hook from settings.json")
+    p_hook.add_argument("--print", action="store_true",
+                        help="print the resulting settings.json, change nothing")
+    p_hook.set_defaults(func=cmd_hook)
+
+    p_export = sub.add_parser(
+        "export", help="write sessions out as Markdown or a static HTML viewer")
+    p_export.add_argument("session", metavar="ID", nargs="?", default=None,
+                          help="session id (prefix ok); omit with --all")
+    p_export.add_argument("--all", action="store_true",
+                          help="export every local session")
+    p_export.add_argument("--project", metavar="MUNGED", help="only this project folder")
+    p_export.add_argument("--html", action="store_true",
+                          help="HTML instead of Markdown (index.html with --all)")
+    p_export.add_argument("--out", default="sessium-export", metavar="DIR",
+                          help="output directory (default ./sessium-export)")
+    p_export.set_defaults(func=cmd_export)
+
+    p_onboard = sub.add_parser(
+        "onboard", help="first-run report: what is set up, what to do next")
+    p_onboard.set_defaults(func=cmd_onboard)
+
     return parser
 
 
@@ -2038,12 +2436,13 @@ def preprocess_argv(argv: list) -> list:
 
 
 def main(argv=None) -> int:
-    global DEBUG
+    global DEBUG, QUIET
     if argv is None:
         argv = sys.argv[1:]
     parser = build_parser()
     args = parser.parse_args(preprocess_argv(list(argv)))
     DEBUG = args.debug
+    QUIET = getattr(args, "quiet", False)
     try:
         return args.func(args)
     except RcloneError as exc:
