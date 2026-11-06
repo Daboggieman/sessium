@@ -6,9 +6,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from test_sessium import (  # noqa: E402
-    UnitTests, CommandTests, SyncTests, Phase3Tests, Batch3Tests, Batch4Tests,
-    Batch5Tests, Batch6Tests,
+from test_sessium import (
+    Batch3Tests,
+    Batch4Tests,
+    Batch5Tests,
+    Batch6Tests,
+    CommandTests,
+    Phase3Tests,
+    SyncTests,
+    UnitTests,
 )
 
 if __name__ == "__main__":

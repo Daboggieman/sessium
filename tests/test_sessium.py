@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import UTC
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -112,12 +113,12 @@ class UnitTests(unittest.TestCase):
         self.assertEqual(self.mod.human_size(3 * 1024 * 1024), "3.0MB")
 
     def test_parse_rclone_time_variants(self):
-        from datetime import datetime, timezone
+        from datetime import datetime
         self.assertEqual(self.mod.parse_rclone_time("2026-11-03T22:50:00.123456789Z"),
-                         datetime(2026, 11, 3, 22, 50, 0, 123456, tzinfo=timezone.utc))
+                         datetime(2026, 11, 3, 22, 50, 0, 123456, tzinfo=UTC))
         # a +01:00 offset must survive parsing (converted to UTC), not be sliced off
         self.assertEqual(self.mod.parse_rclone_time("2026-11-03T23:50:00+01:00"),
-                         datetime(2026, 11, 3, 22, 50, tzinfo=timezone.utc))
+                         datetime(2026, 11, 3, 22, 50, tzinfo=UTC))
         self.assertIsNone(self.mod.parse_rclone_time(""))
         self.assertIsNone(self.mod.parse_rclone_time("garbage"))
 
@@ -695,7 +696,7 @@ class Batch3Tests(SyncBase):
         self.local_file(self.a, sid).write_text(entry + "\n", encoding="utf-8")
         p = run_sessium(self.env(self.a), "open", sid)
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertIn(f"cd /home/test/proj && claude --resume ", p.stdout)
+        self.assertIn("cd /home/test/proj && claude --resume ", p.stdout)
         # the full id is printed, not the prefix
         self.assertIn(sid, p.stdout)
 
@@ -722,9 +723,9 @@ class Batch3Tests(SyncBase):
 
 # ------------------------------------------------------- batch 4: search
 
-from http.server import BaseHTTPRequestHandler, HTTPServer  # noqa: E402
 import threading  # noqa: E402
 import time  # noqa: E402
+from http.server import BaseHTTPRequestHandler, HTTPServer  # noqa: E402
 
 
 class SeekerStub(BaseHTTPRequestHandler):
@@ -858,8 +859,8 @@ class Batch4Tests(SyncBase):
         snaps = sorted(hdir.glob("*.jsonl"))
         self.assertEqual(len(snaps), 1)
         import hashlib
-        self.assertEqual(snaps[0].name,
-                         f"0001-{hashlib.md5(b'A was here\n').hexdigest()[:8]}.jsonl")
+        digest = hashlib.md5(b"A was here\n").hexdigest()
+        self.assertEqual(snaps[0].name, f"0001-{digest[:8]}.jsonl")
         self.assertEqual(snaps[0].read_text(encoding="utf-8"), "A was here\n")
 
     def test_log_id_lists_history(self):

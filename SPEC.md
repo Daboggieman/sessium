@@ -82,8 +82,16 @@ Precedence, first match wins: env `SESSIUM_CONFIG` (Linux) / `SESSIUM_RCLONE_CON
 config.json:
 
 ```json
-{ "rclone_remote": "gdrive", "drive_folder": "claude-backup" }
+{ "rclone_remote": "gdrive", "drive_folder": "claude-backup",
+  "seeker_url": "", "seeker_token": "" }
 ```
+
+`seeker_url` / `seeker_token` are optional (search integration with the
+[seeker](https://github.com/Daboggieman/seeker) engine — Tailscale-only,
+bearer-auth). With `sessium setup --encrypted`, `rclone_remote` becomes the
+crypt remote `sessium-crypt` and `drive_folder` becomes `""` (the crypt root
+IS the old plain root); the Drive layout is unchanged underneath, just
+ciphertext.
 
 Env overrides (both versions honor the same names where the OS allows):
 
@@ -93,6 +101,7 @@ Env overrides (both versions honor the same names where the OS allows):
 | `SESSIUM_CONFIG` | config file path | `<xdg config>/sessium/config.json` |
 | `SESSIUM_STATE` | ledger path | `<xdg state>/sessium/state.json` |
 | `SESSIUM_RCLONE_BIN` | rclone binary | `rclone` on PATH |
+| `SESSIUM_SYSTEMD_DIR` | user unit dir (`schedule`) | `~/.config/systemd/user` |
 
 ## 6. Conflict semantics (decided 2026-11-03, PLAN §3)
 
@@ -115,9 +124,14 @@ Transcripts are never line-merged.
 `list`, `status`, `check`, `setup` (phase 1) · `push`, `pull`, `sync`
 (phase 2) · `diff`, `resolve`, `revert`, `adopt` (phase 3) · `version`,
 `log` (no id: alias for `list`; with an id: history snapshots), `open`
-(Batch 3). All tree-walking commands take `--project <munged>`. `--json`
-(SPEC §9) on `list`, `status`, `diff`; `--dry-run` on `push`, `pull`,
-`sync`, `revert`, `adopt`, `open`; `sync` additionally `--interactive`.
+(phase 3.5) · `search`, `seek`, `checkout`, `gc` (Batch 4) · `schedule`,
+`hook`, `setup --encrypted` (Batch 5) · `export`, `onboard` (Batch 6).
+All tree-walking commands take `--project <munged>`. `--json`
+(SPEC §9) on `list`, `status`, `diff`, `search`; `--dry-run` on `push`,
+`pull`, `sync`, `revert`, `adopt`, `open`, `checkout`, `gc`; `sync`
+additionally `--interactive` and `--only memory|skills` (ledger-less
+two-way fast lane, per-file newest-wins, never deletes). `--quiet` on
+`push`/`pull`/`sync` silences chatter (hooks/cron); errors still print.
 Exit codes: `0` success (skips are not failures), `1` real failures,
 `130` interrupted.
 
@@ -125,6 +139,13 @@ Exit codes: `0` success (skips are not failures), `1` real failures,
 ledger) so a scheduled run and a manual run can't transfer concurrently;
 `--dry-run` never locks. A lock older than 10 minutes is broken with a
 warning (crashed run); a fresh one is a hard error.
+
+Automation: `sessium schedule [--interval MIN] [--off] [--print]` manages a
+systemd **user** timer running `sessium sync`; `sessium hook [--off] [--print]`
+manages a Claude Code **Stop hook** running `sessium push --quiet` (only
+sessium's entries in settings.json are ever touched). `setup --encrypted`
+wraps the plain remote in an rclone crypt remote `sessium-crypt`, re-points
+config.json and prints the generated password exactly once.
 
 ## 8. Transport rules
 
@@ -137,7 +158,7 @@ transferred copy's md5.
 
 ## 9. `--json` output schema
 
-`--json` (on `list`, `status`, `diff`, and `search` once Batch 4 lands)
+`--json` (on `list`, `status`, `diff`, and `search`)
 prints ONE JSON document on stdout — indent 2, keys sorted — and nothing
 else. Human chatter stays on stderr. All mtimes are UTC
 `%Y-%m-%dT%H:%M:%SZ` strings or `null`, so both versions serialize
@@ -162,10 +183,14 @@ identically. Consumers must ignore unknown keys (the schema is additive).
      "local":  { "path", "size", "md5", "mtime", "messages", "last" } | null,
      "remote": { "size", "md5", "mtime", "messages", "last" } | null,
      "ledger": { "last_synced", "local_md5", "remote_md5" } | null }`
+  With `--messages` also on, an additive `"preview"` key appears when both
+  copies are present: `{ "common", "local_added": [[role, text]…],
+  "remote_added": [[role, text]…] }` (the divergence past the common prefix).
 
-- **`search <q> --json`** (Batch 4) — array of
-  `{ "project", "id", "title", "snippet", "where": "title" | "body",
-     "mtime" }`, best match first.
+- **`search <q> --json`** — array of
+  `{ "project", "id", "title", "snippet", "where": "title" | "body" |
+     "semantic", "mtime" }`, best match first (`mtime` is `null` on
+  semantic hits; `title` may be `""`).
 
 ## 10. History snapshots (Batch 4)
 

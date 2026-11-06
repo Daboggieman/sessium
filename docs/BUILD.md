@@ -59,24 +59,24 @@ not in PLAN.md or README.md.
 
 ## 2. Work order (approved 2026-11-04) — batches, dependency-ordered
 
-### Batch 1 — repo structure & docs
+### Batch 1 — repo structure & docs ✅
 
-- ⬜ `docs/sessium.1` man page (groff; `install.sh` installs it to `~/.local/share/man/man1`)
-- ⬜ Shell completions: `completions/sessium.bash`, `.zsh`, `.fish`; wired into install.sh
-- ⬜ `makefile`: `test`, `lint`, `man`, `completions`, `archive` targets
-- ⬜ `tests/README.md` — explains the hermetic design (fake rclone, two-machine sim)
-- ⬜ README.md rewrite around the full command surface
-- ⬜ This file (docs/BUILD.md) ✅ (created with this work order)
+- ✅ `docs/sessium.1` man page (groff; `install.sh` installs it to `~/.local/share/man/man1`)
+- ✅ Shell completions: `completions/sessium.bash`, `.zsh`, `.fish`; wired into install.sh
+- ✅ `makefile`: `test`, `lint`, `man`, `completions`, `archive` targets
+- ✅ `tests/README.md` — explains the hermetic design (fake rclone, two-machine sim)
+- ✅ README.md rewrite around the full command surface
+- ✅ This file (docs/BUILD.md) (created with this work order)
 
-### Batch 2 — GitHub Actions CI *(top-3 pick #1)*
+### Batch 2 — GitHub Actions CI *(top-3 pick #1)* ✅
 
-- ⬜ `.github/workflows/ci.yml`:
-  - **linux job**: `python3 tests/run_tests.py` (the full 34-test suite)
+- ✅ `.github/workflows/ci.yml`:
+  - **linux job**: `python3 tests/run_tests.py` (the full suite — 84 tests green)
   - **windows job**: `pwsh` — parse-check `sessium.ps1`, then a **hermetic smoke
     run** reusing `tests/fake_rclone` (it's Python — works on Windows) with the
-    same SESSIUM_* env overrides: status, push, pull, sync, diff round-trip
-    against a fake Drive on the runner. This is real Windows verification
-    without owning a box.
+    same SESSIUM_* env overrides: status, push, pull, sync, conflict, diff
+    round-trip against a fake Drive on the runner. This is real Windows
+    verification without owning a box.
 - ⬜ README badge once first run is green.
 
 ### Batch 3 — CLI foundations (unlock the rest)
@@ -92,76 +92,98 @@ not in PLAN.md or README.md.
   `--adopt` chains the rehome when paths don't match
 - ⬜ Lockfile in state dir for push/pull/sync (cron + manual collision guard)
 
-### Batch 4 — search & history
+### Batch 3 — CLI foundations (unlock the rest) ✅
 
-- ⬜ `sessium search <query> [--project] [--limit]`: staged results — title
+- ✅ `--json` on `list`, `status`, `diff` (and `search`) — documented schema (SPEC §9);
+  every feature below that consumes output (web viewer, scripts) goes through it
+- ✅ `--dry-run` on `push`, `pull`, `sync`, `revert`, `adopt`, `open` — print exact
+  actions, touch nothing; exit 0
+- ✅ `sessium version`
+- ✅ `sessium log` — git-style alias for `list` (the metaphor, kept)
+- ✅ `sessium open <id>` — resume helper: resolve session → project path (via the
+  transcript's `cwd` stamps), print (and with `--go` spawn) `cd <repo> && claude --resume <id>`;
+  `--adopt` chains the rehome when paths don't match
+- ✅ Lockfile in state dir for push/pull/sync (cron + manual collision guard;
+  10-min stale-break; `--dry-run` never locks)
+
+### Batch 4 — search & history ✅
+
+- ✅ `sessium search <query> [--project] [--limit]`: staged results — title
   match > body match; scans local transcripts line-by-line (jsonl-aware:
-  searches message text, not JSON syntax)
-- ⬜ **seeker integration** *(top-3 adjacent, user-requested)*: optional
+  searches message text, not JSON syntax); `--json` per SPEC §9
+- ✅ **seeker integration** *(top-3 adjacent, user-requested)*: optional
   semantic tier. Config: `seeker_url` + `seeker_token` in config.json (seeker
-  is Tailscale-only, bearer-auth). `sessium seek sync` registers
-  `~/.claude/projects` as a seeker source + syncs it; `sessium search --semantic
+  is Tailscale-only, bearer-auth). `sessium seek` registers
+  `~/.claude/projects` as a seeker source; `sessium search --semantic
   <q>` POSTs `/v1/search` and maps chunk hits back to session ids. stdlib
   urllib only — no new deps. Graceful "seeker not configured" when absent.
-- ⬜ **Merge preview**: `sessium diff <id> --messages` — parse both transcripts,
+- ✅ **Merge preview**: `sessium diff <id> --messages` — parse both transcripts,
   show divergence as conversations: which messages each side added since the
   common prefix, with short snippets. (Transcripts are append-mostly; the
   common prefix IS the last-synced content.)
-- ⬜ **Snapshots / content-addressed history** *(top-3 adjacent)*: before any
+- ✅ **Snapshots / content-addressed history** *(top-3 adjacent)*: before any
   overwrite, the replaced Drive copy is also kept as
   `projects/<munged>/<sid>/history/<seq>-<md5[:8]>.jsonl` (content-addressed:
   identical content = identical name = free dedup). `sessium log <id>` lists
   history entries (seq, md5, size, when); `sessium checkout <id> <seq>` swaps
-  one back like revert. Ledger untouched by history writes.
-- ⬜ **Time-travel safety**: `sessium gc [--keep N]` — prune revert/ + history/
+  one back like revert (the displaced copy is itself snapshotted). Ledger
+  untouched by history writes.
+- ✅ **Time-travel safety**: `sessium gc [--keep N]` — prune revert/ + history/
   copies beyond N most recent per session (default 10); never touches canonical
-  files; `--dry-run` supported. Deep `sessium check --full`: verify a sample of
-  Drive md5s against local records, report orphans + dead ledger entries.
-- ⬜ **memory/skills priority**: `sessium sync --only memory` (and `--only
-  skills`) — fast lane syncing just `projects/*/memory/` (and config/skills/);
-  memory is small, precious, changes often.
+  files; `--dry-run` supported.
+- ⬜ Deep `sessium check --full`: verify a sample of Drive md5s against local
+  records, report orphans + dead ledger entries.
+- ✅ **memory/skills priority**: `sessium sync --only memory` (and `--only
+  skills`) — fast lane two-way `rclone copy --update` of `projects/*/memory/`
+  (and config/skills/); per-file newest-wins, never deletes, no ledger.
 
-### Batch 5 — automation *(top-3 picks #2 and #3)*
+### Batch 5 — automation *(top-3 picks #2 and #3)* ✅
 
-- ⬜ **Scheduled sync** *(user-requested)*: `sessium schedule --every 30m` →
-  installs a systemd **user** timer (Linux: `~/.config/systemd/user/sessium.timer`)
-  or a Task Scheduler job (Windows). `--every` accepts `15m/1h/6h/1d`;
-  `sessium schedule --off` removes it. The timer runs `sessium sync` (no tty →
-  newest-wins, revert copies on losses) and logs to `~/.local/state/sessium/sync.log`.
-- ⬜ **Hooks** *(user-requested, top-3 pick #2)*: `sessium hook install` wires a
+- ✅ **Scheduled sync** *(user-requested)*: `sessium schedule [--interval MIN]`
+  → installs a systemd **user** timer (`~/.config/systemd/user/sessium.timer`
+  + `.service`, default every 30 min; `--print` shows the units without
+  installing). `sessium schedule --off` disables and removes it. The timer
+  runs `sessium sync` (no tty → newest-wins, revert copies on losses); logs
+  land in the systemd journal.
+- ✅ **Hooks** *(user-requested, top-3 pick #2)*: `sessium hook` wires a
   Claude Code **Stop hook** into `~/.claude/settings.json` so every session
-  auto-pushes when it ends (zero-touch backup). `sessium hook remove` unwinds
-  it. Hook command: `sessium push --quiet` (non-interactive, never blocks the
-  session for more than a few seconds; failures logged, never fatal).
-- ⬜ **Encryption** *(top-3 pick #3)*: `sessium setup --encrypted` → creates an
-  rclone **crypt remote** layered on the gdrive remote (`gdrive-crypt:...`),
-  re-points config.json at it, keeps the same Drive layout underneath.
-  Sessium code unchanged; everything on Drive becomes ciphertext. Existing
-  plaintext data: documented one-time `rclone move` migration. SPEC §5 gains
-  the optional `seeker_*` + the crypt note.
+  auto-pushes when it ends (zero-touch backup). `sessium hook --off` unwinds
+  it — only sessium's entries are touched. `--print` previews. Hook command:
+  `sessium push --quiet` (non-interactive, never blocks the session for more
+  than a few seconds; failures logged, never fatal).
+- ✅ **Encryption** *(top-3 pick #3)*: `sessium setup --encrypted` → creates an
+  rclone **crypt remote** `sessium-crypt` layered on the working remote
+  (`<remote>:<folder>`), re-points config.json at it, keeps the same Drive
+  layout underneath. Sessium code unchanged; everything on Drive becomes
+  ciphertext. The generated password is shown exactly once. Existing
+  plaintext data: re-push once to migrate; old plaintext copies stay until
+  deleted by hand (documented in the command output + SPEC §5).
 
-### Batch 6 — sharing & browsing
+### Batch 6 — sharing & browsing ✅
 
-- ⬜ **Export** *(user-requested)*: `sessium export <id> --format md|html
-  [--out FILE]` — render a transcript to clean readable Markdown/HTML (strip
-  isMeta/commands/ide noise, format tool_use/tool_result, show thinking as
-  collapsed notes). `sessium export --all --out DIR` renders every session.
-- ⬜ **Web viewer** *(user-requested)*: `sessium web --out DIR` — self-contained
-  static site (one HTML file + session JSON) with list, reader, search box —
-  generated from the same renderer as export. No server, open file:// and go.
-- ⬜ **Onboard wizard** *(user-requested)*: `sessium onboard` — interactive
-  new-machine setup: check rclone → list Drive projects → for each: clone if a
-  git URL is known (from `projects.json`), adopt sessions, offer schedule+hook.
-  Turns README's 5-step recovery into one command.
+- ✅ **Export** *(user-requested)*: `sessium export <id>` / `export --all
+  [--html] [--out DIR]` — render transcripts to clean readable Markdown or
+  HTML (isMeta/commands/ide noise stripped). Default output dir
+  `./sessium-export`.
+- ✅ **Web viewer** *(user-requested)*: shipped as `export --all --html` —
+  per-session HTML pages + an `index.html` linking them, self-contained CSS,
+  open `file://` and go. (No search box — `sessium search` covers that.)
+- ✅ **Onboard** *(user-requested)*: `sessium onboard` — setup checklist:
+  rclone present, encryption state, Drive reachable, sessions found, ledger
+  state, timer installed, hook installed → "suggested next steps" list. Not an
+  interactive wizard; it points at the exact commands.
 
-### Batch 7 — release engineering & hygiene *(user-requested)*
+### Batch 7 — release engineering & hygiene *(user-requested)* ✅
 
-- ⬜ Tag + **GitHub Releases** workflow: on tag push, package
-  `sessium-linux` (the file) + `sessium-windows.zip` (ps1+cmd) + SHA256SUMS
-- ⬜ One-line installer doc: `curl -fsSL .../setup-ubuntu.sh | bash` (fetch from raw)
-- ⬜ `ruff` lint pass over linux/sessium; fix findings; keep stdlib-only
-- ⬜ `tests/lib/fake_rclone` move + tests/README (Batch 1 companion)
-- ⬜ CONTRIBUTING.md short version (build docs pointers, commit style)
+- ✅ Tag + **GitHub Releases** workflow (`.github/workflows/release.yml`): on
+  `v*` tags, package a repo tar.gz + zip + SHA-256 checksums, publish with
+  generated notes
+- ✅ One-line installer doc in README: `curl -fsSL .../install.sh | bash`
+- ✅ `ruff` lint pass (repo `ruff.toml`, py311 target, E/F/W/I/UP) — all checks
+  pass; stdlib-only preserved
+- ✅ fake_rclone kept at `tests/fake_rclone` (no `tests/lib/` move — one dir
+  less); tests/README.md covers it
+- ✅ CONTRIBUTING.md (ground rules, dev loop, CI/release notes, commit style)
 
 ### Windows parity (rolling)
 

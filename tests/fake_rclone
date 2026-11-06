@@ -17,7 +17,7 @@ import hashlib
 import json
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 
@@ -53,7 +53,7 @@ def entry(path: Path, display: str, want_hash: bool) -> dict:
         "Name": path.name,
         "Size": stat.st_size if path.is_file() else 0,
         "MimeType": "inode/directory" if path.is_dir() else "application/octet-stream",
-        "ModTime": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).strftime(
+        "ModTime": datetime.fromtimestamp(stat.st_mtime, tz=UTC).strftime(
             "%Y-%m-%dT%H:%M:%S.%f000Z"          # ns precision, like real rclone
         ),
         "IsDir": path.is_dir(),

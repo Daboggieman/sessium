@@ -35,7 +35,7 @@ import time
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 VERSION = "0.1.0"
@@ -123,10 +123,10 @@ def load_config() -> dict:
     if legacy.is_file():
         try:
             text = legacy.read_text(encoding="utf-8")
-            match = re.search(r'^DRIVE_REMOTE="([^"]*)"', text, re.M)
+            match = re.search(r'^DRIVE_REMOTE="([^"]*)"', text, re.MULTILINE)
             if match:
                 cfg["rclone_remote"] = match.group(1)
-            match = re.search(r'^DRIVE_DIR="([^"]*)"', text, re.M)
+            match = re.search(r'^DRIVE_DIR="([^"]*)"', text, re.MULTILINE)
             if match:
                 cfg["drive_folder"] = match.group(1)
         except OSError as exc:
@@ -185,7 +185,7 @@ def record_sync(ledger: dict, project: str, sid: str,
         "id": sid,
         "local_md5": local_md5,
         "remote_md5": remote_md5,
-        "last_synced": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "last_synced": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
 
 
@@ -318,7 +318,7 @@ def parse_rclone_time(value: str):
     value = re.sub(r"\.(\d{6})\d+", r".\1", value)
     try:
         return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(
-            timezone.utc
+            UTC
         )
     except ValueError:
         return None
@@ -333,7 +333,7 @@ def mtime_of(session: dict):
     if isinstance(value, datetime):
         return value
     try:
-        return datetime.fromtimestamp(value, tz=timezone.utc)
+        return datetime.fromtimestamp(value, tz=UTC)
     except (OSError, OverflowError, ValueError):
         return None
 
@@ -701,10 +701,10 @@ def iso_time(value) -> str | None:
     if value is None or value == "":
         return None
     if isinstance(value, datetime):
-        return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     try:
         return datetime.fromtimestamp(
-            value, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            value, tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     except (OSError, OverflowError, ValueError):
         return None
 
@@ -879,7 +879,94 @@ def cmd_check(args) -> int:
         say(f"     ledger not created yet — push/pull/sync will create it "
             f"at {state_path()}")
 
-    return 0
+    if not getattr(args, "full", False):
+        return 0
+    return deep_check(cfg, projects)
+
+
+def pick_sample(items: list, count: int) -> list:
+    """Deterministic, evenly spread sample of a sorted list (up to count)."""
+    if len(items) <= count:
+        return list(items)
+    step = len(items) / count
+    return [items[min(len(items) - 1, int(i * step))] for i in range(count)]
+
+
+def deep_check(cfg: dict, projects: dict) -> int:
+    """The --full half of check: audit the ledger against both sides and
+    spot-verify a sample of in-sync sessions (local bytes vs Drive hash).
+    Read-only. Orphans and dead ledger entries are informational (sessium
+    never deletes); an md5 spot-check mismatch is a real failure."""
+    say("")
+    say("deep check (--full):")
+    try:
+        remote_map = remote_sessions(cfg)
+    except RcloneError as exc:
+        fail(f"deep check: cannot list Drive: {exc}")
+        return 1
+
+    local_keys, local_md5s = set(), {}
+    for project, sessions in projects.items():
+        for sess in sessions:
+            key = f"{project}/{sess['id']}"
+            local_keys.add(key)
+            local_md5s[key] = sess["md5"]
+    remote_keys, remote_md5s = set(), {}
+    for project, sessions in remote_map.items():
+        for sess in sessions:
+            key = f"{project}/{sess['id']}"
+            remote_keys.add(key)
+            remote_md5s[key] = sess["md5"]
+    live = local_keys | remote_keys
+
+    ledger = load_ledger().get("sessions", {})
+
+    # 7. dead ledger entries — recorded, but the file is gone from both sides
+    dead = sorted(set(ledger) - live)
+    if dead:
+        warn(f"dead ledger entries: {len(dead)} (harmless; they classify as "
+             "new-here/new-there until pruned by hand)")
+        for key in dead[:10]:
+            say(f"       - {key}")
+        if len(dead) > 10:
+            say(f"       … and {len(dead) - 10} more")
+    else:
+        ok("ledger: no dead entries")
+
+    # 8. orphans — on Drive but never recorded here (normal: other machines)
+    orphans = sorted((remote_keys - local_keys) - set(ledger))
+    if orphans:
+        say(f"     orphans on Drive (never synced from this machine): "
+            f"{len(orphans)} — expected for other machines' sessions")
+        for key in orphans[:10]:
+            orphan_project, orphan_sid = key.rsplit("/", 1)
+            say(f"       - {orphan_project}/{short_id(orphan_sid)}")
+        if len(orphans) > 10:
+            say(f"       … and {len(orphans) - 10} more")
+    else:
+        ok("no orphans on Drive")
+
+    # 9. spot-check: live local md5 vs live Drive md5 on in-sync sessions
+    candidates = sorted(
+        key for key in local_keys & remote_keys
+        if ledger.get(key, {}).get("local_md5") == ledger.get(key, {}).get("remote_md5")
+        and remote_md5s.get(key))
+    sample = pick_sample(candidates, 10)
+    mismatches = 0
+    for key in sample:
+        project, sid = key.rsplit("/", 1)
+        if local_md5s[key] == remote_md5s[key]:
+            ok(f"spot-check {project}/{short_id(sid)}: md5 matches on both sides")
+        else:
+            fail(f"spot-check {key}: local md5 {local_md5s[key]} "
+                 f"!= Drive md5 {remote_md5s[key]} — re-push or re-pull this session")
+            mismatches += 1
+    if not sample:
+        say("     nothing to spot-check yet (no sessions on both sides)")
+    elif not mismatches:
+        ok(f"spot-check: {len(sample)} session(s) verified")
+
+    return 1 if mismatches else 0
 
 
 def transfer_summary(pushed: int, pulled: int, conflicts_skipped: int,
@@ -1918,11 +2005,9 @@ def cmd_onboard(args) -> int:
         warn("encryption: off — Drive copies are plaintext "
              "(optional: sessium setup --encrypted)")
 
-    reachable = False
     try:
         rclone("lsd", f"{cfg['rclone_remote']}:", timeout=30)
         ok(f"Drive reachable (remote '{cfg['rclone_remote']}')")
-        reachable = True
     except RcloneError as exc:
         fail(f"Drive not reachable: {exc}")
         next_steps.append(("authorize rclone", "sessium setup"))
@@ -2252,6 +2337,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_status.set_defaults(func=cmd_status)
 
     p_check = sub.add_parser("check", help="read-only self-test of the whole setup")
+    p_check.add_argument("--full", action="store_true",
+                         help="audit the ledger (orphans, dead entries) and "
+                              "spot-verify a sample of in-sync sessions")
     p_check.set_defaults(func=cmd_check)
 
     p_push = sub.add_parser("push", help="upload new/changed sessions to Drive")
