@@ -30,6 +30,16 @@ def split_remote(arg: str) -> Path:
     return Path(os.environ["FAKE_DRIVE_ROOT"]) / rest
 
 
+def resolve_arg(arg: str) -> Path:
+    """Remote URL or local path? Rclone's own rule: a single character before
+    the ':' is a Windows drive letter (C:\\Users\\...), not a remote name.
+    Without this, every local path on Windows would be read inside the fake
+    Drive and the smoke run could never pass."""
+    if ":" in arg and len(arg.split(":", 1)[0]) > 1:
+        return split_remote(arg)
+    return Path(arg)
+
+
 def list_dir_json(target: Path, recursive: bool, want_hash: bool) -> None:
     if not target.is_dir():
         print(f'directory not found: "{target}"', file=sys.stderr)
@@ -105,10 +115,10 @@ def main() -> None:
         recursive = "--recursive" in rest
         want_hash = "--hash" in rest
         positional = [a for a in rest if not a.startswith("--")]
-        list_dir_json(split_remote(positional[0]), recursive, want_hash)
+        list_dir_json(resolve_arg(positional[0]), recursive, want_hash)
         return
     if args[0] == "cat":
-        target = split_remote(args[1])
+        target = resolve_arg(args[1])
         if not target.is_file():
             print(f"file not found: {target}", file=sys.stderr)
             sys.exit(1)
@@ -116,8 +126,8 @@ def main() -> None:
         return
     if args[0] == "copyto":
         src, dst = args[1], args[2]
-        src_path = split_remote(src) if ":" in src else Path(src)
-        dst_path = split_remote(dst) if ":" in dst else Path(dst)
+        src_path = resolve_arg(src)
+        dst_path = resolve_arg(dst)
         if not src_path.is_file():
             print(f"file not found: {src_path}", file=sys.stderr)
             sys.exit(1)
@@ -130,8 +140,8 @@ def main() -> None:
         # newer on the destination (per-file newest-wins, what sync --only uses)
         update = "--update" in args
         positional = [a for a in args[1:] if not a.startswith("-")]
-        src_dir = split_remote(positional[0]) if ":" in positional[0] else Path(positional[0])
-        dst_dir = split_remote(positional[1]) if ":" in positional[1] else Path(positional[1])
+        src_dir = resolve_arg(positional[0])
+        dst_dir = resolve_arg(positional[1])
         if not src_dir.is_dir():
             print(f"directory not found: {src_dir}", file=sys.stderr)
             sys.exit(1)
