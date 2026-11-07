@@ -48,11 +48,19 @@ $lines = @(
     '{"type":"assistant","message":{"content":"ok"}}'
 )
 $sessionText = ($lines -join "`n") + "`n"
+
+# exact-byte writes: no BOM, no automatic CRLF translation (Set-Content
+# would add both on Windows and break the round-trip comparisons)
+$utf8 = New-Object System.Text.UTF8Encoding($false)
+function Write-Exact([string]$Path, [string]$Text) {
+    [System.IO.File]::WriteAllText($Path, $Text, $utf8)
+}
+
 $sessionA = Join-Path $claudeA "projects\$proj\aaa.jsonl"
-Set-Content -LiteralPath $sessionA -Value $sessionText -Encoding UTF8
+Write-Exact $sessionA $sessionText
 
 # config + env
-Set-Content -Path (Join-Path $tmp "config.json") -Value '{"rclone_remote":"fake","drive_folder":"backup"}' -Encoding UTF8
+Write-Exact (Join-Path $tmp "config.json") '{"rclone_remote":"fake","drive_folder":"backup"}'
 $env:SESSIUM_CLAUDE_DIR = $claudeA
 $env:SESSIUM_STATE = Join-Path $tmp "machine-a\state.json"
 $env:SESSIUM_CONFIG = Join-Path $tmp "config.json"
@@ -62,7 +70,7 @@ $env:FAKE_DRIVE_ROOT = $drive
 Write-Host "== roundtrip: A pushes, B pulls =="
 
 # 1. A status: remote has nothing yet -> new-here
-Set-Content -LiteralPath (Join-Path $tmp "config.json") -Value '{"rclone_remote":"fake","drive_folder":"backup"}' -Encoding UTF8
+Write-Exact (Join-Path $tmp "config.json") '{"rclone_remote":"fake","drive_folder":"backup"}'
 $r = Run-Sessium @("status")
 Assert-True ($r.code -eq 0) "status exits 0"
 Assert-True ($r.text -match "new-here") "status classifies new-here"
@@ -81,7 +89,7 @@ $r = Run-Sessium @("pull")
 Assert-True ($r.code -eq 0) "B pull exits 0"
 $sessionB = Join-Path $claudeB "projects\$proj\aaa.jsonl"
 Assert-True (Test-Path $sessionB) "session downloaded on B"
-Assert-Equal $sessionText (Get-Content $sessionB -Raw) "content survives the round-trip"
+Assert-Equal $sessionText ((Get-Content $sessionB -Raw) -replace "`r`n", "`n") "content survives the round-trip"
 
 $r = Run-Sessium @("status")
 Assert-True ($r.text -match "in-sync") "B sees in-sync after pull"
@@ -99,21 +107,100 @@ Assert-True ((Get-Content $sessionB -Raw).Contains("A's extra line")) "B syncs t
 
 # 5. conflict: both edit, B pushes last -> A's sync resolves newest-wins
 $env:SESSIUM_CLAUDE_DIR = $claudeA
-Set-Content -LiteralPath $sessionA -Value "A was here" -Encoding utf8
+Write-Exact $sessionA "A was here`n"
 $env:SESSIUM_CLAUDE_DIR = $claudeB
-Set-Content -LiteralPath $sessionB -Value "B was here" -Encoding utf8
+Write-Exact $sessionB "B was here`n"
 $null = Run-Sessium @("push")
 
+$env:SESSIUM_CLAUDE_DIR = $claudeA
 $r = Run-Sessium @("sync")
 Assert-True ($r.code -eq 0) "conflict sync exits 0"
 Assert-True ($r.text -match "remote wins") "newest-wins picks remote (B pushed last)"
-Assert-Equal "B was here" (Get-Content $sessionA -Raw) "A's local copy replaced by remote"
+Assert-Equal "B was here`n" ((Get-Content $sessionA -Raw) -replace "`r`n", "`n") "A's local copy replaced by remote"
 Assert-True (Test-Path (Join-Path $claudeA "projects\$proj\revert")) "loser kept in revert/"
 
 # 6. diff works
 $r = Run-Sessium @("diff", "aaa")
 Assert-True ($r.code -eq 0) "diff exits 0"
 Assert-True ($r.text -match "remote") "diff shows both sides"
+
+# --- batch 3 foundations -----------------------------------------------------
+
+Write-Host "== batch 3 foundations =="
+
+# version
+$r = Run-Sessium @("version")
+Assert-True ($r.code -eq 0) "version exits 0"
+Assert-True ($r.text -match "^sessium ") "version prints the banner"
+
+# list --json: one JSON doc, schema keys present
+$r = Run-Sessium @("list", "--json")
+Assert-True ($r.code -eq 0) "list --json exits 0"
+$json = @($r.text | ConvertFrom-Json)
+Assert-True ($json.Count -ge 1) "list --json returns rows"
+Assert-True ($null -ne $json[0].project -and $null -ne $json[0].id) "rows carry project/id"
+Assert-True ($json[0].mtime -match "Z$") "mtime is UTC ISO"
+
+# list --json --titles adds title
+$r = Run-Sessium @("list", "--json", "--titles")
+$json = @($r.text | ConvertFrom-Json)
+Assert-True ($json[0].title -eq "hey, build me a spaceship") "--titles extracts the title"
+
+# status --json
+$r = Run-Sessium @("status", "--json")
+Assert-True ($r.code -eq 0) "status --json exits 0"
+$json = $r.text | ConvertFrom-Json
+Assert-True ($json.reachable -eq $true) "status --json reports reachable"
+Assert-True ($json.sessions -ge 1) "status --json counts sessions"
+Assert-True ($json.rows[0].state -eq "in-sync") "rows carry state"
+Assert-True ($null -ne $json.rows[0].local.md5) "rows carry local md5"
+
+# diff --json
+$r = Run-Sessium @("diff", "aaa", "--json")
+Assert-True ($r.code -eq 0) "diff --json exits 0"
+$json = $r.text | ConvertFrom-Json
+Assert-True ($json.id -like "aaa*") "diff --json resolves the id"
+Assert-True ($json.local.messages -ge 1) "diff --json counts messages"
+Assert-True ($null -ne $json.remote -and $null -ne $json.ledger) "diff --json has remote + ledger"
+
+# push --dry-run: prints intent, touches nothing
+Add-Content -LiteralPath $sessionA -Value "A dry-run edit" -Encoding utf8
+$r = Run-Sessium @("push", "--dry-run")
+Assert-True ($r.text -match "would push") "push --dry-run prints intent"
+Assert-True (-not (Get-Content $driveFile -Raw).Contains("A dry-run edit")) "dry-run touched nothing"
+
+# real push clears the pending change, then --quiet is silent when in-sync
+$null = Run-Sessium @("push")
+$r = Run-Sessium @("push", "--quiet")
+Assert-True ($r.code -eq 0) "push --quiet exits 0"
+Assert-True ($r.text.Trim() -eq "") "push --quiet prints nothing when in-sync"
+
+# lockfile: a fresh lock blocks a second transfer
+$lockPath = Join-Path (Split-Path -Parent $env:SESSIUM_STATE) "sync.lock"
+Set-Content -LiteralPath $lockPath -Value "held" -Encoding ASCII
+$r = Run-Sessium @("push")
+Assert-True ($r.code -eq 1) "fresh lock blocks a concurrent push"
+Remove-Item -LiteralPath $lockPath -Force
+
+# revert --dry-run: lists copies, prompts nothing (A lost its copy in step 5)
+$r = Run-Sessium @("revert", "aaa", "--dry-run")
+Assert-True ($r.code -eq 0) "revert --dry-run exits 0"
+Assert-True ($r.text -match "would prompt") "revert --dry-run stops before the prompt"
+
+# open prints the resume command (no cwd stamp -> flagged guess, still prints)
+$r = Run-Sessium @("open", "aaa")
+Assert-True ($r.code -eq 0) "open exits 0"
+Assert-True ($r.text -match "claude --resume aaa") "open prints the resume line"
+
+# log with no id behaves like list
+$r = Run-Sessium @("log")
+Assert-True ($r.code -eq 0) "log (no id) exits 0"
+Assert-True ($r.text -match "aaa") "log lists sessions"
+
+# log <id> with no snapshots yet is a friendly no-op
+$r = Run-Sessium @("log", "aaa")
+Assert-True ($r.code -eq 0) "log <id> exits 0"
+Assert-True ($r.text -match "no history yet") "log <id> explains missing history"
 
 Write-Host ""
 if ($script:failed -gt 0) {

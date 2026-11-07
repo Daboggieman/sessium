@@ -31,6 +31,10 @@ subcommands sessium uses (`version`, `lsd`, `lsf`, `lsjson`, `copyto`,
 `cat`) against a plain directory that mirrors the Drive folder layout.
 It reports real md5s and nanosecond ModTimes like the real transport.
 
+`fake_rclone.cmd` is the Windows shim for it (`python … %*`), so the
+PowerShell smoke run (`ci_smoke.ps1`) can point `SESSIUM_RCLONE_BIN` at
+the same stub.
+
 **It exits 1 on any command it doesn't know — deliberately.** If sessium
 starts calling a new rclone subcommand, the tests fail loudly until the
 stub learns it. Same discipline for new flags.

@@ -190,8 +190,19 @@ not in PLAN.md or README.md.
 
 ### Windows parity (rolling)
 
-- 🪟 Every Batch 3–6 command needs a PowerShell counterpart after it stabilizes
-  on Linux. Tracked per-batch here; SPEC §7 updated as commands land.
+- ✅ **Batch 3 foundations ported to `windows/sessium.ps1`** (2026-11-07):
+  `version`, `log` (alias + `<id>` history listing), `open` (--go/--adopt),
+  `--json` on list/status/diff via a hand-rolled PS 5.1 serializer that
+  mirrors Python's `json.dumps(indent=2, sort_keys=True)` byte-for-byte,
+  `--dry-run` on push/pull/sync/revert/adopt/open, `--quiet`, and the
+  `sync.lock` transfer lockfile. Smoke run (`tests/ci_smoke.ps1`) extended:
+  version/json schemas/dry-run/quiet/lockfile/open + a fake_rclone.cmd shim
+  so CI's Windows job can actually run the stub. Also fixed two latent
+  smoke bugs (final sync of the conflict sequence ran as the wrong machine;
+  Set-Content CRLF/BOM would break exact-content assertions).
+- 🪟 Still to port: Batch 4 (search/seek, diff --messages, history snapshots
+  + checkout, gc, check --full, sync --only), Batch 5 (schedule → schtasks
+  equivalent, hook, setup --encrypted), Batch 6 (export, onboard).
 
 ---
 

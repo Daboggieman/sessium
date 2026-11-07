@@ -5,8 +5,9 @@
 # Drive data and the same ledger format; SPEC.md is the contract between
 # the two versions and wins on any disagreement.
 #
-# Phase 4 surface (SPEC section 7): list, status, check, setup,
-# push, pull, sync, diff, resolve, revert, adopt.
+# Surface so far (SPEC section 7): list, status, check, setup, push, pull,
+# sync, diff, resolve, revert, adopt + Batch 3 foundations: version, log,
+# open, --json, --dry-run, --quiet, transfer lockfile.
 #
 # Usage: powershell -ExecutionPolicy Bypass -File sessium.ps1 <command> [args]
 #        (sessium.cmd on your PATH wraps this; install.ps1 installs both)
@@ -14,6 +15,7 @@
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = "Stop"
 $script:Debug = $false
+$script:Quiet = $false
 $script:Version = "0.1.0"
 
 # ---------------------------------------------------------------- utilities
@@ -22,7 +24,9 @@ function Write-Dbg([string]$Msg) {
     if ($script:Debug) { Write-Host "  [debug] $Msg" -ForegroundColor DarkGray }
 }
 
-function Write-Info([string]$Msg) { Write-Host $Msg }
+function Write-Info([string]$Msg) {
+    if (-not $script:Quiet) { Write-Host $Msg }
+}
 
 function Write-Warn2([string]$Msg) { Write-Host $Msg -ForegroundColor Yellow }
 
@@ -81,6 +85,100 @@ function Get-JsonProp($Obj, [string]$Name) {
     $p = $Obj.PSObject.Properties[$Name]
     if ($p) { return $p.Value }
     return $null
+}
+
+# ---------------------------------------------------------------- json (SPEC 9)
+
+<# JSON string escaping identical to Python's json.dumps default
+   (ensure_ascii): control chars, quote, backslash; every char > 0x7E
+   becomes \uXXXX. .NET strings are UTF-16, so astral chars arrive as
+   surrogate pairs and each half is escaped on its own - same bytes out. #>
+function ConvertTo-JsonString([string]$S) {
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append('"')
+    foreach ($ch in $S.ToCharArray()) {
+        $code = [int]$ch
+        switch ($code) {
+            0x22 { [void]$sb.Append('\"'); continue }
+            0x5C { [void]$sb.Append('\\'); continue }
+            0x08 { [void]$sb.Append('\b'); continue }
+            0x0C { [void]$sb.Append('\f'); continue }
+            0x0A { [void]$sb.Append('\n'); continue }
+            0x0D { [void]$sb.Append('\r'); continue }
+            0x09 { [void]$sb.Append('\t'); continue }
+        }
+        if ($code -lt 0x20 -or $code -gt 0x7E) {
+            [void]$sb.Append(('\u{0:x4}' -f $code))
+        } else {
+            [void]$sb.Append($ch)
+        }
+    }
+    [void]$sb.Append('"')
+    return $sb.ToString()
+}
+
+<# Serialize one already-shaped value at a given indent level. Hashtables
+   (keys sorted ordinal), arrays, strings, bools, ints, $null. Output is
+   byte-identical to Python json.dumps(data, indent=2, sort_keys=True). #>
+function ConvertTo-JsonText($Value, [int]$Indent) {
+    $pad = " " * $Indent
+    $padIn = " " * ($Indent + 2)
+    if ($null -eq $Value) { return "null" }
+    if ($Value -is [bool]) { if ($Value) { return "true" } else { return "false" } }
+    if ($Value -is [string]) { return (ConvertTo-JsonString $Value) }
+    if ($Value -is [int] -or $Value -is [long] -or $Value -is [Int64]) {
+        return $Value.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+    }
+    if ($Value -is [double] -or $Value -is [single] -or $Value -is [decimal]) {
+        return ([double]$Value).ToString("R", [System.Globalization.CultureInfo]::InvariantCulture)
+    }
+    if ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [System.Collections.IDictionary]) {
+        $items = @($Value)
+        if ($items.Count -eq 0) { return "[]" }
+        $lines = @()
+        foreach ($item in $items) {
+            $lines += ($padIn + (ConvertTo-JsonText $item ($Indent + 2)))
+        }
+        return "[`n" + ($lines -join ",`n") + "`n$pad]"
+    }
+    if ($Value -is [System.Collections.IDictionary]) {
+        if ($Value.Count -eq 0) { return "{}" }
+        $keys = @($Value.Keys | Sort-Object)
+        $lines = @()
+        foreach ($k in $keys) {
+            $lines += ($padIn + (ConvertTo-JsonString "$k") + ": " +
+                (ConvertTo-JsonText $Value[$k] ($Indent + 2)))
+        }
+        return "{`n" + ($lines -join ",`n") + "`n$pad}"
+    }
+    return (ConvertTo-JsonString "$Value")
+}
+
+<# Print ONE JSON document on stdout - indent 2, keys sorted, nothing else
+   (chatter stays on stderr). SPEC section 9. #>
+function Emit-Json($Data) {
+    Write-Host (ConvertTo-JsonText $Data 0)
+}
+
+<# mtime for --json rows: UTC "yyyy-MM-ddTHH:mm:ssZ" or $null. Accepts a
+   DateTime (local or UTC) or an epoch-seconds number. #>
+function Get-IsoTime($Value) {
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [DateTime]) {
+        if ($Value.Kind -eq [DateTimeKind]::Unspecified) {
+            $Value = [DateTime]::SpecifyKind($Value, [DateTimeKind]::Utc)
+        }
+        return $Value.ToUniversalTime().ToString(
+            "yyyy-MM-dd'T'HH:mm:ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture)
+    }
+    try {
+        $epoch = [long]$Value
+        $dt = [DateTime]::new(1970, 1, 1, 0, 0, 0, [DateTimeKind]::Utc).AddSeconds($epoch)
+        return $dt.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'",
+            [System.Globalization.CultureInfo]::InvariantCulture)
+    } catch {
+        return $null
+    }
 }
 
 # ---------------------------------------------------------------- config
@@ -570,6 +668,17 @@ function Resolve-ConflictRow($Row, [bool]$Interactive) {
 <# Apply a conflict decision. The loser is never deleted — it becomes a
    revert copy first. Afterwards both ledger md5s describe the surviving
    copy, so the next classification is in-sync. #>
+<# What apply-conflict's newest-wins default would do — for --dry-run,
+   which shows the decision it would make without making it. #>
+function Describe-Conflict($Row) {
+    $rt = $null; if ($Row.remote) { $rt = $Row.remote.mtime }
+    $lt = $null; if ($Row.local) { $lt = $Row.local.mtime }
+    if ($null -ne $rt -and ($null -eq $lt -or $rt -gt $lt)) {
+        return "remote wins (newer; local kept as revert)"
+    }
+    return "local wins (newer; remote kept as revert)"
+}
+
 function Invoke-ApplyConflict($Cfg, $Row, [string]$Choice, $Ledger) {
     $localPath = $Row.local.path
     $remoteUrl = ConvertTo-DriveUrl $Cfg "projects/$($Row.project)/$($Row.id).jsonl"
@@ -621,7 +730,7 @@ function Invoke-ApplyConflict($Cfg, $Row, [string]$Choice, $Ledger) {
 
 # ---------------------------------------------------------------- commands
 
-function Invoke-ListSessions([string]$Project, [switch]$Titles) {
+function Invoke-ListSessions([string]$Project, [switch]$Titles, [switch]$Json) {
     $cfg = Get-SessiumConfig
     $ledger = Get-Ledger
     $localMap = Get-LocalSessions
@@ -652,6 +761,28 @@ function Invoke-ListSessions([string]$Project, [switch]$Titles) {
     if ($localOnly) {
         Write-Warn2 "  (remote unreachable — local-only view)"
     }
+    if ($Json) {
+        # SPEC section 9: list --json is the LOCAL inventory (same as Linux;
+        # remote-only sessions have no local path to report)
+        $rows = New-Object System.Collections.Generic.List[object]
+        foreach ($proj in ($localMap.Keys | Sort-Object)) {
+            if ($Project -and $proj -ne $Project) { continue }
+            foreach ($l in $localMap[$proj]) {
+                $row = @{
+                    project = $proj
+                    id = $l.id
+                    path = $l.path
+                    size = [long]$l.size
+                    mtime = (Get-IsoTime $l.mtime)
+                }
+                if ($Titles) { $row.title = (Get-SessionTitle $l.path) }
+                $rows.Add($row)
+            }
+        }
+        $jsonRows = @($rows | Sort-Object -Property @{Expression = "mtime"; Descending = $true })
+        Emit-Json $jsonRows
+        return
+    }
     if ($sorted.Count -eq 0) {
         Write-Info "no sessions found"
         return
@@ -680,14 +811,16 @@ function Invoke-ListSessions([string]$Project, [switch]$Titles) {
     Write-Info ("{0} session(s)" -f $sorted.Count)
 }
 
-function Invoke-Status([string]$Project) {
+function Invoke-Status([string]$Project, [switch]$Json) {
     $cfg = Get-SessiumConfig
     $ledger = Get-Ledger
     $localMap = Get-LocalSessions
     $remoteMap = $null
+    $reachable = $true
     try { $remoteMap = Get-RemoteSessions $cfg } catch {
         Write-Warn2 "  [!]  remote unreachable ($($_.Exception.Message)) — local-only view"
         $remoteMap = @{}
+        $reachable = $false
     }
 
     $rows = Get-Classification $localMap $remoteMap $ledger
@@ -699,6 +832,48 @@ function Invoke-Status([string]$Project) {
         $counts[$r.state]++
     }
     $projCount = @($rows | ForEach-Object { $_.project } | Sort-Object -Unique).Count
+
+    if ($Json) {
+        $jsonRows = New-Object System.Collections.Generic.List[object]
+        foreach ($r in ($rows | Sort-Object -Property project, id)) {
+            $localObj = $null
+            if ($r.local) {
+                $localObj = @{
+                    size = [long]$r.local.size
+                    md5 = "$($r.local_md5)"
+                    mtime = (Get-IsoTime $r.local.mtime)
+                }
+            }
+            $remoteObj = $null
+            if ($r.remote) {
+                $remoteObj = @{
+                    size = [long]$r.remote.size
+                    md5 = "$($r.remote_md5)"
+                    mtime = (Get-IsoTime $r.remote.mtime)
+                }
+            }
+            $lastSynced = $null
+            if ($r.entry) { $lastSynced = $r.entry.last_synced }
+            $jsonRows.Add(@{
+                project = $r.project
+                id = $r.id
+                state = $r.state
+                local = $localObj
+                remote = $remoteObj
+                last_synced = $lastSynced
+            })
+        }
+        Emit-Json @{
+            remote = (ConvertTo-DriveUrl $cfg $null)
+            reachable = $reachable
+            projects = $projCount
+            sessions = $rows.Count
+            counts = $counts
+            rows = $jsonRows
+        }
+        return
+    }
+
     Write-Info ("projects: {0}   sessions: {1}" -f $projCount, $rows.Count)
     $order = @("in-sync", "push", "pull", "conflict", "new-here", "new-there")
     foreach ($st in $order) {
@@ -794,6 +969,45 @@ function Invoke-Check {
 
 # ------------------------------------------------------------ push/pull/sync
 
+$script:LockStaleSeconds = 600
+
+<# Serialize push/pull/sync per machine with a lock file next to the ledger
+   (SPEC section 7). -DryRun mutates nothing and never locks. A lock older
+   than $script:LockStaleSeconds is treated as a crashed run and broken with
+   a warning; a fresh one is a hard error. #>
+function Invoke-WithTransferLock([bool]$DryRun, [scriptblock]$Body) {
+    if ($DryRun) { & $Body; return }
+    $lock = Join-Path (Split-Path -Parent (Get-StatePath)) "sync.lock"
+    $lockDir = Split-Path -Parent $lock
+    if (-not (Test-Path -LiteralPath $lockDir)) {
+        New-Item -ItemType Directory -Path $lockDir -Force | Out-Null
+    }
+    $fs = $null
+    while ($null -eq $fs) {
+        try {
+            $fs = [System.IO.File]::Open($lock, [System.IO.FileMode]::CreateNew,
+                [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        } catch [System.IO.IOException] {
+            if (-not (Test-Path -LiteralPath $lock)) { continue }  # vanished between the calls
+            $age = ((Get-Date) - (Get-Item -LiteralPath $lock).LastWriteTime).TotalSeconds
+            if ($age -gt $script:LockStaleSeconds) {
+                Write-Warn2 ("  [!]  breaking stale lock {0} ({1} min old — likely a crashed run)" -f $lock, [int]($age / 60))
+                Remove-Item -LiteralPath $lock -Force -ErrorAction SilentlyContinue
+                continue
+            }
+            throw "another sessium transfer holds $lock — wait for it, or delete the file if that run is dead"
+        }
+    }
+    try {
+        $fs.Close()
+        [System.IO.File]::WriteAllText($lock,
+            "pid $PID started $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')")
+        & $Body
+    } finally {
+        Remove-Item -LiteralPath $lock -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Write-TransferSummary([string]$Verb, [int]$Moved, [int]$Skipped, [int]$InSync, [int]$Failures) {
     $parts = @()
     if ($Moved -gt 0) { $parts += ("{0}: {1}" -f $Verb, $Moved) }
@@ -803,7 +1017,9 @@ function Write-TransferSummary([string]$Verb, [int]$Moved, [int]$Skipped, [int]$
     Write-Info ("  " + ($parts -join "   "))
 }
 
-function Invoke-Push([string]$Project) {
+function Invoke-Push([string]$Project, [switch]$DryRun, [switch]$Quiet) {
+    if ($Quiet) { $script:Quiet = $true }
+    Invoke-WithTransferLock $DryRun {
     $cfg = Get-SessiumConfig
     $ledger = Get-Ledger
     $localMap = Get-LocalSessions
@@ -816,9 +1032,13 @@ function Invoke-Push([string]$Project) {
     if ($Project) { $rows = @($rows | Where-Object { $_.project -eq $Project }) }
 
     $pushed = 0; $skipped = 0; $failures = 0; $dirty = $false
-    $bootstrapCount = 0
+    $inSync = 0; $bootstrapCount = 0
     foreach ($r in $rows) {
-        if ($r.state -eq "in-sync" -and -not $r.entry) {
+        if ($r.state -eq "in-sync") {
+            $inSync++
+            if ($r.entry) { continue }
+            # bootstrap rule: matching copies with no record are recorded, not pushed
+            if ($DryRun) { continue }
             Set-LedgerEntry $ledger $r.project $r.id $r.local_md5 $r.remote_md5
             $bootstrapCount++
             $dirty = $true
@@ -826,12 +1046,17 @@ function Invoke-Push([string]$Project) {
         }
         if ($r.state -eq "conflict") {
             $label = "{0}/{1}" -f $r.project, (Get-ShortId $r.id)
-            Write-Warn2 "  CONFLICT $label — skipped (sync or resolve decides conflicts)"
+            Write-Warn2 "  [!]  skipped CONFLICT $label — 'sessium sync' or 'sessium resolve' decides it"
             $skipped++
             continue
         }
         if ($r.state -ne "push" -and $r.state -ne "new-here") { continue }
         $label = "{0}/{1}" -f $r.project, (Get-ShortId $r.id)
+        if ($DryRun) {
+            Write-Info ("would push {0} ({1})" -f $label, (Get-HumanSize $r.local.size))
+            $pushed++
+            continue
+        }
         Write-Info "  pushing $label"
         try {
             Copy-Up $r.local.path (ConvertTo-DriveUrl $cfg "projects/$($r.project)/$($r.id).jsonl")
@@ -843,11 +1068,14 @@ function Invoke-Push([string]$Project) {
         }
     }
     if ($dirty) { Save-Ledger $ledger }
-    Write-TransferSummary "pushed" $pushed $skipped $bootstrapCount $failures
+    Write-TransferSummary "pushed" $pushed $skipped $inSync $failures
     if ($failures -gt 0) { exit 1 }
+    }
 }
 
-function Invoke-Pull([string]$Project) {
+function Invoke-Pull([string]$Project, [switch]$DryRun, [switch]$Quiet) {
+    if ($Quiet) { $script:Quiet = $true }
+    Invoke-WithTransferLock $DryRun {
     $cfg = Get-SessiumConfig
     $ledger = Get-Ledger
     $localMap = Get-LocalSessions
@@ -860,22 +1088,29 @@ function Invoke-Pull([string]$Project) {
     if ($Project) { $rows = @($rows | Where-Object { $_.project -eq $Project }) }
 
     $pulled = 0; $skipped = 0; $failures = 0; $dirty = $false
-    $bootstrapCount = 0
+    $inSync = 0
     foreach ($r in $rows) {
-        if ($r.state -eq "in-sync" -and -not $r.entry) {
+        if ($r.state -eq "in-sync") {
+            $inSync++
+            if ($r.entry) { continue }
+            if ($DryRun) { continue }
             Set-LedgerEntry $ledger $r.project $r.id $r.local_md5 $r.remote_md5
-            $bootstrapCount++
             $dirty = $true
             continue
         }
         if ($r.state -eq "conflict") {
             $label = "{0}/{1}" -f $r.project, (Get-ShortId $r.id)
-            Write-Warn2 "  CONFLICT $label — skipped (sync or resolve decides conflicts)"
+            Write-Warn2 "  [!]  skipped CONFLICT $label — 'sessium sync' or 'sessium resolve' decides it"
             $skipped++
             continue
         }
         if ($r.state -ne "pull" -and $r.state -ne "new-there") { continue }
         $label = "{0}/{1}" -f $r.project, (Get-ShortId $r.id)
+        if ($DryRun) {
+            Write-Info ("would pull {0} ({1})" -f $label, (Get-HumanSize $r.remote.size))
+            $pulled++
+            continue
+        }
         Write-Info "  pulling $label"
         try {
             $dest = Get-LocalSessionPath $r.project $r.id
@@ -888,11 +1123,14 @@ function Invoke-Pull([string]$Project) {
         }
     }
     if ($dirty) { Save-Ledger $ledger }
-    Write-TransferSummary "pulled" $pulled $skipped $bootstrapCount $failures
+    Write-TransferSummary "pulled" $pulled $skipped $inSync $failures
     if ($failures -gt 0) { exit 1 }
+    }
 }
 
-function Invoke-Sync([string]$Project, [switch]$Interactive) {
+function Invoke-Sync([string]$Project, [switch]$Interactive, [switch]$DryRun, [switch]$Quiet) {
+    if ($Quiet) { $script:Quiet = $true }
+    Invoke-WithTransferLock $DryRun {
     $cfg = Get-SessiumConfig
     $ledger = Get-Ledger
     $localMap = Get-LocalSessions
@@ -911,13 +1149,18 @@ function Invoke-Sync([string]$Project, [switch]$Interactive) {
         $label = "{0}/{1}" -f $r.project, (Get-ShortId $r.id)
         switch ($r.state) {
             "in-sync" {
-                if (-not $r.entry) {
+                $inSync++
+                if (-not $r.entry -and -not $DryRun) {
                     Set-LedgerEntry $ledger $r.project $r.id $r.local_md5 $r.remote_md5
                     $dirty = $true
                 }
-                $inSync++
             }
             "push" {
+                if ($DryRun) {
+                    Write-Info ("would push {0} ({1})" -f $label, (Get-HumanSize $r.local.size))
+                    $pushed++
+                    continue
+                }
                 Write-Info "  pushing $label"
                 try {
                     Copy-Up $r.local.path (ConvertTo-DriveUrl $cfg "projects/$($r.project)/$($r.id).jsonl")
@@ -929,6 +1172,11 @@ function Invoke-Sync([string]$Project, [switch]$Interactive) {
                 }
             }
             "pull" {
+                if ($DryRun) {
+                    Write-Info ("would pull {0} ({1})" -f $label, (Get-HumanSize $r.remote.size))
+                    $pulled++
+                    continue
+                }
                 Write-Info "  pulling $label"
                 try {
                     $dest = Get-LocalSessionPath $r.project $r.id
@@ -941,6 +1189,11 @@ function Invoke-Sync([string]$Project, [switch]$Interactive) {
                 }
             }
             "new-here" {
+                if ($DryRun) {
+                    Write-Info ("would push {0} ({1})" -f $label, (Get-HumanSize $r.local.size))
+                    $pushed++
+                    continue
+                }
                 Write-Info "  pushing (new) $label"
                 try {
                     Copy-Up $r.local.path (ConvertTo-DriveUrl $cfg "projects/$($r.project)/$($r.id).jsonl")
@@ -952,6 +1205,11 @@ function Invoke-Sync([string]$Project, [switch]$Interactive) {
                 }
             }
             "new-there" {
+                if ($DryRun) {
+                    Write-Info ("would pull {0} ({1})" -f $label, (Get-HumanSize $r.remote.size))
+                    $pulled++
+                    continue
+                }
                 Write-Info "  pulling (new) $label"
                 try {
                     $dest = Get-LocalSessionPath $r.project $r.id
@@ -964,6 +1222,11 @@ function Invoke-Sync([string]$Project, [switch]$Interactive) {
                 }
             }
             "conflict" {
+                if ($DryRun) {
+                    Write-Info ("would resolve {0}: {1}" -f $label, (Describe-Conflict $r))
+                    $resolved++
+                    continue
+                }
                 $choice = Resolve-ConflictRow $r $wantInteractive
                 $outcome = Invoke-ApplyConflict $cfg $r $choice $ledger
                 if ($outcome -eq "resolved") { $resolved++; $dirty = $true }
@@ -979,8 +1242,10 @@ function Invoke-Sync([string]$Project, [switch]$Interactive) {
     if ($skipped -gt 0) { $parts += "skipped: $skipped" }
     $parts += "in-sync: $inSync"
     if ($failures -gt 0) { $parts += "FAILURES: $failures" }
-    Write-Info ("  " + ($parts -join "   "))
+    $prefix = ""; if ($DryRun) { $prefix = "dry-run: " }
+    Write-Info ("  " + $prefix + ($parts -join "   "))
     if ($failures -gt 0) { exit 1 }
+    }
 }
 
 # ------------------------------------------------- diff/resolve/revert/adopt
@@ -1020,7 +1285,7 @@ function Show-DiffRow($Row) {
     }
 }
 
-function Invoke-Diff([string]$Prefix, [string]$Project) {
+function Invoke-Diff([string]$Prefix, [string]$Project, [switch]$Json) {
     $cfg = Get-SessiumConfig
     $ledger = Get-Ledger
     $localMap = Get-LocalSessions
@@ -1031,6 +1296,54 @@ function Invoke-Diff([string]$Prefix, [string]$Project) {
     $rows = Get-Classification $localMap $remoteMap $ledger
     if ($Project) { $rows = @($rows | Where-Object { $_.project -eq $Project }) }
     $row = Find-OneSession $Prefix $rows
+
+    if ($Json) {
+        $localObj = $null; $remoteObj = $null
+        if ($row.local) {
+            $t = Read-Transcript $row.local.path
+            $localObj = @{
+                path = $row.local.path
+                size = [long]$row.local.size
+                md5 = "$($row.local_md5)"
+                mtime = (Get-IsoTime $row.local.mtime)
+                messages = $t.messages
+                last = $t.last
+            }
+        }
+        if ($row.remote) {
+            $remoteObj = @{
+                size = [long]$row.remote.size
+                md5 = "$($row.remote_md5)"
+                mtime = (Get-IsoTime $row.remote.mtime)
+                messages = 0
+                last = ""
+            }
+            $tmp = Get-RemoteTranscript $cfg $row.project $row.id
+            if ($tmp) {
+                $t = Read-Transcript $tmp
+                Remove-Item -LiteralPath $tmp -Force
+                $remoteObj.messages = $t.messages
+                $remoteObj.last = $t.last
+            }
+        }
+        $ledgerObj = $null
+        if ($row.entry) {
+            $ledgerObj = @{
+                last_synced = $row.entry.last_synced
+                local_md5 = $row.entry.local_md5
+                remote_md5 = $row.entry.remote_md5
+            }
+        }
+        Emit-Json @{
+            project = $row.project
+            id = $row.id
+            state = $row.state
+            local = $localObj
+            remote = $remoteObj
+            ledger = $ledgerObj
+        }
+        return
+    }
     Show-DiffRow $row
 }
 
@@ -1057,7 +1370,7 @@ function Invoke-Resolve([string]$Prefix, [switch]$Interactive, [string]$Project)
     if ($outcome -ne "skipped") { Save-Ledger $ledger }
 }
 
-function Invoke-Revert([string]$Prefix) {
+function Invoke-Revert([string]$Prefix, [switch]$DryRun) {
     $root = Join-Path (Get-ClaudeDir) "projects"
     if (-not (Test-Path -LiteralPath $root)) {
         Write-Fail "no revert copies found (nothing at $root)"
@@ -1094,6 +1407,10 @@ function Invoke-Revert([string]$Prefix) {
         Write-Info ("  {0}.  {1}  {2}  {3}" -f ($i + 1), (Get-HumanSize $fi.Length),
             (Format-Time $fi.LastWriteTime), $fi.Name)
     }
+    if ($DryRun) {
+        Write-Info "dry-run: would prompt for which copy to restore — nothing changed"
+        return 0
+    }
     $answer = Read-Host "number to restore (or q to cancel)"
     $a = "$answer".Trim().ToLower()
     if ($a -eq "q" -or $a -eq "") { Write-Info "cancelled — nothing changed"; return }
@@ -1118,56 +1435,183 @@ function Invoke-Revert([string]$Prefix) {
     Write-Info "  next: 'sessium sync' pushes the restored copy to Drive"
 }
 
-function Invoke-Adopt([string]$Source, [string]$RepoPath) {
+function Invoke-Adopt([string]$Source, [string]$RepoPath, [switch]$DryRun) {
     $src = $Source
     $root = Join-Path (Get-ClaudeDir) "projects"
     $srcDir = Join-Path $root $src
     if (-not (Test-Path -LiteralPath $srcDir)) {
         Write-Info "no sessions folder '$src' under $root"
-        Write-Info "available folders:"
-        foreach ($d in (Get-ChildItem -LiteralPath $root -Directory | Sort-Object Name)) {
-            Write-Info "    $($d.Name)"
+        if (Test-Path -LiteralPath $root) {
+            Write-Info "available folders:"
+            foreach ($d in (Get-ChildItem -LiteralPath $root -Directory | Sort-Object Name)) {
+                Write-Info "    $($d.Name)"
+            }
         }
         exit 1
     }
     $dest = ConvertTo-Munge $RepoPath
     if ($src -eq $dest) {
-        Write-Info "nothing to do — '$src' already matches this machine's path for $RepoPath"
-        return
+        Write-Info "already matches this machine's path ($dest) — nothing to do"
+        return 0
     }
     $destDir = Join-Path $root $dest
-    if (-not (Test-Path -LiteralPath $destDir)) {
-        New-Item -ItemType Directory -Path $destDir -Force | Out-Null
-    }
     $copied = 0; $already = 0; $kept = 0
-    foreach ($item in (Get-ChildItem -LiteralPath $srcDir)) {
+    foreach ($item in (Get-ChildItem -LiteralPath $srcDir | Sort-Object Name)) {
+        if ($item.Name -eq "revert") { continue }          # machine-local, never rehomed
         $tgt = Join-Path $destDir $item.Name
         if ($item.PSIsContainer) {
-            if ($item.Name -eq "revert") { continue }      # machine-local, never rehomed
             if (Test-Path -LiteralPath $tgt) {
-                Write-Warn2 "  folder $($item.Name) already exists at destination — left as is"
+                Write-Warn2 "  [!]  folder $($item.Name)/ already exists at the destination — left as is"
                 $kept++
                 continue
+            }
+            if ($DryRun) {
+                Write-Info "would copy folder $($item.Name)/"
+                $copied++
+                continue
+            }
+            if (-not (Test-Path -LiteralPath $destDir)) {
+                New-Item -ItemType Directory -Path $destDir -Force | Out-Null
             }
             Copy-Item -LiteralPath $item.FullName -Destination $tgt -Recurse
             $copied++
         } else {
+            if ($item.Extension -ne ".jsonl") { continue }  # adopt transcripts (mirrors Linux)
             if (Test-Path -LiteralPath $tgt) {
                 $a = Get-FileMd5 $item.FullName
                 $b = Get-FileMd5 $tgt
                 if ($a -eq $b) { $already++; continue }
-                Write-Warn2 "  file $($item.Name) differs at destination — kept both (yours untouched)"
+                Write-Warn2 "  [!]  kept both: $($item.Name) differs from the copy already at the destination"
                 $kept++
                 continue
+            }
+            if ($DryRun) {
+                Write-Info "would copy $($item.Name)"
+                $copied++
+                continue
+            }
+            if (-not (Test-Path -LiteralPath $destDir)) {
+                New-Item -ItemType Directory -Path $destDir -Force | Out-Null
             }
             Copy-Item -LiteralPath $item.FullName -Destination $tgt
             $copied++
         }
     }
-    Write-Info ""
-    Write-Info ("adopted {0} -> {1}:  {2} copied, {3} already present, {4} kept as is" -f `
-        $src, $dest, $copied, $already, $kept)
-    Write-Info "next:  cd $RepoPath; claude --resume"
+    $prefix = ""; if ($DryRun) { $prefix = "dry-run: " }
+    Write-Info ("{0}adopted {1} -> {2}: {3} copied, {4} already present, {5} kept as is" -f `
+        $prefix, $src, $dest, $copied, $already, $kept)
+    if (-not $DryRun) {
+        Write-Info "next:  cd $RepoPath; claude --resume"
+    }
+    return 0
+}
+
+# ---------------------------------------------------------------- batch 3
+
+function Invoke-Version {
+    Write-Info "sessium $script:Version"
+    return 0
+}
+
+<# The repo path recorded in the transcript's entries (Claude Code stamps a
+   `cwd` on most lines). This is how `open` maps a session back to its repo
+   without having to reverse the lossy munging. "" when none. #>
+function Get-SessionCwd([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path)) { return "" }
+    $i = 0
+    foreach ($line in (Get-Content -LiteralPath $Path -Encoding UTF8)) {
+        if ($i -ge 50) { break }
+        $i++
+        if (-not $line.Trim()) { continue }
+        try { $obj = $line | ConvertFrom-Json } catch { continue }
+        $cwd = Get-JsonProp $obj "cwd"
+        if ($cwd -is [string] -and $cwd) { return $cwd }
+    }
+    return ""
+}
+
+<# Print (or with -Go, spawn) the resume command for a session. The repo
+   path comes from the transcript's own cwd stamps, so this works across
+   machines despite the lossy munging. -Adopt rehomes the sessions first
+   when the repo is not at this machine's matching path. #>
+function Invoke-Open([string]$Prefix, [string]$Project, [switch]$Go,
+                     [switch]$Adopt, [switch]$DryRun) {
+    $cfg = Get-SessiumConfig
+    $ledger = Get-Ledger
+    $localMap = Get-LocalSessions
+    $remoteMap = @{}
+    try { $remoteMap = Get-RemoteSessions $cfg } catch {
+        Write-Warn2 "  [!]  cannot reach Drive right now — searching locally only"
+    }
+    $rows = Get-Classification $localMap $remoteMap $ledger
+    if ($Project) { $rows = @($rows | Where-Object { $_.project -eq $Project }) }
+    $row = Find-OneSession $Prefix $rows
+
+    if (-not $row.local) {
+        Write-Fail "$($row.project)/$($row.id) is not on this machine — run 'sessium pull' first"
+    }
+    $cwd = Get-SessionCwd $row.local.path
+    if (-not $cwd) {
+        # lossy inverse of munge(), as a last resort — flagged as a guess
+        $cwd = $row.project.Replace("-", "\")
+        Write-Warn2 "  [!]  transcript has no cwd stamp — guessing $cwd"
+    }
+    if ($Adopt -and -not (Test-Path -LiteralPath $cwd)) {
+        Write-Info "repo path $cwd does not exist here — adopting sessions first"
+        if ($DryRun) {
+            Write-Info "dry-run: would run adopt for $($row.project) -> $cwd"
+            return
+        }
+        Invoke-Adopt $row.project $cwd
+        return
+    }
+    $resume = "cd $cwd; claude --resume $($row.id)"
+    if ($Go) {
+        if ($DryRun) {
+            Write-Info "dry-run: would launch: $resume"
+            return
+        }
+        Start-Process -FilePath "powershell" -WorkingDirectory $cwd `
+            -ArgumentList "-NoExit", "-Command", "claude --resume $($row.id)"
+        return 0
+    }
+    Write-Info $resume
+    return 0
+}
+
+<# No id: git-style alias for `list`. With an id: list the session's
+   content-addressed history snapshots (SPEC section 10). #>
+function Invoke-Log([string]$Prefix, [string]$Project, [switch]$Titles, [switch]$Json) {
+    if (-not $Prefix) {
+        Invoke-ListSessions $Project -Titles:$Titles -Json:$Json
+        return 0
+    }
+    $cfg = Get-SessiumConfig
+    $ledger = Get-Ledger
+    $localMap = Get-LocalSessions
+    $remoteMap = @{}
+    try { $remoteMap = Get-RemoteSessions $cfg } catch {
+        Write-Warn2 "  [!]  cannot reach Drive right now — searching locally only"
+    }
+    $rows = Get-Classification $localMap $remoteMap $ledger
+    if ($Project) { $rows = @($rows | Where-Object { $_.project -eq $Project }) }
+    $row = Find-OneSession $Prefix $rows
+    $hDir = Join-Path (Join-Path (Join-Path (Join-Path (Get-ClaudeDir) "projects") $row.project) $row.id) "history"
+    $snaps = @()
+    if (Test-Path -LiteralPath $hDir) {
+        $snaps = @(Get-ChildItem -LiteralPath $hDir -File -Filter "*.jsonl" | Sort-Object Name)
+    }
+    if ($snaps.Count -eq 0) {
+        Write-Info "no history yet for $(Get-ShortId $row.id) — snapshots appear here when a sync overwrites a copy that had unsynced changes"
+        return 0
+    }
+    Write-Info "history of $($row.id) ($($row.project)):"
+    foreach ($f in $snaps) {
+        Write-Info ("  {0}  {1}  {2}" -f $f.BaseName, (Get-HumanSize $f.Length),
+            (Format-Time $f.LastWriteTime))
+    }
+    Write-Info "restore one with: sessium checkout $(Get-ShortId $row.id) <seq>"
+    return 0
 }
 
 # ---------------------------------------------------------------- setup
@@ -1189,17 +1633,22 @@ sessium $script:Version - git for Claude Code sessions (Drive remote)
 
 usage: sessium <command> [args]
 
-  list [--titles] [--project <munged>]     browse sessions, newest first
-  status [--project <munged>]              what changed here / there / conflicted
+  list [--titles] [--json] [--project <m>]  browse sessions, newest first
+  log [<id>]                               list (no id), or a session's history
+  status [--json] [--project <m>]          what changed here / there / conflicted
   check                                    connectivity + config + ledger self-test
   setup [--check-only]                     run setup-windows.ps1 (first-time Drive setup)
-  push [--project <munged>]                upload new/changed sessions (skips conflicts)
-  pull [--project <munged>]                download new/changed sessions (skips conflicts)
-  sync [--interactive] [--project <m>]     push AND pull; decides conflicts
-  diff <id>                                local vs remote vs last-synced, side by side
+  version                                  print the version
+  push [--dry-run] [--quiet] [--project <m>]   upload new/changed sessions
+  pull [--dry-run] [--quiet] [--project <m>]   download new/changed sessions
+  sync [--interactive] [--dry-run] [--quiet] [--project <m>]
+                                           push AND pull; decides conflicts
+  diff <id> [--json]                       local vs remote vs last-synced
   resolve <id>                             decide a conflicted session by hand
-  revert <id>                              swap a kept revert copy back in
-  adopt <munged-folder> <repo-path>        rehome sessions to this machine's path
+  revert <id> [--dry-run]                  swap a kept revert copy back in
+  open <id> [--go] [--adopt] [--dry-run]   print (or run) the claude --resume command
+  adopt <munged-folder> <repo-path> [--dry-run]
+                                           rehome sessions to this machine's path
 
 session ids: a prefix is enough ('sessium diff 9f8e'). Munged project names
 always start with '-' (e.g. -C--Users-me-repo) - fine after --project.
@@ -1212,13 +1661,21 @@ always start with '-' (e.g. -C--Users-me-repo) - fine after --project.
 function Invoke-Main([string[]]$CliArgs) {
     # munged names start with '-'; manual parsing takes them as values as-is
     $positional = New-Object System.Collections.Generic.List[string]
-    $opt = @{ project = ""; titles = $false; interactive = $false }
+    $opt = @{
+        project = ""; titles = $false; interactive = $false
+        json = $false; dryrun = $false; go = $false; adopt = $false; quiet = $false
+    }
     $i = 0
     while ($i -lt $CliArgs.Count) {
         $a = $CliArgs[$i]
         if ($a -eq "--debug") { $script:Debug = $true; $i++; continue }
         if ($a -eq "--titles") { $opt.titles = $true; $i++; continue }
         if ($a -eq "--interactive") { $opt.interactive = $true; $i++; continue }
+        if ($a -eq "--json") { $opt.json = $true; $i++; continue }
+        if ($a -eq "--dry-run") { $opt.dryrun = $true; $i++; continue }
+        if ($a -eq "--go") { $opt.go = $true; $i++; continue }
+        if ($a -eq "--adopt") { $opt.adopt = $true; $i++; continue }
+        if ($a -eq "--quiet") { $opt.quiet = $true; $i++; continue }
         if ($a -like "--project=*") { $opt.project = $a.Substring(10); $i++; continue }
         if ($a -eq "--project" -and ($i + 1) -lt $CliArgs.Count) {
             $opt.project = $CliArgs[$i + 1]; $i += 2; continue
@@ -1229,16 +1686,26 @@ function Invoke-Main([string[]]$CliArgs) {
     if ($positional.Count -gt 0) { $cmd = $positional[0]; $positional.RemoveAt(0) }
 
     switch ($cmd) {
-        "list"     { Invoke-ListSessions $opt.project -Titles:$opt.titles; return 0 }
-        "status"   { Invoke-Status $opt.project; return 0 }
+        "list"     { Invoke-ListSessions $opt.project -Titles:$opt.titles -Json:$opt.json; return 0 }
+        "status"   { Invoke-Status $opt.project -Json:$opt.json; return 0 }
         "check"    { Invoke-Check; return 0 }
         "setup"    { Invoke-Setup @($positional); return 0 }
-        "push"     { Invoke-Push $opt.project; return 0 }
-        "pull"     { Invoke-Pull $opt.project; return 0 }
-        "sync"     { Invoke-Sync $opt.project -Interactive:$opt.interactive; return 0 }
+        "push"     { Invoke-Push $opt.project -DryRun:$opt.dryrun -Quiet:$opt.quiet; return 0 }
+        "pull"     { Invoke-Pull $opt.project -DryRun:$opt.dryrun -Quiet:$opt.quiet; return 0 }
+        "sync"     { Invoke-Sync $opt.project -Interactive:$opt.interactive -DryRun:$opt.dryrun -Quiet:$opt.quiet; return 0 }
+        "version"  { return (Invoke-Version) }
+        "log" {
+            $prefix = ""
+            if ($positional.Count -gt 0) { $prefix = $positional[0] }
+            return (Invoke-Log $prefix $opt.project -Titles:$opt.titles -Json:$opt.json)
+        }
+        "open" {
+            if ($positional.Count -lt 1) { Write-Fail "usage: sessium open <id> [--go] [--adopt]  (prefix ok)" }
+            return (Invoke-Open $positional[0] $opt.project -Go:$opt.go -Adopt:$opt.adopt -DryRun:$opt.dryrun)
+        }
         "diff" {
             if ($positional.Count -lt 1) { Write-Fail "usage: sessium diff <id>  (prefix ok)" }
-            Invoke-Diff $positional[0] $opt.project; return 0
+            Invoke-Diff $positional[0] $opt.project -Json:$opt.json; return 0
         }
         "resolve" {
             if ($positional.Count -lt 1) { Write-Fail "usage: sessium resolve <id>  (prefix ok)" }
@@ -1247,13 +1714,13 @@ function Invoke-Main([string[]]$CliArgs) {
         }
         "revert" {
             if ($positional.Count -lt 1) { Write-Fail "usage: sessium revert <id>  (prefix ok)" }
-            Invoke-Revert $positional[0]; return 0
+            return (Invoke-Revert $positional[0] -DryRun:$opt.dryrun)
         }
         "adopt" {
             if ($positional.Count -lt 2) {
                 Write-Fail "usage: sessium adopt <munged-folder> <repo-path>"
             }
-            Invoke-Adopt $positional[0] $positional[1]; return 0
+            return (Invoke-Adopt $positional[0] $positional[1] -DryRun:$opt.dryrun)
         }
         "-h" { Show-Usage; return 0 }
         "--help" { Show-Usage; return 0 }
