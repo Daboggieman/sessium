@@ -22,10 +22,12 @@ function Assert-Equal([string]$Expected, [string]$Actual, [string]$What) {
     Assert-True ($Expected -ceq $Actual) "$What (expected: $Expected / got: $Actual)"
 }
 function Run-Sessium([string[]]$CliArgs) {
-    $out = & $ps1 @CliArgs 2>&1
+    # 2>&1 + 6>&1: errors AND Write-Host (pwsh's information stream is 6;
+    # plain 2>&1 leaks tables to the console and leaves $r.text empty)
+    $out = & $ps1 @CliArgs 2>&1 6>&1
     $code = $LASTEXITCODE
     Write-Host ("  $ sessium " + ($CliArgs -join ' ') + "  ->  rc=$code")
-    return @{ code = $code; text = ($out | Out-String) }
+    return @{ code = $code; text = (($out | ForEach-Object { "$_" }) -join "`n") }
 }
 
 # --- fixture ----------------------------------------------------------------
@@ -343,6 +345,87 @@ New-Item -ItemType Directory -Path (Join-Path $claudeA "skills") -Force | Out-Nu
 Write-Exact (Join-Path $claudeA "skills\my-skill.md") "skill body`n"
 $null = Run-Sessium @("sync", "--only", "skills")
 Assert-True (Test-Path (Join-Path $drive "backup\config\skills\my-skill.md")) "skills reached Drive"
+
+# --- batch 5: schedule / hook / crypt -----------------------------------------
+
+Write-Host "== batch 5 =="
+
+# schedule --print: shows the schtasks command, installs nothing
+$r = Run-Sessium @("schedule", "--print")
+Assert-True ($r.code -eq 0) "schedule --print exits 0"
+Assert-True ($r.text -match "schtasks /Create") "schedule --print shows the create command"
+Assert-True ($r.text -match "/SC MINUTE /MO 30") "schedule --print defaults to 30 minutes"
+Assert-True ($r.text -match "sessium.ps1`" sync") "schedule --print runs sessium sync"
+
+# schedule install + off through a fake schtasks (hermetic: no real task)
+$stubDir = Join-Path $tmp "fake-schtasks"
+New-Item -ItemType Directory -Path $stubDir -Force | Out-Null
+$stub = Join-Path $stubDir "fake-schtasks.cmd"
+Write-Exact $stub "@echo off`necho %* >> `"%~dp0schtasks-calls.log`"`nexit /b 0`n"
+$env:SESSIUM_SCHTASKS_BIN = $stub
+$r = Run-Sessium @("schedule", "--interval", "15")
+Assert-True ($r.code -eq 0) "schedule install exits 0"
+Assert-True ($r.text -match "schedule installed") "schedule install reports success"
+$stubLog = Join-Path $stubDir "schtasks-calls.log"
+$stubText = Get-Content -LiteralPath $stubLog -Raw
+Assert-True ($stubText -match "/Create /TN sessium-sync /SC MINUTE /MO 15") "schtasks got the create call"
+$null = Run-Sessium @("schedule", "--off")
+$stubText = Get-Content -LiteralPath $stubLog -Raw
+Assert-True ($stubText -match "/Delete /TN sessium-sync /F") "schedule --off deletes the task"
+Remove-Item -LiteralPath $stubLog -Force
+Remove-Item Env:\SESSIUM_SCHTASKS_BIN
+
+# hook: installs into settings.json alongside unrelated hooks, idempotent,
+# --off removes only the sessium entry
+$settingsPath = Join-Path $claudeA "settings.json"
+Write-Exact $settingsPath '{"hooks":{"Stop":[{"matcher":"","hooks":[{"type":"command","command":"echo unrelated"}]}]}}'
+$r = Run-Sessium @("hook")
+Assert-True ($r.code -eq 0) "hook exits 0"
+$settings = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json
+$stopEntries = @($settings.hooks.Stop)
+Assert-True ($stopEntries.Count -eq 2) "hook added one entry next to the existing one"
+$sessiumEntries = @($stopEntries | Where-Object { (ConvertTo-Json $_ -Compress -Depth 5) -match "push --quiet" })
+Assert-True ($sessiumEntries.Count -eq 1) "the added entry is the sessium push hook"
+$null = Run-Sessium @("hook")
+$settings = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json
+Assert-True (@($settings.hooks.Stop).Count -eq 2) "hook is idempotent (no duplicate)"
+$r = Run-Sessium @("hook", "--off")
+Assert-True ($r.code -eq 0) "hook --off exits 0"
+$settings = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json
+$stopEntries = @($settings.hooks.Stop)
+Assert-True ($stopEntries.Count -eq 1) "hook --off removed only the sessium entry"
+Assert-True ($stopEntries[0].hooks[0].command -eq "echo unrelated") "unrelated hook survived"
+
+# hook --off on otherwise-empty settings leaves no hooks key behind
+Remove-Item -LiteralPath $settingsPath -Force
+$null = Run-Sessium @("hook")
+$null = Run-Sessium @("hook", "--off")
+$settings = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json
+Assert-True ($null -eq $settings.hooks) "hook --off leaves no empty hooks key"
+
+# hook --print: previews, writes nothing
+Remove-Item -LiteralPath $settingsPath -Force -ErrorAction SilentlyContinue
+$r = Run-Sessium @("hook", "--print")
+Assert-True ($r.code -eq 0) "hook --print exits 0"
+Assert-True ($r.text -match "would write") "hook --print previews"
+Assert-True ($r.text -match "push --quiet") "hook --print shows the command"
+Assert-True (-not (Test-Path -LiteralPath $settingsPath)) "hook --print touched nothing"
+
+# setup --encrypted: crypt remote created over the plain one, config re-pointed,
+# unknown keys preserved; LAST so later steps would see the crypt remote
+Write-Exact (Join-Path $tmp "config.json") '{"rclone_remote":"fake","drive_folder":"backup","seeker_url":"http://seeker.example"}'
+$r = Run-Sessium @("setup", "--encrypted")
+Assert-True ($r.code -eq 0) "setup --encrypted exits 0"
+Assert-True ($r.text -match "SAVE THIS PASSWORD") "setup --encrypted shows the password once"
+Assert-True ($r.text -match "sessium-crypt") "setup --encrypted names the crypt remote"
+$cryptLog = Join-Path $drive "rclone-config.log"
+Assert-True (Test-Path -LiteralPath $cryptLog) "rclone config create was logged"
+$cryptText = Get-Content -LiteralPath $cryptLog -Raw
+Assert-True ($cryptText -match "sessium-crypt crypt remote=fake:backup password=\S+") "crypt was created over fake:backup with a password"
+$cfgAfter = Get-Content -LiteralPath $env:SESSIUM_CONFIG -Raw | ConvertFrom-Json
+Assert-True ($cfgAfter.rclone_remote -eq "sessium-crypt") "config now points at the crypt remote"
+Assert-True ($cfgAfter.drive_folder -eq "") "drive_folder cleared (crypt root == old plain root)"
+Assert-True ($cfgAfter.seeker_url -eq "http://seeker.example") "unknown config keys survived"
 
 Write-Host ""
 

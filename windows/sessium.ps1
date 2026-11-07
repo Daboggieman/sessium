@@ -135,7 +135,11 @@ function ConvertTo-JsonText($Value, [int]$Indent) {
         return ([double]$Value).ToString("R", [System.Globalization.CultureInfo]::InvariantCulture)
     }
     if ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [System.Collections.IDictionary]) {
-        $items = @($Value)
+        # foreach-accumulate, NOT @($Value): pwsh 7.4's @(<List[object]>)
+        # throws "Argument types do not match" under StrictMode (DLR bug);
+        # the foreach statement handles every IEnumerable the same way
+        $items = @()
+        foreach ($item in $Value) { $items += $item }
         if ($items.Count -eq 0) { return "[]" }
         $lines = @()
         foreach ($item in $items) {
@@ -401,7 +405,10 @@ function Get-LocalSessions {
                 mtime = $f.LastWriteTimeUtc
             })
         }
-        $map[$projDir.Name] = $rows
+        # object[], not List[object]: pwsh 7.4 throws "Argument types do not
+        # match" for @(<List[object]>) under StrictMode, and callers wrap
+        # these map values in @() (Get-Classification, sync, json status)
+        $map[$projDir.Name] = $rows.ToArray()
     }
     return $map
 }
@@ -468,7 +475,9 @@ function Read-Transcript([string]$Path) {
 <# Fetch a remote transcript to a temp file (rclone cat), caller unlinks.
    Returns the temp path, or $null when the fetch fails. #>
 function Get-RemoteTranscript($Cfg, [string]$Project, [string]$Sid) {
-    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("sessium-" + $Sid.Substring(0, 8) + ".jsonl")
+    # real ids are 32+ hex chars; the smoke's fake ones can be shorter
+    $keep = if ($Sid.Length -gt 8) { $Sid.Substring(0, 8) } else { $Sid }
+    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("sessium-" + $keep + ".jsonl")
     try {
         Invoke-Rclone -RcloneArgs @("cat", (ConvertTo-DriveUrl $Cfg "projects/$Project/$Sid.jsonl")) `
             -ToFile $tmp -TimeoutSec 120
@@ -552,7 +561,14 @@ function Get-RemoteSessions($Cfg) {
             md5 = (Get-JsonProp (Get-JsonProp $e "Hashes") "MD5")
         })
     }
-    return $map
+    # object[], not List[object]: pwsh 7.4 throws "Argument types do not
+    # match" for @(<List[object]>) under StrictMode, and callers wrap these
+    # map values in @() (Get-Classification, sync, json status). New map, not
+    # in-place: replacing values while enumerating Keys trips Hashtable's
+    # version check ("Collection was modified").
+    $out = @{}
+    foreach ($k in $map.Keys) { $out[$k] = $map[$k].ToArray() }
+    return $out
 }
 
 # ------------------------------------------------------- classification
@@ -600,8 +616,10 @@ function Get-Classification($LocalMap, $RemoteMap, $Ledger) {
     foreach ($proj in $projects) {
         $locals = @(); if ($LocalMap.ContainsKey($proj)) { $locals = @($LocalMap[$proj]) }
         $remotes = @(); if ($RemoteMap.ContainsKey($proj)) { $remotes = @($RemoteMap[$proj]) }
-        $ids = @(($locals | ForEach-Object { $_.id }) +
-                 ($remotes | ForEach-Object { $_.id }) | Sort-Object -Unique)
+        # concat the ARRAYS first: piping each side separately unwraps a
+        # single-item pipeline to a scalar, and "aaa" + "aaa" string-concats
+        # into a bogus id
+        $ids = @(($locals + $remotes) | ForEach-Object { $_.id } | Sort-Object -Unique)
         foreach ($sid in $ids) {
             $local = $null; foreach ($l in $locals) { if ($l.id -eq $sid) { $local = $l; break } }
             $remote = $null; foreach ($r in $remotes) { if ($r.id -eq $sid) { $remote = $r; break } }
@@ -611,7 +629,9 @@ function Get-Classification($LocalMap, $RemoteMap, $Ledger) {
             $rows.Add((Get-ClassificationRow $proj $sid $local $remote $entry))
         }
     }
-    return $rows
+    # leading comma: a single-row List unrolls to a SCALAR on return, and a
+    # caller's $rows.Count then reads the row's key count (8) instead of 1
+    return ,$rows
 }
 
 <# Resolve a session id prefix against the classified rows. Zero matches ->
@@ -977,7 +997,7 @@ function Invoke-Status([string]$Project, [switch]$Json) {
     Write-Info ""
     Write-Info ("{0,-10}  {1,-8}  {2,-11}  {3,7}  {4}" -f "STATE", "ID", "MODIFIED", "SIZE", "PROJECT")
     foreach ($r in ($rows | Sort-Object -Property @{ Expression = {
-            if ($_.local) { $_.local.mtime } else { $_.remote.mtime } }; Descending = $true })) {
+            if ($_.local) { $_.local.mtime } elseif ($_.remote) { $_.remote.mtime } else { $null } }; Descending = $true })) {
         $when = "-"; $size = "-"
         if ($r.local) { $when = Format-Time $r.local.mtime; $size = Get-HumanSize $r.local.size }
         elseif ($r.remote) { $when = Format-Time $r.remote.mtime; $size = Get-HumanSize $r.remote.size }
