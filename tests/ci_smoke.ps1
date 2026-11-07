@@ -197,10 +197,147 @@ $r = Run-Sessium @("log")
 Assert-True ($r.code -eq 0) "log (no id) exits 0"
 Assert-True ($r.text -match "aaa") "log lists sessions"
 
-# log <id> with no snapshots yet is a friendly no-op
+# --- batch 4: history / checkout / gc / messages / search / deep check -------
+
+Write-Host "== batch 4 =="
+
+# log <id> lists the snapshot the step-5 conflict created (content-addressed)
 $r = Run-Sessium @("log", "aaa")
 Assert-True ($r.code -eq 0) "log <id> exits 0"
-Assert-True ($r.text -match "no history yet") "log <id> explains missing history"
+Assert-True ($r.text -match "history of aaa") "log <id> lists history"
+Assert-True ($r.text -match "\d{4}-[0-9a-f]{8}\.jsonl") "snapshot names are <seq>-<md5[:8]>.jsonl"
+Assert-True ($r.text -match "sessium checkout") "log points at checkout"
+
+# checkout --dry-run: names the file it would restore, touches nothing
+$r = Run-Sessium @("checkout", "aaa", "1", "--dry-run")
+Assert-True ($r.code -eq 0) "checkout --dry-run exits 0"
+Assert-True ($r.text -match "would restore") "checkout --dry-run prints intent"
+
+# checkout restores snapshot #1 (the conflict loser); the copy it displaces
+# is snapshotted first, then the chosen snapshot MOVES out of history/ -
+# so history holds exactly the displaced copy's snapshot afterwards
+$histDir = Join-Path $claudeA "projects\$proj\aaa\history"
+$r = Run-Sessium @("checkout", "aaa", "1")
+Assert-True ($r.code -eq 0) "checkout exits 0"
+Assert-True ($r.text -match "restored ") "checkout names the restored snapshot"
+Assert-Equal "A was here`n" ((Get-Content $sessionA -Raw) -replace "`r`n", "`n") "checkout restored the conflict loser"
+Assert-True (@(Get-ChildItem -LiteralPath $histDir -File -Filter "*.jsonl").Count -eq 1) "checkout leaves the displaced snapshot"
+Assert-True (Test-Path (Join-Path $histDir "0002-*.jsonl")) "displaced copy got seq 2"
+
+# bad seq: friendly listing, exit 1
+$r = Run-Sessium @("checkout", "aaa", "99")
+Assert-True ($r.code -eq 1) "checkout with unknown seq exits 1"
+Assert-True ($r.text -match "no snapshot #99") "checkout names the missing seq"
+
+# gc: default keep=10 has nothing to prune; --keep 1 prunes the older revert
+# (2 revert copies exist after step 5 + checkout; history holds 1)
+$r = Run-Sessium @("gc")
+Assert-True ($r.code -eq 0) "gc exits 0"
+Assert-True ($r.text -match "nothing to prune") "gc with default keep prunes nothing"
+
+$r = Run-Sessium @("gc", "--keep", "1", "--dry-run")
+Assert-True ($r.text -match "would prune") "gc --dry-run lists doomed files"
+Assert-True ($r.text -match "1 file\(s\) would be pruned") "gc --dry-run summary counts 1"
+$revCount = @(Get-ChildItem -LiteralPath (Join-Path $claudeA "projects\$proj\revert") -File -Filter "*.jsonl").Count
+$histCount = @(Get-ChildItem -LiteralPath $histDir -File -Filter "*.jsonl").Count
+Assert-True ($revCount -eq 2 -and $histCount -eq 1) "gc --dry-run touched nothing"
+
+$r = Run-Sessium @("gc", "--keep", "1")
+Assert-True ($r.text -match "pruned 1 file\(s\); kept 1 most recent per session") "gc reports the prune"
+$revCount = @(Get-ChildItem -LiteralPath (Join-Path $claudeA "projects\$proj\revert") -File -Filter "*.jsonl").Count
+$histCount = @(Get-ChildItem -LiteralPath $histDir -File -Filter "*.jsonl").Count
+Assert-True ($revCount -eq 1 -and $histCount -eq 1) "gc kept 1 revert + 1 history"
+Assert-True (Test-Path (Join-Path $claudeA "projects\$proj\aaa.jsonl")) "gc never touches canonical transcripts"
+
+# diff --messages: rewrite A's copy as a fresh two-turn transcript; the Drive
+# copy is plain text (0 parseable messages) so the whole local side is unsynced
+$lines4 = @(
+    '{"type":"user","message":{"content":"seek me please"}}',
+    '{"type":"assistant","message":{"content":"the body has zebra"}}'
+)
+Write-Exact $sessionA (($lines4 -join "`n") + "`n")
+
+$r = Run-Sessium @("diff", "aaa", "--messages")
+Assert-True ($r.code -eq 0) "diff --messages exits 0"
+Assert-True ($r.text -match "common prefix: 0 message\(s\)") "diff --messages shows the divergence point"
+Assert-True ($r.text -match "local adds 2") "diff --messages counts local adds"
+Assert-True ($r.text -match "remote adds 0") "diff --messages counts remote adds"
+Assert-True ($r.text -match "\+ user\s+seek me please") "diff --messages previews the message text"
+
+$r = Run-Sessium @("diff", "aaa", "--json", "--messages")
+Assert-True ($r.code -eq 0) "diff --json --messages exits 0"
+$json = $r.text | ConvertFrom-Json
+Assert-True ($json.preview.common -eq 0) "preview carries the common count"
+Assert-True (@($json.preview.local_added).Count -eq 2) "preview lists local adds"
+Assert-True ($json.preview.local_added[0][0] -eq "user") "preview entries are [role, text] pairs"
+Assert-True (@($json.preview.remote_added).Count -eq 0) "preview lists remote adds"
+
+# search: title match outranks body, snippets, --json schema, no-matches
+$r = Run-Sessium @("search", "seek me please")
+Assert-True ($r.code -eq 0) "search exits 0"
+Assert-True ($r.text -match "1 match\(es\)") "search finds the title hit"
+Assert-True ($r.text -match "title") "hit is tagged as a title match"
+
+$r = Run-Sessium @("search", "zebra")
+Assert-True ($r.text -match "1 match\(es\)") "search finds the body hit"
+Assert-True ($r.text -match "body") "hit is tagged as a body match"
+Assert-True ($r.text -match "zebra") "body hit shows a snippet"
+
+$r = Run-Sessium @("search", "wumpus")
+Assert-True ($r.text -match "no matches") "search reports no matches cleanly"
+
+$r = Run-Sessium @("search", "seek me please", "--json")
+$json = @($r.text | ConvertFrom-Json)
+Assert-True ($json.Count -eq 1) "search --json returns one row"
+Assert-True ($json[0].where -eq "title") "search --json carries where"
+Assert-True ($json[0].project -eq $proj -and $json[0].id -like "aaa*") "search --json carries project/id"
+
+# seek without a seeker config is a friendly failure
+$r = Run-Sessium @("seek")
+Assert-True ($r.code -eq 1) "seek without config exits 1"
+Assert-True ($r.text -match "seeker not configured") "seek explains what to configure"
+$r = Run-Sessium @("search", "x", "--semantic")
+Assert-True ($r.code -eq 1) "search --semantic without config exits 1"
+
+# push the fresh transcript, then the deep check verifies both sides agree
+$null = Run-Sessium @("push")
+$r = Run-Sessium @("check")
+Assert-True ($r.code -eq 0) "check exits 0"
+$r = Run-Sessium @("check", "--full")
+Assert-True ($r.code -eq 0) "check --full exits 0"
+Assert-True ($r.text -match "deep check \(--full\):") "check --full runs the deep check"
+Assert-True ($r.text -match "no dead entries") "deep check: no dead ledger entries"
+Assert-True ($r.text -match "no orphans on Drive") "deep check: no orphans"
+Assert-True ($r.text -match "md5 matches on both sides") "deep check: spot-check entry"
+Assert-True ($r.text -match "spot-check: 1 session\(s\) verified") "deep check: one session verified"
+
+# sync --only memory: nothing yet -> intent -> push up -> pull down
+$r = Run-Sessium @("sync", "--only", "memory")
+Assert-True ($r.code -eq 0) "sync --only memory exits 0 with nothing present"
+Assert-True ($r.text -match "nothing to sync for --only memory") "sync --only explains emptiness"
+
+$memDir = Join-Path $claudeA "projects\$proj\memory"
+New-Item -ItemType Directory -Path $memDir -Force | Out-Null
+Write-Exact (Join-Path $memDir "note.md") "user notes live here`n"
+$r = Run-Sessium @("sync", "--only", "memory", "--dry-run")
+Assert-True ($r.text -match "would two-way sync") "sync --only --dry-run prints intent"
+Assert-True (-not (Test-Path (Join-Path $drive "backup\projects\$proj\memory\note.md"))) "sync --only --dry-run touched nothing"
+
+$r = Run-Sessium @("sync", "--only", "memory")
+Assert-True ($r.text -match "\[OK\] synced memory: memory") "sync --only reports the pair"
+Assert-True (Test-Path (Join-Path $drive "backup\projects\$proj\memory\note.md")) "memory file reached Drive"
+
+Write-Exact (Join-Path $drive "backup\projects\$proj\memory\drive-note.md") "written on another machine`n"
+$null = Run-Sessium @("sync", "--only", "memory")
+Assert-True (Test-Path (Join-Path $memDir "drive-note.md")) "Drive-only memory pulled down"
+
+# sync --only skills: config/skills two-ways
+New-Item -ItemType Directory -Path (Join-Path $claudeA "skills") -Force | Out-Null
+Write-Exact (Join-Path $claudeA "skills\my-skill.md") "skill body`n"
+$null = Run-Sessium @("sync", "--only", "skills")
+Assert-True (Test-Path (Join-Path $drive "backup\config\skills\my-skill.md")) "skills reached Drive"
+
+Write-Host ""
 
 Write-Host ""
 if ($script:failed -gt 0) {

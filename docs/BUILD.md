@@ -200,9 +200,23 @@ not in PLAN.md or README.md.
   so CI's Windows job can actually run the stub. Also fixed two latent
   smoke bugs (final sync of the conflict sequence ran as the wrong machine;
   Set-Content CRLF/BOM would break exact-content assertions).
-- 🪟 Still to port: Batch 4 (search/seek, diff --messages, history snapshots
-  + checkout, gc, check --full, sync --only), Batch 5 (schedule → schtasks
-  equivalent, hook, setup --encrypted), Batch 6 (export, onboard).
+- ✅ **Batch 4 ported to `windows/sessium.ps1`** (2026-11-07): `search` (title
+  > body ranking, one compound sort, --json, --semantic) + `seek`, `diff
+  --messages` (common-prefix divergence, `[role, text]` preview pairs in
+  JSON), history snapshots (content-addressed `<seq>-<md5[:8]>.jsonl`, written
+  at all 4 conflict sites — matching Linux cmd_revert's asymmetry where only
+  checkout snapshots its displaced copy), `checkout <id> <seq>` (--dry-run,
+  displaced copy snapshotted, ledger local_md5 updated), `gc --keep N`
+  (revert/ + history/ per-session, dry-run), `check --full` (dead ledger
+  entries, orphans, md5 spot-check sample), `sync --only memory|skills`
+  (two-way rclone copy --update inside the transfer lock). Smoke run extended
+  to ~150 assertions: snapshot round-trip through the conflict step,
+  checkout moves the chosen snapshot out (seq numbering), gc keep=1, message
+  divergence vs a plain-text remote (0 parseable messages), search
+  title/body/no-match/--json, unconfigured-seeker failures, deep-check happy
+  path, memory/skills two-way sync including a Drive-only pull-down.
+- 🪟 Still to port: Batch 5 (schedule → schtasks equivalent, hook, setup
+  --encrypted), Batch 6 (export, onboard).
 
 ---
 
