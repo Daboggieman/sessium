@@ -2248,6 +2248,193 @@ function Invoke-Setup([string[]]$Passthrough) {
     exit $LASTEXITCODE
 }
 
+# ------------------------------------------------- batch 5: schedule/hook/crypt
+
+$script:CryptName = "sessium-crypt"
+
+<# PSCustomObject (from ConvertFrom-Json) -> hashtable tree the serializer
+   understands. Recurses into nested objects/arrays; primitives pass through. #>
+function ConvertFrom-PSObject($Obj) {
+    if ($null -eq $Obj) { return $null }
+    if ($Obj -is [System.Management.Automation.PSCustomObject]) {
+        $h = @{}
+        foreach ($p in $Obj.PSObject.Properties) {
+            $h[$p.Name] = ConvertFrom-PSObject $p.Value
+        }
+        return $h
+    }
+    if ($Obj -is [System.Collections.IEnumerable] -and
+        $Obj -isnot [string] -and $Obj -isnot [System.Collections.IDictionary]) {
+        $out = @()
+        foreach ($item in @($Obj)) { $out += ,(ConvertFrom-PSObject $item) }
+        return ,$out
+    }
+    return $Obj
+}
+
+<# Scheduled sync: a Windows Task Scheduler task ("sessium-sync") running
+   `sessium.ps1 sync` every --interval minutes (default 30) — the schtasks
+   equivalent of the Linux systemd user timer. SESSIUM_SCHTASKS_BIN overrides
+   the schtasks binary (tests). #>
+function Get-SchtasksBin {
+    if ($env:SESSIUM_SCHTASKS_BIN) { return $env:SESSIUM_SCHTASKS_BIN }
+    return "schtasks"
+}
+
+function Invoke-Schedule([int]$Interval = 30, [switch]$Off, [switch]$Print) {
+    $bin = Get-SchtasksBin
+    $taskName = "sessium-sync"
+    $tr = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" sync"
+    $create = "schtasks /Create /TN `"$taskName`" /SC MINUTE /MO $Interval /TR `"$tr`" /F"
+    if ($Print) {
+        Write-Info $create
+        Write-Info "--- 8< ---"
+        Write-Info "task: $taskName, runs every $Interval minutes: powershell -File `"$PSCommandPath`" sync"
+        Write-Info "next: schtasks /Query /TN `"$taskName`" /V   (delete by hand: schtasks /Delete /TN `"$taskName`" /F)"
+        return 0
+    }
+    if ($Off) {
+        $null = & $bin /Delete /TN $taskName /F 2>&1     # fine if it never existed
+        Write-Info "[OK] schedule removed (task '$taskName' deleted)"
+        return 0
+    }
+    $null = & $bin /Create /TN $taskName /SC MINUTE /MO $Interval /TR $tr /F 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Fail "schtasks /Create failed (rc=$LASTEXITCODE) — task '$taskName' not installed"
+    }
+    Write-Info "[OK] schedule installed: task '$taskName' every $Interval minutes"
+    Write-Info "check: schtasks /Query /TN `"$taskName`" /V"
+    return 0
+}
+
+<# Wire a Claude Code Stop hook into <claude-dir>/settings.json so every
+   session auto-pushes when it ends (`sessium push --quiet`). Only sessium's
+   own entries are touched; --off unwinds them. #>
+function Invoke-Hook([switch]$Off, [switch]$Print) {
+    $settingsPath = Join-Path (Get-ClaudeDir) "settings.json"
+    $data = @{}
+    if (Test-Path -LiteralPath $settingsPath) {
+        try {
+            $raw = Get-Content -LiteralPath $settingsPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            $data = ConvertFrom-PSObject $raw
+        } catch {
+            Write-Fail "cannot read ${settingsPath}: $($_.Exception.Message)"
+        }
+    }
+    $command = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" push --quiet"
+    $hooks = @{}
+    if ($data.ContainsKey("hooks")) { $hooks = $data["hooks"] }
+    $stop = @()
+    if ($hooks.ContainsKey("Stop")) { $stop = @($hooks["Stop"]) }
+    $keep = @()
+    foreach ($entry in $stop) {
+        $dump = ConvertTo-JsonText $entry 0
+        if ("$dump" -match "sessium.*push --quiet") { continue }     # ours
+        $keep += $entry
+    }
+    $stop = @($keep)
+    if (-not $Off) {
+        $stop += ,@{ matcher = ""; hooks = @(@{ type = "command"; command = $command }) }
+    }
+    if ($stop.Count -gt 0) {
+        $hooks["Stop"] = $stop
+        $data["hooks"] = $hooks
+    } else {
+        if ($hooks.ContainsKey("Stop")) { $null = $hooks.Remove("Stop") }
+        if ($hooks.Count -eq 0 -and $data.ContainsKey("hooks")) { $null = $data.Remove("hooks") }
+    }
+    $text = (ConvertTo-JsonText $data 0) + "`n"
+    if ($Print) {
+        Write-Info "would write ${settingsPath}:"
+        Write-Host $text
+        return 0
+    }
+    try {
+        [System.IO.File]::WriteAllText($settingsPath, $text,
+            (New-Object System.Text.UTF8Encoding($false)))
+    } catch {
+        Write-Fail "cannot write ${settingsPath}: $($_.Exception.Message)"
+    }
+    if ($Off) {
+        Write-Info "[OK] hook removed from $settingsPath"
+    } else {
+        Write-Info "[OK] hook installed in $settingsPath"
+        Write-Info "every session turn now ends with: $command"
+    }
+    return 0
+}
+
+<# Wrap the plain remote in an rclone crypt layer and point sessium at it.
+   Drive-side data beyond this point is unreadable ciphertext — the password
+   is generated here and shown exactly once. Same flow as the Linux
+   setup_encrypted(): `rclone config create sessium-crypt crypt ...`, then a
+   rewritten config.json (rclone_remote=sessium-crypt, drive_folder=""). #>
+function Invoke-SetupEncrypted {
+    $text = $null
+    try {
+        $text = Invoke-Rclone -RcloneArgs @("config", "file") -TimeoutSec 30
+    } catch {
+        Write-Fail "cannot run rclone: $($_.Exception.Message)"
+    }
+    $lines = @("$text" -split "`r?`n" | Where-Object { $_.Trim() -ne "" })
+    if ($lines.Count -eq 0) {
+        Write-Fail "cannot locate rclone.conf ('rclone config file' came back empty)"
+    }
+    $confPath = $lines[$lines.Count - 1].Trim()
+    $cfg = Get-SessiumConfig
+    $plain = "$($cfg.Remote):$($cfg.Folder)"
+    # secrets.token_urlsafe(24): 24 random bytes, base64url, no padding
+    $rng = New-Object System.Security.Cryptography.RNGCryptoServiceProvider
+    $bytes = New-Object byte[] 24
+    $rng.GetBytes($bytes)
+    $password = [Convert]::ToBase64String($bytes).TrimEnd("=").Replace("+", "-").Replace("/", "_")
+    try {
+        $null = Invoke-Rclone -RcloneArgs @("config", "create", $script:CryptName,
+            "crypt", "remote=$plain", "password=$password") -TimeoutSec 60
+    } catch {
+        Write-Fail "rclone config create failed: $($_.Exception.Message)"
+    }
+    # re-point config.json at the crypt remote, preserving every other key
+    $cfgPath = Get-ConfigPath
+    $newCfg = $null
+    if (Test-Path -LiteralPath $cfgPath) {
+        try {
+            $raw = Get-Content -LiteralPath $cfgPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            $newCfg = ConvertFrom-PSObject $raw
+        } catch {
+            Write-Warn2 "  [!]  unreadable config $cfgPath — starting a fresh one"
+        }
+    }
+    if ($null -eq $newCfg) {
+        $newCfg = @{ rclone_remote = $cfg.Remote; drive_folder = $cfg.Folder
+                     seeker_url = $cfg.SeekerUrl; seeker_token = $cfg.SeekerToken }
+    }
+    $newCfg["rclone_remote"] = $script:CryptName
+    $newCfg["drive_folder"] = ""          # crypt root == old plain root
+    try {
+        $dir = Split-Path -Parent $cfgPath
+        if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        }
+        [System.IO.File]::WriteAllText($cfgPath,
+            (ConvertTo-JsonText $newCfg 0) + "`n",
+            (New-Object System.Text.UTF8Encoding($false)))
+    } catch {
+        Write-Fail "cannot write config: $($_.Exception.Message)"
+    }
+    Write-Info "[OK] crypt remote '$($script:CryptName)' created over $plain (rclone.conf: $confPath)"
+    Write-Info "[OK] sessium config switched to the crypt remote"
+    Write-Host ""
+    Write-Host ("=" * 62)
+    Write-Host "SAVE THIS PASSWORD — encrypted data is unrecoverable without it:"
+    Write-Host "    $password"
+    Write-Host ("=" * 62)
+    Write-Host ""
+    Write-Info "next: sessium push   (re-uploads everything as ciphertext; existing"
+    Write-Info "plaintext copies stay on Drive until you delete them by hand)"
+    return 0
+}
+
 # ---------------------------------------------------------------- dispatch
 
 function Show-Usage {
@@ -2260,7 +2447,12 @@ usage: sessium <command> [args]
   log [<id>]                               list (no id), or a session's history
   status [--json] [--project <m>]          what changed here / there / conflicted
   check [--full]                           self-test; --full also audits the ledger
-  setup [--check-only]                     run setup-windows.ps1 (first-time Drive setup)
+  setup [--check-only] [--encrypted]       run setup-windows.ps1; --encrypted wraps
+                                           the Drive remote in an rclone crypt layer
+  schedule [--interval MIN] [--print] [--off]   Task Scheduler task running
+                                           `sessium sync` every MIN minutes (default 30)
+  hook [--print] [--off]                   wire a Claude Code Stop hook: auto-push
+                                           on every session end
   version                                  print the version
   push [--dry-run] [--quiet] [--project <m>]   upload new/changed sessions
   pull [--dry-run] [--quiet] [--project <m>]   download new/changed sessions
@@ -2296,6 +2488,7 @@ function Invoke-Main([string[]]$CliArgs) {
         json = $false; dryrun = $false; go = $false; adopt = $false; quiet = $false
         full = $false; messages = $false; semantic = $false
         only = ""; limit = 0; keep = -1; name = ""
+        print = $false; off = $false; interval = 0
     }
     $i = 0
     while ($i -lt $CliArgs.Count) {
@@ -2311,6 +2504,12 @@ function Invoke-Main([string[]]$CliArgs) {
         if ($a -eq "--full") { $opt.full = $true; $i++; continue }
         if ($a -eq "--messages") { $opt.messages = $true; $i++; continue }
         if ($a -eq "--semantic") { $opt.semantic = $true; $i++; continue }
+        if ($a -eq "--print") { $opt.print = $true; $i++; continue }
+        if ($a -eq "--off") { $opt.off = $true; $i++; continue }
+        if ($a -like "--interval=*") { $opt.interval = [int]$a.Substring(11); $i++; continue }
+        if ($a -eq "--interval" -and ($i + 1) -lt $CliArgs.Count) {
+            $opt.interval = [int]$CliArgs[$i + 1]; $i += 2; continue
+        }
         if ($a -like "--project=*") { $opt.project = $a.Substring(10); $i++; continue }
         if ($a -eq "--project" -and ($i + 1) -lt $CliArgs.Count) {
             $opt.project = $CliArgs[$i + 1]; $i += 2; continue
@@ -2340,7 +2539,15 @@ function Invoke-Main([string[]]$CliArgs) {
         "list"     { Invoke-ListSessions $opt.project -Titles:$opt.titles -Json:$opt.json; return 0 }
         "status"   { Invoke-Status $opt.project -Json:$opt.json; return 0 }
         "check"    { return (Invoke-Check -Full:$opt.full) }
-        "setup"    { Invoke-Setup @($positional); return 0 }
+        "setup"    {
+            if ($positional -contains "--encrypted") { return (Invoke-SetupEncrypted) }
+            Invoke-Setup @($positional); return 0
+        }
+        "schedule" {
+            $interval = $opt.interval; if ($interval -le 0) { $interval = 30 }
+            return (Invoke-Schedule $interval -Off:$opt.off -Print:$opt.print)
+        }
+        "hook"     { return (Invoke-Hook -Off:$opt.off -Print:$opt.print) }
         "push"     { Invoke-Push $opt.project -DryRun:$opt.dryrun -Quiet:$opt.quiet; return 0 }
         "pull"     { Invoke-Pull $opt.project -DryRun:$opt.dryrun -Quiet:$opt.quiet; return 0 }
         "sync"     { Invoke-Sync $opt.project $opt.only -Interactive:$opt.interactive -DryRun:$opt.dryrun -Quiet:$opt.quiet; return 0 }
