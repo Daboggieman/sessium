@@ -230,3 +230,15 @@ not in PLAN.md or README.md.
   never mutates the ledger; snapshots are free dedup, not a second format.
 - 2026-11-04 — **Scheduling/hook defaults are safe**: no-tty sync = newest-wins
   with guaranteed revert copies; hook push is quiet and non-fatal.
+- 2026-11-07 — **Fresh remote is empty, not unreachable** (found on a real
+  machine): lsjson rc=3 "directory not found" on a brand-new Drive is treated
+  as an empty remote everywhere — push creates the folder chain. Fixed in
+  `remote_sessions()`/`sync_only()` (Linux) and
+  `Get-RemoteSessions`/`Invoke-SyncOnly` (Windows); regression tests both
+  sides (suite + smoke step 0).
+- 2026-11-07 — **The README one-liner actually works now**: `install.sh`
+  survives `curl | bash` (`${BASH_SOURCE[0]:-$0}`; BASH_SOURCE is unset when
+  piped and `set -u` aborted on it) and, with no checkout to install from,
+  fetches the files from master into a temp dir. It also installs
+  `setup-ubuntu.sh` to `~/.local/bin` so an installed `sessium setup` works
+  (cmd_setup falls back to PATH lookup). uninstall.sh matches.

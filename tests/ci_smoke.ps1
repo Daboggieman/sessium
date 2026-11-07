@@ -69,6 +69,13 @@ $env:FAKE_DRIVE_ROOT = $drive
 
 Write-Host "== roundtrip: A pushes, B pulls =="
 
+# 0. fresh remote: no backup/ folder at all is "empty", not "unreachable"
+#    (regression: rc=3 directory-not-found from lsjson killed status/push/sync)
+Remove-Item -LiteralPath (Join-Path $drive "backup") -Recurse -Force
+$r = Run-Sessium @("status")
+Assert-True ($r.code -eq 0) "fresh remote (no backup/ folder): status exits 0"
+Assert-True ($r.text -match "new-here") "fresh remote: still classifies new-here"
+
 # 1. A status: remote has nothing yet -> new-here
 Write-Exact (Join-Path $tmp "config.json") '{"rclone_remote":"fake","drive_folder":"backup"}'
 $r = Run-Sessium @("status")

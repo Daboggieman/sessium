@@ -1,6 +1,6 @@
 # Shared settings for the sessium sync scripts. Sourced by push.sh and pull.sh.
 # Edit these two lines if you used a different name/folder in `rclone config`:
-DRIVE_REMOTE="gdrive"
+DRIVE_REMOTE="ugdrive"
 DRIVE_DIR="claude-backup"
 
 CLAUDE_DIR="$HOME/.claude"

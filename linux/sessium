@@ -424,7 +424,14 @@ def session_title(path: Path, max_lines: int = 200) -> str:
 
 def remote_sessions(cfg: dict) -> dict:
     """munged project name -> list of session dicts, read straight off Drive."""
-    proc = rclone("lsjson", "--recursive", "--hash", drive_url(cfg, "projects"))
+    try:
+        proc = rclone("lsjson", "--recursive", "--hash", drive_url(cfg, "projects"))
+    except RcloneError as exc:
+        # a fresh remote has no projects/ folder yet — that is "empty", not
+        # "unreachable" (push creates the folder chain on its first upload)
+        if "directory not found" in str(exc).lower():
+            return {}
+        raise
     entries = json.loads(proc.stdout or "[]")
     result = {}
     for entry in entries:
@@ -1181,7 +1188,13 @@ def sync_only(cfg: dict, what: str, dry_run: bool) -> int:
         try:
             proc = rclone("lsjson", "--recursive", drive_url(cfg, "projects"))
             entries = json.loads(proc.stdout or "[]")
-        except (RcloneError, json.JSONDecodeError) as exc:
+        except RcloneError as exc:
+            if "directory not found" in str(exc).lower():
+                entries = []          # fresh remote — nothing to pull down yet
+            else:
+                fail(f"cannot reach Drive: {exc}")
+                return 1
+        except (json.JSONDecodeError) as exc:
             fail(f"cannot reach Drive: {exc}")
             return 1
         for entry in entries:
@@ -1748,10 +1761,15 @@ def cmd_setup(args) -> int:
     --encrypted wrap the working Drive remote in an rclone crypt layer."""
     if getattr(args, "encrypted", False):
         return setup_encrypted()
+    # repo layout first (linux/sessium sits one level down), then whatever
+    # install.sh put on PATH (~/.local/bin/setup-ubuntu.sh)
     script = Path(__file__).resolve().parent.parent / "setup-ubuntu.sh"
     if not script.is_file():
-        fail(f"setup script not found at {script}")
-        return 1
+        found = shutil.which("setup-ubuntu.sh")
+        if not found:
+            fail(f"setup script not found at {script} or on PATH")
+            return 1
+        script = Path(found)
     passthrough = ["--check-only"] if args.check_only else []
     result = subprocess.run(["bash", str(script), *passthrough])
     return result.returncode

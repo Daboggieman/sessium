@@ -528,7 +528,15 @@ function Get-MessageDivergence($LocalMsgs, $RemoteMsgs) {
 function Get-RemoteSessions($Cfg) {
     $map = @{}
     $url = ConvertTo-DriveUrl $Cfg "projects"
-    $text = Invoke-Rclone -RcloneArgs @("lsjson", "--recursive", "--hash", $url)
+    $text = $null
+    try {
+        $text = Invoke-Rclone -RcloneArgs @("lsjson", "--recursive", "--hash", $url)
+    } catch {
+        # a fresh remote has no projects/ folder yet — that is "empty", not
+        # "unreachable" (push creates the folder chain on its first upload)
+        if ("$($_.Exception.Message)" -match "directory not found") { return $map }
+        throw
+    }
     if (-not $text) { return $map }
     $entries = @($text | ConvertFrom-Json)
     foreach ($e in $entries) {
@@ -1225,12 +1233,15 @@ function Invoke-SyncOnly([string]$What, [bool]$DryRun) {
                 }
             }
         }
+        $entries = @()
         try {
             $text = Invoke-Rclone -RcloneArgs @("lsjson", "--recursive", (ConvertTo-DriveUrl $cfg "projects"))
-            $entries = @()
             if ($text) { $entries = @($text | ConvertFrom-Json) }
         } catch {
-            Write-Fail "cannot reach Drive: $($_.Exception.Message)"
+            # fresh remote: no projects/ folder yet == empty, not unreachable
+            if ("$($_.Exception.Message)" -notmatch "directory not found") {
+                Write-Fail "cannot reach Drive: $($_.Exception.Message)"
+            }
         }
         foreach ($e in $entries) {
             if ("$(Get-JsonProp $e 'Path')" -notmatch '^projects/([^/]+)/memory/') { continue }

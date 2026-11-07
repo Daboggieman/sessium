@@ -9,6 +9,7 @@ Run from anywhere:   python3 tests/run_tests.py      (see run_tests.py)
 """
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -333,6 +334,22 @@ class SyncBase(unittest.TestCase):
 
 class SyncTests(SyncBase):
     """Phase 2: ledger, push/pull/sync, conflict resolution."""
+
+    def test_sync_on_fresh_remote_bootstraps(self):
+        """A brand-new Drive (no projects/ folder at all) is "empty", not
+        "unreachable" — regression: the rc=3 directory-not-found from lsjson
+        used to kill status/push/sync with 'cannot reach Drive'."""
+        shutil.rmtree(self.drive)
+        p = run_sessium(self.env(self.a), "status", "--json")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIs(json.loads(p.stdout)["reachable"], True)
+        self.local_file(self.a, "aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
+        p = run_sessium(self.env(self.a), "sync")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertTrue(self.drive_file("aaa").is_file())   # folder chain created
+        p = run_sessium(self.env(self.b), "pull")           # another machine pulls
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertTrue(self.local_file(self.b, "aaa").is_file())
 
     def test_push_then_pull_roundtrip(self):
         self.local_file(self.a, "aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
