@@ -264,9 +264,37 @@ class RcloneError(Exception):
     pass
 
 
+# rclone exit codes worth another attempt: 5 = transient retry error,
+# 6 = retries exhausted, 8 = transfers exhausted. Not-found (2/3/4) and
+# fatal (7) are permanent — retrying those just burns time. Timeouts are
+# treated as transient too (a slow link is not a broken one).
+TRANSIENT_RCS = {5, 6, 8}
+COPY_RETRIES = 2
+# Backoff between retries: 2s, then 4s. SESSIUM_RETRY_DELAY_SCALE lets the
+# test suite collapse the waits to zero.
+RETRY_DELAY_SCALE = float(os.environ.get("SESSIUM_RETRY_DELAY_SCALE", "1.0"))
+
+# File-transfer timeout: the old fixed 300s killed healthy uploads of big
+# transcripts on slow uplinks (three in one real sync). Scale the ceiling
+# with the file size — 10 s/MB assumes a ~100 KB/s sustained rate, and never
+# go below the 300s base. SESSIUM_COPY_TIMEOUT overrides with a fixed value.
+COPY_TIMEOUT_BASE = 300
+COPY_TIMEOUT_PER_MB = 10.0
+
+
+def copy_timeout(size_bytes) -> int:
+    override = os.environ.get("SESSIUM_COPY_TIMEOUT", "")
+    if override.isdigit():
+        return int(override)
+    size = size_bytes or 0
+    return max(COPY_TIMEOUT_BASE, int(COPY_TIMEOUT_PER_MB * (size / (1 << 20))))
+
+
 def rclone(*args: str, timeout: int = 120, check: bool = True, to_file=None):
     """Run rclone. With to_file=<path>, stdout streams into that file (used
-    for `rclone cat` of big transcripts) instead of being captured."""
+    for `rclone cat` of big transcripts) instead of being captured.
+    Raised RcloneErrors carry .transient — True for timeouts and rclone's
+    retry-class exit codes — so copy_retrying() can pick its battles."""
     cmd = [rclone_bin(), *args]
     debug(" ".join(cmd))
     try:
@@ -282,15 +310,36 @@ def rclone(*args: str, timeout: int = 120, check: bool = True, to_file=None):
             f"SESSIUM_RCLONE_BIN at the binary"
         ) from exc
     except subprocess.TimeoutExpired as exc:
-        raise RcloneError(f"rclone timed out after {timeout}s: {' '.join(args[:2])}") from exc
+        err = RcloneError(f"rclone timed out after {timeout}s: {' '.join(args[:2])}")
+        err.transient = True
+        raise err from exc
     if check and proc.returncode != 0:
         detail = proc.stderr or proc.stdout or ""
         if isinstance(detail, bytes):
             detail = detail.decode("utf-8", "replace")
         lines = detail.strip().splitlines()
         tail = lines[-1][:200] if lines else "(no output)"
-        raise RcloneError(f"rclone {' '.join(args[:2])} failed (rc={proc.returncode}): {tail}")
+        err = RcloneError(f"rclone {' '.join(args[:2])} failed (rc={proc.returncode}): {tail}")
+        err.transient = proc.returncode in TRANSIENT_RCS
+        raise err
     return proc
+
+
+def copy_retrying(args: list, size_bytes: int | None = None, to_file=None) -> None:
+    """rclone copyto/copy with a size-aware timeout and bounded retries.
+    Transfers are idempotent (copyto/copy overwrite whole files), so a blind
+    re-attempt is safe; permanent errors still fail on the first attempt."""
+    timeout = copy_timeout(size_bytes)
+    for n in range(1, COPY_RETRIES + 2):
+        try:
+            rclone(*args, timeout=timeout, to_file=to_file)
+            return
+        except RcloneError as exc:
+            if not getattr(exc, "transient", False) or n > COPY_RETRIES:
+                raise
+            delay = int(2 * n * RETRY_DELAY_SCALE)   # 2s, then 4s
+            warn(f"retry {n}/{COPY_RETRIES} in {delay}s: {exc}")
+            time.sleep(delay)
 
 
 # ---------------------------------------------------------------------------
@@ -593,20 +642,23 @@ def fetch_remote_transcript(cfg: dict, project: str, sid: str) -> Path:
     fd, name = tempfile.mkstemp(prefix=f"sessium-{sid[:8]}-")
     os.close(fd)
     path = Path(name)
-    rclone("cat", drive_url(cfg, f"projects/{project}/{sid}.jsonl"),
-           timeout=300, to_file=str(path))
+    copy_retrying(["cat", drive_url(cfg, f"projects/{project}/{sid}.jsonl")],
+                  to_file=str(path))
     return path
 
 
 def upload_session(cfg: dict, project: str, sid: str, local_path: str) -> None:
-    rclone("copyto", local_path, drive_url(cfg, f"projects/{project}/{sid}.jsonl"),
-           timeout=300)
+    size = os.path.getsize(local_path)
+    copy_retrying(["copyto", local_path,
+                   drive_url(cfg, f"projects/{project}/{sid}.jsonl")],
+                  size_bytes=size)
 
 
 def download_session(cfg: dict, project: str, sid: str, local_path: str) -> None:
     Path(local_path).parent.mkdir(parents=True, exist_ok=True)
-    rclone("copyto", drive_url(cfg, f"projects/{project}/{sid}.jsonl"), local_path,
-           timeout=300)
+    # size unknown without an extra lsjson round-trip — base timeout + retries
+    copy_retrying(["copyto", drive_url(cfg, f"projects/{project}/{sid}.jsonl"),
+                   local_path])
 
 
 def revert_path(project: str, sid: str) -> Path:
@@ -635,8 +687,8 @@ def save_remote_revert(cfg: dict, project: str, sid: str) -> Path:
     """Preserve a losing REMOTE copy: download it into revert/ before the
     upload overwrites it on Drive."""
     dst = revert_path(project, sid)
-    rclone("copyto", drive_url(cfg, f"projects/{project}/{sid}.jsonl"), str(dst),
-           timeout=300)
+    copy_retrying(["copyto", drive_url(cfg, f"projects/{project}/{sid}.jsonl"),
+                   str(dst)])
     return dst
 
 
@@ -1218,10 +1270,8 @@ def sync_only(cfg: dict, what: str, dry_run: bool) -> int:
             continue
         try:
             local_dir.mkdir(parents=True, exist_ok=True)
-            rclone("copy", str(local_dir) + "/", remote_dir + "/", "--update",
-                   timeout=300)
-            rclone("copy", remote_dir + "/", str(local_dir) + "/", "--update",
-                   timeout=300)
+            copy_retrying(["copy", str(local_dir) + "/", remote_dir + "/", "--update"])
+            copy_retrying(["copy", remote_dir + "/", str(local_dir) + "/", "--update"])
             transferred += 1
             ok(f"synced {what}: {local_dir.name}  <->  {remote_dir.split(':')[-1]}")
         except RcloneError as exc:
@@ -2340,7 +2390,8 @@ def build_parser() -> argparse.ArgumentParser:
                     "with Google Drive as the remote.",
     )
     parser.add_argument("--version", action="version", version=f"sessium {VERSION}")
-    parser.add_argument("--debug", action="store_true", help="show rclone commands")
+    parser.add_argument("--debug", "--verbose", action="store_true",
+                        help="show rclone commands (aliases: --verbose)")
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_list = sub.add_parser("list", help="inventory of local sessions")
@@ -2517,6 +2568,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 ADOPT_FLAG_TOKENS = ("--dry-run", "-h", "--help")
 
+# Global flags are accepted anywhere on the line, not just before the
+# subcommand: "sessium sync --verbose" reads naturally, so hoist both spellings
+# to the front where the top-level parser sees them. Pure flags — safe to move.
+GLOBAL_FLAG_TOKENS = ("--debug", "--verbose")
+
 
 def preprocess_argv(argv: list) -> list:
     """Munged path arguments always begin with '-' (e.g. -home-recoding-Kairo-v1),
@@ -2524,6 +2580,8 @@ def preprocess_argv(argv: list) -> list:
     '--project=-foo', and for adopt hoist its known flags ahead of a '--'
     that shields the leading-dash source positional (everything after '--'
     would otherwise be gobbled as positionals)."""
+    hoisted = [t for t in argv if t in GLOBAL_FLAG_TOKENS]
+    argv = [t for t in argv if t not in GLOBAL_FLAG_TOKENS]
     out = []
     i = 0
     while i < len(argv):
@@ -2543,7 +2601,7 @@ def preprocess_argv(argv: list) -> list:
             break
         out.append(argv[i])
         i += 1
-    return out
+    return hoisted + out
 
 
 def main(argv=None) -> int:

@@ -74,10 +74,29 @@ def entry(path: Path, display: str, want_hash: bool) -> dict:
     return e
 
 
+def fail_inject(args: list) -> None:
+    """SESSIUM_FAKE_FAIL_FIRST="<rc>,<count>" makes the first <count> copyto
+    invocations exit <rc> with a plausible stderr line; later calls behave
+    normally. The counter persists under the fake drive so it survives across
+    processes — this is how the retry tests simulate a flaky uplink."""
+    spec = os.environ.get("SESSIUM_FAKE_FAIL_FIRST", "")
+    if not spec or not args or args[0] != "copyto":
+        return
+    rc_s, _, n_s = spec.partition(",")
+    state = Path(os.environ["FAKE_DRIVE_ROOT"]) / "fake-fail-count"
+    seen = int(state.read_text(encoding="utf-8")) if state.exists() else 0
+    if seen < int(n_s):
+        state.write_text(str(seen + 1), encoding="utf-8")
+        print(f"fake_rclone: injected failure rc={rc_s} (attempt {seen + 1}/{n_s})",
+              file=sys.stderr)
+        sys.exit(int(rc_s))
+
+
 def main() -> None:
     args = sys.argv[1:]
     if not args:
         sys.exit(1)
+    fail_inject(args)
     if args[0] == "version":
         print("rclone vFAKE-STUB-1.0")
         return

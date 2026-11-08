@@ -148,6 +148,17 @@ class UnitTests(unittest.TestCase):
         self.assertEqual(len(set(spread)), 10)                     # no duplicates
         self.assertEqual(spread, list(range(0, 100, 10)))          # evenly spread
 
+    def test_copy_timeout_scales_with_size(self):
+        ct = self.mod.copy_timeout
+        self.assertEqual(ct(0), 300)                # small files keep the base
+        self.assertEqual(ct(50 * 1024 * 1024), 500)  # 50MB -> 300..500s: 10s/MB
+        self.assertEqual(ct(200 * 1024 * 1024), 2000)  # 200MB transcript
+        os.environ["SESSIUM_COPY_TIMEOUT"] = "45"
+        try:
+            self.assertEqual(ct(999 * 1024 * 1024), 45)  # env overrides scaling
+        finally:
+            del os.environ["SESSIUM_COPY_TIMEOUT"]
+
 
 # ------------------------------------------------------------ command tests
 
@@ -363,6 +374,53 @@ class SyncTests(SyncBase):
                          SESSION_WITH_TITLE)
         p = run_sessium(self.env(self.b), "status")
         self.assertIn("in-sync: 1", p.stdout)
+
+    def test_push_retries_transient_failures(self):
+        # first copyto exits rc=6 (retries exhausted — the real-world failure),
+        # the engine's own retry saves it
+        self.local_file(self.a, "aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
+        env = self.env(self.a)
+        env["SESSIUM_FAKE_FAIL_FIRST"] = "6,1"
+        env["SESSIUM_RETRY_DELAY_SCALE"] = "0"
+        p = run_sessium(env, "push")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("retry 1/2", p.stderr)
+        self.assertIn("pushed: 1", p.stdout)
+        self.assertTrue(self.drive_file("aaa").is_file())
+        self.assertEqual(self.drive_file("aaa").read_text(encoding="utf-8"),
+                         SESSION_WITH_TITLE)
+
+    def test_push_fails_after_retries_exhausted(self):
+        # every copyto fails -> the session is quarantined, rc=1, nothing pushed
+        self.local_file(self.a, "aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
+        env = self.env(self.a)
+        env["SESSIUM_FAKE_FAIL_FIRST"] = "6,99"
+        env["SESSIUM_RETRY_DELAY_SCALE"] = "0"
+        p = run_sessium(env, "push")
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("retry 1/2", p.stderr)
+        self.assertIn("retry 2/2", p.stderr)
+        self.assertIn("FAILED: 1", p.stdout)
+        self.assertFalse(self.drive_file("aaa").exists())
+
+    def test_push_does_not_retry_permanent_errors(self):
+        # rc=2 (not found) is permanent: fail fast, no retry chatter
+        self.local_file(self.a, "aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
+        env = self.env(self.a)
+        env["SESSIUM_FAKE_FAIL_FIRST"] = "2,99"
+        env["SESSIUM_RETRY_DELAY_SCALE"] = "0"
+        p = run_sessium(env, "push")
+        self.assertEqual(p.returncode, 1)
+        self.assertNotIn("retry 1/2", p.stderr)
+        self.assertIn("FAILED: 1", p.stdout)
+
+    def test_verbose_flag_accepted_anywhere(self):
+        # --verbose aliases --debug, before or after the subcommand
+        p = run_sessium(self.env(self.a), "--verbose", "version")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        p = run_sessium(self.env(self.a), "version", "--verbose")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertNotIn("unrecognized arguments", p.stderr)
 
     def test_bootstrap_records_without_prompt(self):
         # identical copies everywhere, no ledger on either machine yet
