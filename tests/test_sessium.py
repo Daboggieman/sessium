@@ -1315,6 +1315,26 @@ class Batch5Tests(SyncBase):
         self.assertEqual(new_cfg["drive_folder"], "")
         self.assertEqual(new_cfg["seeker_url"], "http://seeker.example")
 
+    def test_push_after_encrypted_lands_at_crypt_root(self):
+        # regression: the post-crypt config carries drive_folder "" (crypt
+        # root == the old folder), which a truthy config check silently
+        # reverted to the default — pushes forked into
+        # <crypt>:claude-backup/ and re-uploaded everything under a parallel
+        # tree instead of landing at the crypt root
+        self.local_file(self.a, "aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
+        p = run_sessium(self.env(self.a), "setup", "--encrypted")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        p = run_sessium(self.env(self.a), "push")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("pushed: 1", p.stdout)
+        crypt_root = self.drive / "projects" / PROJ / "aaa.jsonl"
+        self.assertTrue(crypt_root.is_file(), "push went to the crypt root")
+        self.assertEqual(crypt_root.read_bytes(),
+                         self.local_file(self.a, "aaa").read_bytes())
+        self.assertFalse(
+            (self.drive / "claude-backup" / "projects" / PROJ / "aaa.jsonl").exists(),
+            "no parallel claude-backup tree appeared")
+
 
 # ------------------------------------------------- batch 6: export / onboard
 

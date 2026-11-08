@@ -538,6 +538,49 @@ Assert-True ($r.text -match "sync timer: installed") "onboard: timer detected th
 Assert-True ($r.text -match "all set\. everyday commands") "onboard: all set when nothing is missing"
 Remove-Item Env:\SESSIUM_SCHTASKS_BIN -ErrorAction SilentlyContinue
 
+# --- retry / timeout / --verbose: a real sync lost 3 sessions to the fixed
+# 300s copyto timeout (big transcripts, slow uplink) and 1 to rc=6 (rclone's
+# own retries exhausted), and "sessium sync --verbose" was "unrecognized".
+# Machine A's aaa still holds the escaping-test content and was never
+# re-pushed, so each push below does exactly one copyto.
+Write-Host "== retry / verbose =="
+
+# --verbose is an alias of --debug, accepted on either side of the subcommand
+$r = Run-Sessium @("version", "--verbose")
+Assert-True ($r.code -eq 0) "--verbose after the subcommand is accepted"
+$r = Run-Sessium @("--verbose", "version")
+Assert-True ($r.code -eq 0) "--verbose before the subcommand is accepted"
+
+# a transient failure (rc=6) is retried and the push succeeds;
+# SESSIUM_RETRY_DELAY_SCALE collapses the 2s/4s backoff for tests
+Use-Machine "A"
+$env:SESSIUM_FAKE_FAIL_FIRST = "6,1"
+$env:SESSIUM_RETRY_DELAY_SCALE = "0"
+$r = Run-Sessium @("push")
+Assert-True ($r.code -eq 0) "push survives one transient copyto failure"
+Assert-True ($r.text -match "retry 1/2") "the retry is announced"
+Assert-True ($r.text -match "pushed: 1") "push completes after the retry"
+Assert-True ([System.IO.File]::ReadAllText((Join-Path $drive "projects\$proj\aaa.jsonl")) -ceq [System.IO.File]::ReadAllText($sessionA)) "the retried push landed the right bytes"
+
+# when every attempt fails, the push reports FAILED and nothing lands
+$env:SESSIUM_FAKE_FAIL_FIRST = "6,99"
+Remove-Item -LiteralPath (Join-Path $drive "projects\$proj\aaa.jsonl") -Force
+$r = Run-Sessium @("push")
+Assert-True ($r.code -eq 1) "push fails after retries are exhausted"
+Assert-True ($r.text -match "retry 1/2") "first retry ran"
+Assert-True ($r.text -match "retry 2/2") "second retry ran"
+Assert-True ($r.text -match "FAILED: 1") "the exhausted transfer is reported as FAILED"
+Assert-True (-not (Test-Path -LiteralPath (Join-Path $drive "projects\$proj\aaa.jsonl"))) "no partial upload landed"
+
+# a permanent failure (rc=2, not found) fails on the first attempt - no retry
+$env:SESSIUM_FAKE_FAIL_FIRST = "2,99"
+$r = Run-Sessium @("push")
+Assert-True ($r.code -eq 1) "permanent copyto failure still fails the push"
+Assert-True ($r.text -notmatch "retry 1/2") "permanent errors are not retried"
+
+Remove-Item Env:\SESSIUM_FAKE_FAIL_FIRST -ErrorAction SilentlyContinue
+Remove-Item Env:\SESSIUM_RETRY_DELAY_SCALE -ErrorAction SilentlyContinue
+
 Write-Host ""
 
 Write-Host ""

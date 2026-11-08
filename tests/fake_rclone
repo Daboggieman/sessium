@@ -22,12 +22,17 @@ from pathlib import Path
 
 
 def split_remote(arg: str) -> Path:
-    """'gdrive:claude-backup/projects' -> $FAKE_DRIVE_ROOT/claude-backup/projects"""
+    """'gdrive:claude-backup/projects' -> $FAKE_DRIVE_ROOT/claude-backup/projects
+
+    A leading slash after the colon is tolerated (real rclone allows it): with
+    a crypt config, drive_folder is "" and drive_url emits '<remote>:/projects/...'.
+    pathlib would treat that join as absolute and escape the fake drive, so
+    strip it first."""
     if ":" not in arg:
         print(f"not a remote path: {arg}", file=sys.stderr)
         sys.exit(1)
     _, rest = arg.split(":", 1)
-    return Path(os.environ["FAKE_DRIVE_ROOT"]) / rest
+    return Path(os.environ["FAKE_DRIVE_ROOT"]) / rest.lstrip("/")
 
 
 def resolve_arg(arg: str) -> Path:

@@ -230,10 +230,14 @@ function Get-SessiumConfig {
             $folder = Get-JsonProp $raw "drive_folder"
             $seekerUrl = Get-JsonProp $raw "seeker_url"
             $seekerToken = Get-JsonProp $raw "seeker_token"
-            if ($remote) { $cfg.Remote = [string]$remote }
-            if ($folder) { $cfg.Folder = [string]$folder }
-            if ($seekerUrl) { $cfg.SeekerUrl = [string]$seekerUrl }
-            if ($seekerToken) { $cfg.SeekerToken = [string]$seekerToken }
+            # null-guard, not truthiness: setup --encrypted writes
+            # drive_folder as "" (crypt root == the old folder), and a truthy
+            # check silently reverted that to the default - every push then
+            # forked into <crypt>:claude-backup/ instead of the crypt root
+            if ($null -ne $remote) { $cfg.Remote = [string]$remote }
+            if ($null -ne $folder) { $cfg.Folder = [string]$folder }
+            if ($null -ne $seekerUrl) { $cfg.SeekerUrl = [string]$seekerUrl }
+            if ($null -ne $seekerToken) { $cfg.SeekerToken = [string]$seekerToken }
             return $cfg
         } catch {
             Write-Warn2 "  [!]  unreadable config $path — falling back to defaults"
@@ -270,6 +274,64 @@ function ConvertTo-ProcessArg([string]$A) {
     return "`"$a2`""
 }
 
+<# rclone exit codes worth another attempt: 5 = transient retry error,
+   6 = retries exhausted, 8 = transfers exhausted. Not-found (2/3/4) and
+   fatal (7) are permanent - retrying those just burns time. Timeouts are
+   treated as transient too (a slow link is not a broken one). #>
+$script:TransientRcs = @(5, 6, 8)
+$script:CopyRetries = 2
+
+# File-transfer timeout: the old fixed 300s killed healthy uploads of big
+# transcripts on slow uplinks. Scale the ceiling with the file size - 10 s/MB
+# assumes a ~100 KB/s sustained rate, and never go below the 300s base.
+# SESSIUM_COPY_TIMEOUT overrides with a fixed value.
+$script:CopyTimeoutBase = 300
+$script:CopyTimeoutPerMb = 10.0
+
+function Get-CopyTimeout([long]$SizeBytes) {
+    $override = $env:SESSIUM_COPY_TIMEOUT
+    if ($override -and $override -match '^\d+$') { return [int]$override }
+    $size = 0
+    if ($SizeBytes -gt 0) { $size = $SizeBytes }
+    return [Math]::Max($script:CopyTimeoutBase,
+        [int][Math]::Floor($script:CopyTimeoutPerMb * ($size / 1MB)))
+}
+
+# Plain thrown exceptions carry no Transient flag, and StrictMode 2 forbids
+# reading a property that may not exist - go through PSObject.Properties.
+function Test-TransientError($Exception) {
+    $p = $Exception.PSObject.Properties["Transient"]
+    return ($null -ne $p -and [bool]$p.Value)
+}
+
+<# rclone copyto/copy with a size-aware timeout and bounded retries.
+   Transfers are idempotent (copyto/copy overwrite whole files), so a blind
+   re-attempt is safe; permanent errors still fail on the first attempt.
+   SESSIUM_RETRY_DELAY_SCALE collapses the 2s/4s backoff (test suite). #>
+function Invoke-CopyWithRetry {
+    param([string[]]$RcloneArgs, [long]$SizeBytes = 0, [string]$ToFile)
+    $timeout = Get-CopyTimeout $SizeBytes
+    $scale = 1.0
+    if ($env:SESSIUM_RETRY_DELAY_SCALE -and $env:SESSIUM_RETRY_DELAY_SCALE -match '^\d+(\.\d+)?$') {
+        $scale = [double]$env:SESSIUM_RETRY_DELAY_SCALE
+    }
+    for ($n = 1; $n -le $script:CopyRetries + 1; $n++) {
+        try {
+            if ($ToFile) {
+                $null = Invoke-Rclone -RcloneArgs $RcloneArgs -TimeoutSec $timeout -ToFile $ToFile
+            } else {
+                $null = Invoke-Rclone -RcloneArgs $RcloneArgs -TimeoutSec $timeout
+            }
+            return
+        } catch {
+            if (-not (Test-TransientError $_.Exception) -or $n -gt $script:CopyRetries) { throw }
+            $delay = [int](2 * $n * $scale)
+            Write-Warn2 "  [!]  retry $n/$($script:CopyRetries) in ${delay}s: $($_.Exception.Message)"
+            if ($delay -gt 0) { Start-Sleep -Seconds $delay }
+        }
+    }
+}
+
 <# Run rclone and return stdout (raw text). With -ToFile, stdout goes to that
    file instead (streaming a remote transcript to disk). Throws with rclone's
    own stderr on failure. #>
@@ -293,12 +355,17 @@ function Invoke-Rclone {
     $errTask = $proc.StandardError.ReadToEndAsync()
     if (-not $proc.WaitForExit($TimeoutSec * 1000)) {
         try { $proc.Kill() } catch { }
-        throw "rclone $($RcloneArgs[0]) timed out after ${TimeoutSec}s"
+        $ex = New-Object System.Exception "rclone $($RcloneArgs[0]) timed out after ${TimeoutSec}s"
+        Add-Member -InputObject $ex -NotePropertyName Transient -NotePropertyValue $true
+        throw $ex
     }
     $err = $errTask.Result.Trim()
     if ($proc.ExitCode -ne 0) {
-        throw "rclone $($RcloneArgs -join ' ') failed (rc=$($proc.ExitCode))$(
+        $ex = New-Object System.Exception "rclone $($RcloneArgs -join ' ') failed (rc=$($proc.ExitCode))$(
             if ($err) { ": $err" })"
+        Add-Member -InputObject $ex -NotePropertyName Transient `
+            -NotePropertyValue ($script:TransientRcs -contains $proc.ExitCode)
+        throw $ex
     }
     if ($ToFile) {
         [System.IO.File]::WriteAllText($ToFile, $outTask.Result, [System.Text.Encoding]::UTF8)
@@ -509,8 +576,8 @@ function Get-RemoteTranscript($Cfg, [string]$Project, [string]$Sid) {
     try {
         # $null = : discard output so nothing extra joins this function's
         # return stream beside the temp path
-        $null = Invoke-Rclone -RcloneArgs @("cat", (ConvertTo-DriveUrl $Cfg "projects/$Project/$Sid.jsonl")) `
-            -ToFile $tmp -TimeoutSec 120
+        $null = Invoke-CopyWithRetry -RcloneArgs @("cat", (ConvertTo-DriveUrl $Cfg "projects/$Project/$Sid.jsonl")) `
+            -ToFile $tmp
         return $tmp
     } catch {
         if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force }
@@ -696,7 +763,9 @@ function Get-LocalSessionPath([string]$Project, [string]$Sid) {
 }
 
 function Copy-Up([string]$LocalPath, [string]$RemoteUrl) {
-    Invoke-Rclone -RcloneArgs @("copyto", $LocalPath, $RemoteUrl) -TimeoutSec 300
+    $size = 0
+    if (Test-Path -LiteralPath $LocalPath) { $size = (Get-Item -LiteralPath $LocalPath).Length }
+    Invoke-CopyWithRetry -RcloneArgs @("copyto", $LocalPath, $RemoteUrl) -SizeBytes $size
 }
 
 function Copy-Down([string]$RemoteUrl, [string]$LocalPath) {
@@ -704,7 +773,8 @@ function Copy-Down([string]$RemoteUrl, [string]$LocalPath) {
     if (-not (Test-Path -LiteralPath $dir)) {
         New-Item -ItemType Directory -Path $dir -Force | Out-Null
     }
-    Invoke-Rclone -RcloneArgs @("copyto", $RemoteUrl, $LocalPath) -TimeoutSec 300
+    # size unknown without an extra lsjson round-trip - base timeout + retries
+    Invoke-CopyWithRetry -RcloneArgs @("copyto", $RemoteUrl, $LocalPath)
 }
 
 <# Unique revert-copy path: <dir>/revert/<sid>.revert-<yyyyMMdd-HHmmss>.jsonl,
@@ -1329,8 +1399,8 @@ function Invoke-SyncOnly([string]$What, [bool]$DryRun) {
             if (-not (Test-Path -LiteralPath $p.local)) {
                 New-Item -ItemType Directory -Path $p.local -Force | Out-Null
             }
-            Invoke-Rclone -RcloneArgs @("copy", ($p.local + "/"), ($p.remote + "/"), "--update") -TimeoutSec 300
-            Invoke-Rclone -RcloneArgs @("copy", ($p.remote + "/"), ($p.local + "/"), "--update") -TimeoutSec 300
+            Invoke-CopyWithRetry -RcloneArgs @("copy", ($p.local + "/"), ($p.remote + "/"), "--update")
+            Invoke-CopyWithRetry -RcloneArgs @("copy", ($p.remote + "/"), ($p.local + "/"), "--update")
             $tail = ($p.remote -split ":")[-1]
             Write-Info "[OK] synced ${What}: $(Split-Path -Leaf $p.local)  <->  $tail"
         } catch {
@@ -2803,7 +2873,7 @@ usage: sessium <command> [args]
 session ids: a prefix is enough ('sessium diff 9f8e'). Munged project names
 always start with '-' (e.g. -C--Users-me-repo) - fine after --project.
 
---debug prints every rclone call. Exit codes: 0 ok (skips are not failures),
+--debug/--verbose prints every rclone call. Exit codes: 0 ok (skips are not failures),
 1 real failures. (Ctrl+C exits via the PowerShell console itself.)
 "@
 }
@@ -2822,7 +2892,7 @@ function Invoke-Main([string[]]$CliArgs) {
     $i = 0
     while ($i -lt $CliArgs.Count) {
         $a = $CliArgs[$i]
-        if ($a -eq "--debug") { $script:Debug = $true; $i++; continue }
+        if ($a -eq "--debug" -or $a -eq "--verbose") { $script:Debug = $true; $i++; continue }
         if ($a -eq "--titles") { $opt.titles = $true; $i++; continue }
         if ($a -eq "--interactive") { $opt.interactive = $true; $i++; continue }
         if ($a -eq "--json") { $opt.json = $true; $i++; continue }

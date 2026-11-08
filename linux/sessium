@@ -114,7 +114,12 @@ def load_config() -> dict:
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             for key in cfg:
-                if data.get(key):
+                # "is not None", not truthiness: setup --encrypted writes
+                # drive_folder as "" (crypt root == the old folder), and a
+                # truthy check silently reverted that to the default - every
+                # push then forked into <crypt>:claude-backup/ instead of the
+                # crypt root
+                if data.get(key) is not None:
                     cfg[key] = data[key]
             return cfg
         except (json.JSONDecodeError, OSError) as exc:
