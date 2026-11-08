@@ -59,9 +59,16 @@ function Get-ShortId([string]$Id, [int]$Keep = 8) {
    offsets like +01:00 allowed) into a UTC DateTime. Returns $null on
    empty/unparseable input. .NET Framework only parses up to 7 fractional
    digits, so trim the nanoseconds first. #>
-function ConvertFrom-RcloneTime([string]$Value) {
-    if (-not $Value) { return $null }
-    $trimmed = [regex]::Replace($Value, '\.(\d{7})\d+', '$1')
+function ConvertFrom-RcloneTime($Value) {
+    if ($null -eq $Value) { return $null }
+    # pwsh's ConvertFrom-Json coerces ISO-8601 strings to DateTime BEFORE we
+    # see them (lsjson ModTime arrives as [DateTime]) — accept both, and
+    # never round-trip through [string], which lands in en-US culture format
+    if ($Value -is [DateTime]) { return $Value.ToUniversalTime() }
+    # keep the DOT: the match includes it, and a bare '$1' replacement glues
+    # the fraction onto the seconds ("161234567") which fails to parse —
+    # remote mtimes all came back null and newest-wins had nothing to compare
+    $trimmed = [regex]::Replace($Value, '\.(\d{7})\d+', '.$1')
     $trimmed = $trimmed -replace 'Z$', '+00:00'
     try {
         $dto = [DateTimeOffset]::Parse($trimmed,
@@ -100,19 +107,19 @@ function ConvertTo-JsonString([string]$S) {
     [void]$sb.Append('"')
     foreach ($ch in $S.ToCharArray()) {
         $code = [int]$ch
-        switch ($code) {
-            0x22 { [void]$sb.Append('\"'); continue }
-            0x5C { [void]$sb.Append('\\'); continue }
-            0x08 { [void]$sb.Append('\b'); continue }
-            0x0C { [void]$sb.Append('\f'); continue }
-            0x0A { [void]$sb.Append('\n'); continue }
-            0x0D { [void]$sb.Append('\r'); continue }
-            0x09 { [void]$sb.Append('\t'); continue }
-        }
         if ($code -lt 0x20 -or $code -gt 0x7E) {
             [void]$sb.Append(('\u{0:x4}' -f $code))
         } else {
-            [void]$sb.Append($ch)
+            switch ($code) {
+                0x22 { [void]$sb.Append('\"') }
+                0x5C { [void]$sb.Append('\\') }
+                0x08 { [void]$sb.Append('\b') }
+                0x0C { [void]$sb.Append('\f') }
+                0x0A { [void]$sb.Append('\n') }
+                0x0D { [void]$sb.Append('\r') }
+                0x09 { [void]$sb.Append('\t') }
+                default { [void]$sb.Append($ch) }
+            }
         }
     }
     [void]$sb.Append('"')
@@ -135,17 +142,19 @@ function ConvertTo-JsonText($Value, [int]$Indent) {
         return ([double]$Value).ToString("R", [System.Globalization.CultureInfo]::InvariantCulture)
     }
     if ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [System.Collections.IDictionary]) {
-        # foreach-accumulate, NOT @($Value): pwsh 7.4's @(<List[object]>)
-        # throws "Argument types do not match" under StrictMode (DLR bug);
-        # the foreach statement handles every IEnumerable the same way
-        $items = @()
-        foreach ($item in $Value) { $items += $item }
-        if ($items.Count -eq 0) { return "[]" }
-        $lines = @()
-        foreach ($item in $items) {
-            $lines += ($padIn + (ConvertTo-JsonText $item ($Indent + 2)))
+        # List.Add, NOT "$items += $item": array += with an ARRAY on the right
+        # concatenates element-wise and flattens nested arrays (a pair
+        # ["user","text"] would dissolve into the outer list). Add keeps each
+        # element intact, so nested arrays serialize nested. Also dodges pwsh
+        # 7.4's @(<List[object]>) DLR crash under StrictMode.
+        $lines = New-Object System.Collections.Generic.List[string]
+        $count = 0
+        foreach ($item in $Value) {
+            $count++
+            $lines.Add($padIn + (ConvertTo-JsonText $item ($Indent + 2)))
         }
-        return "[`n" + ($lines -join ",`n") + "`n$pad]"
+        if ($count -eq 0) { return "[]" }
+        return "[`n" + ($lines.ToArray() -join ",`n") + "`n$pad]"
     }
     if ($Value -is [System.Collections.IDictionary]) {
         if ($Value.Count -eq 0) { return "{}" }
@@ -293,9 +302,12 @@ function Invoke-Rclone {
     }
     if ($ToFile) {
         [System.IO.File]::WriteAllText($ToFile, $outTask.Result, [System.Text.Encoding]::UTF8)
-        return $null
+        return   # plain return, NOT "return $null": an emitted $null joins
+                 # the CALLER's output stream (Get-RemoteTranscript's $tmp
+                 # became @($null, path) and Remove-Item -LiteralPath died
+                 # binding the null element)
     }
-    if ($Quiet) { return $null }
+    if ($Quiet) { return }
     return $outTask.Result
 }
 
@@ -317,6 +329,20 @@ function New-Ledger {
 
 function Get-LedgerKey([string]$Project, [string]$Sid) { return "$Project/$Sid" }
 
+<# pwsh's ConvertFrom-Json coerces ISO-8601 strings to DateTime, and the
+   ledger's last_synced must round-trip as the exact string sessium wrote
+   ("yyyy-MM-ddTHH:mm:ssZ") — a [string] cast of the coerced DateTime lands
+   in en-US culture ("11/07/2026 22:34:39") and would corrupt the file on
+   the next save. Re-format DateTimes back to the canonical form. #>
+function ConvertTo-IsoZ($Value) {
+    if ($null -eq $Value) { return "" }
+    if ($Value -is [DateTime]) {
+        return $Value.ToUniversalTime().ToString(
+            "yyyy-MM-dd'T'HH:mm:ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture)
+    }
+    return [string]$Value
+}
+
 <# Load the ledger. An unreadable one is a loud warning plus a fresh start —
    the bootstrap rule re-records matching sessions, so losing it must never
    cause data loss or mass conflicts (SPEC section 3). #>
@@ -335,7 +361,7 @@ function Get-Ledger {
                     id = [string](Get-JsonProp $v "id")
                     local_md5 = [string](Get-JsonProp $v "local_md5")
                     remote_md5 = [string](Get-JsonProp $v "remote_md5")
-                    last_synced = [string](Get-JsonProp $v "last_synced")
+                    last_synced = (ConvertTo-IsoZ (Get-JsonProp $v "last_synced"))
                 }
             }
         }
@@ -388,8 +414,9 @@ function Get-FileMd5([string]$Path) {
     }
 }
 
-<# Discover local sessions: @{ "<munged>" = @( @{ id, path, size, mtime } ) }
-   mtime is a UTC DateTime (LastWriteTimeUtc). #>
+<# Discover local sessions: @{ "<munged>" = @( @{ id, path, size, mtime, md5 } ) }
+   mtime is a UTC DateTime (LastWriteTimeUtc). md5 matches Linux's
+   local_sessions(), which hashes every transcript on every scan. #>
 function Get-LocalSessions {
     $root = Join-Path (Get-ClaudeDir) "projects"
     $map = @{}
@@ -403,6 +430,7 @@ function Get-LocalSessions {
                 path = $f.FullName
                 size = $f.Length
                 mtime = $f.LastWriteTimeUtc
+                md5 = (Get-FileMd5 $f.FullName)
             })
         }
         # object[], not List[object]: pwsh 7.4 throws "Argument types do not
@@ -479,7 +507,9 @@ function Get-RemoteTranscript($Cfg, [string]$Project, [string]$Sid) {
     $keep = if ($Sid.Length -gt 8) { $Sid.Substring(0, 8) } else { $Sid }
     $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("sessium-" + $keep + ".jsonl")
     try {
-        Invoke-Rclone -RcloneArgs @("cat", (ConvertTo-DriveUrl $Cfg "projects/$Project/$Sid.jsonl")) `
+        # $null = : discard output so nothing extra joins this function's
+        # return stream beside the temp path
+        $null = Invoke-Rclone -RcloneArgs @("cat", (ConvertTo-DriveUrl $Cfg "projects/$Project/$Sid.jsonl")) `
             -ToFile $tmp -TimeoutSec 120
         return $tmp
     } catch {
@@ -514,7 +544,10 @@ function Get-TranscriptMessages([string]$Path) {
         $norm = (($text -split "\s+") | Where-Object { $_ }) -join " "
         $out.Add(@{ role = $t; text = $norm })
     }
-    return ,$out
+    # object[], not the List: @() around a List[object] hits pwsh 7.4's
+    # "Argument types do not match" DLR crash under strict mode (the same
+    # bug the status rows hit), and diff --messages wraps these in @()
+    return ,$out.ToArray()
 }
 
 <# Transcripts are append-mostly: the common prefix IS the last-synced
@@ -1164,7 +1197,11 @@ function Invoke-DeepCheck($Cfg, $LocalMap) {
         if (-not "$($remoteMd5s[$k])") { continue }
         $candidates += $k
     }
-    $sample = @(Pick-Sample $candidates 10)
+    # direct assignment, NOT @(): Pick-Sample uses `return ,$items` (the
+    # unroll guard emits the array as ONE pipeline object), and @() around
+    # the call re-wraps that into a 1-element array whose element is the
+    # (empty) array — sample.Count would be 1 with a non-key inside.
+    $sample = Pick-Sample $candidates 10
     $mismatches = 0
     foreach ($k in $sample) {
         if ($k -match "^(.*)/(.*)$") {
@@ -1214,7 +1251,11 @@ function Invoke-WithTransferLock([bool]$DryRun, [scriptblock]$Body) {
                 Remove-Item -LiteralPath $lock -Force -ErrorAction SilentlyContinue
                 continue
             }
-            throw "another sessium transfer holds $lock — wait for it, or delete the file if that run is dead"
+            # print + exit 1, matching Linux's "except LockBusy: fail(); return 1".
+            # A raw throw here escapes the & script invocation and kills the
+            # caller (the smoke / any wrapper) instead of exiting rc=1.
+            Write-Fail "another sessium transfer holds $lock — wait for it, or delete the file if that run is dead"
+            exit 1
         }
     }
     try {
@@ -1656,10 +1697,12 @@ function Invoke-Diff([string]$Prefix, [string]$Project, [switch]$Json, [switch]$
             foreach ($m in @($preview.local_added)) { $la.Add(@($m.role, $m.text)) }
             $ra = New-Object System.Collections.Generic.List[object]
             foreach ($m in @($preview.remote_added)) { $ra.Add(@($m.role, $m.text)) }
+            # .ToArray(), not @(): @() around a List[object] is pwsh 7.4's
+            # "Argument types do not match" DLR crash under strict mode
             $doc.preview = @{
                 common = $preview.common
-                local_added = @($la)
-                remote_added = @($ra)
+                local_added = $la.ToArray()
+                remote_added = $ra.ToArray()
             }
         }
         Emit-Json $doc
@@ -2455,6 +2498,266 @@ function Invoke-SetupEncrypted {
     return 0
 }
 
+# ---------------------------------------------------------------- export/onboard
+
+<# fail() without the exit: onboard's checks are non-fatal — every gap prints
+   a line and the report continues (mirrors Linux cmd_onboard, where fail()
+   only prints and the command always returns 0). #>
+function Write-FailLine([string]$Msg) {
+    Write-Host "[X]  $Msg" -ForegroundColor Red
+}
+
+<# Python html.escape(s, quote=True): & first, then < > " '. Used by the
+   export renderer, byte-identical to the Linux output. #>
+function ConvertTo-HtmlEscaped([string]$S) {
+    $s = $S.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;")
+    return $s.Replace('"', "&quot;").Replace("'", "&#x27;")
+}
+
+$script:ExportCss = @'
+body{font-family:system-ui,sans-serif;max-width:52rem;margin:2rem auto;
+padding:0 1rem;line-height:1.55;color:#1a1a1a;background:#fafafa}
+h1{border-bottom:2px solid #ddd;padding-bottom:.3rem;font-size:1.4rem}
+.meta{color:#666;font-size:.85rem}
+.msg{margin:.8rem 0;padding:.6rem 1rem;border-radius:.5rem}
+.user{background:#e8f0fe}.assistant{background:#efefef}
+.role{font-weight:600;text-transform:uppercase;font-size:.7rem;color:#555}
+ul{padding-left:1.2rem}li{margin:.3rem 0}
+'@
+
+<# One session as Markdown: a metadata header, then "## role" + text per
+   message. Matches Linux render_markdown() line for line. #>
+function ConvertTo-ExportMarkdown([string]$Project, [string]$Sid, [string]$Path) {
+    $title = Get-SessionTitle $Path
+    if (-not $title) { $title = $Sid }
+    $msgs = Get-TranscriptMessages $Path
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add("# $title")
+    $lines.Add("")
+    $lines.Add("- project: ``$project``")
+    $lines.Add("- session: ``$sid``")
+    $lines.Add("- messages: $($msgs.Count)")
+    $lines.Add("")
+    $lines.Add("---")
+    $lines.Add("")
+    foreach ($m in $msgs) {
+        $lines.Add("## $($m.role)")
+        $lines.Add("")
+        $lines.Add("$($m.text)")
+        $lines.Add("")
+    }
+    return ($lines.ToArray() -join "`n")
+}
+
+<# One session as a small static HTML page (no JS), matching Linux
+   render_session_html(). #>
+function ConvertTo-ExportSessionHtml([string]$Project, [string]$Sid, [string]$Path) {
+    $title = Get-SessionTitle $Path
+    if (-not $title) { $title = $Sid }
+    $msgs = Get-TranscriptMessages $Path
+    $parts = New-Object System.Collections.Generic.List[string]
+    $parts.Add("<!doctype html><meta charset='utf-8'><title>$(ConvertTo-HtmlEscaped $title)</title>")
+    $parts.Add("<style>$script:ExportCss</style>")
+    $parts.Add("<h1>$(ConvertTo-HtmlEscaped $title)</h1>")
+    $parts.Add("<p class='meta'>$(ConvertTo-HtmlEscaped $project) · $sid · $($msgs.Count) message(s)</p>")
+    foreach ($m in $msgs) {
+        $parts.Add("<div class='msg $($m.role)'><div class='role'>$($m.role)</div>$(ConvertTo-HtmlEscaped "$($m.text)")</div>")
+    }
+    return ($parts.ToArray() -join "`n")
+}
+
+<# The --html --all index page linking every exported file, matching Linux
+   render_index_html(). #>
+function ConvertTo-ExportIndexHtml($Items) {
+    $lis = New-Object System.Collections.Generic.List[string]
+    foreach ($it in $Items) {
+        $label = $it.title
+        if (-not $label) { $label = $it.id }
+        $lis.Add("<li><a href='$(ConvertTo-HtmlEscaped "$($it.file)")'>$(ConvertTo-HtmlEscaped $label)</a> " +
+                 "<span class='meta'>$(ConvertTo-HtmlEscaped "$($it.project)")</span></li>")
+    }
+    return ("<!doctype html><meta charset='utf-8'><title>sessium sessions</title>" +
+            "<style>$script:ExportCss</style>" +
+            "<h1>sessium sessions</h1><ul>$($lis.ToArray() -join "`n")</ul>")
+}
+
+<# Write sessions out as Markdown (default) or HTML. -All exports every local
+   session and, with -Html, adds an index.html viewer page. Same contract as
+   Linux cmd_export(). #>
+function Invoke-Export([string]$Prefix, [string]$OutDir, [string]$Project,
+                       [switch]$All, [switch]$Html) {
+    # Path.expanduser(): a leading ~ means home
+    $out = "$OutDir"
+    if ($out -like "~*") { $out = $out -replace '^~', $HOME }
+    if (-not $out) { $out = "sessium-export" }
+
+    $localMap = Get-LocalSessions
+    if ($Project) {
+        $filtered = @{}
+        if ($localMap.ContainsKey($Project)) { $filtered[$Project] = $localMap[$Project] }
+        $localMap = $filtered
+    }
+    if (-not $All) {
+        if (-not $Prefix) {
+            Write-Fail "give a session id, or --all for every local session"
+        }
+        $cfg = Get-SessiumConfig
+        $remoteMap = @{}
+        try { $remoteMap = Get-RemoteSessions $cfg } catch { }
+        $ledger = Get-Ledger
+        $rows = Get-Classification $localMap $remoteMap $ledger
+        if ($Project) { $rows = @($rows | Where-Object { $_.project -eq $Project }) }
+        $row = Find-OneSession $Prefix $rows
+        if (-not $row.local) {
+            Write-Fail "that session is on Drive only — pull first (export works on local copies)"
+        }
+        $localMap = @{ $row.project = @($row.local) }
+    }
+
+    $ext = "md"
+    if ($Html) { $ext = "html" }
+    $items = New-Object System.Collections.Generic.List[object]
+    foreach ($proj in ($localMap.Keys | Sort-Object)) {
+        foreach ($s in $localMap[$proj]) {
+            $items.Add(@{ project = $proj; id = $s.id
+                          title = (Get-SessionTitle $s.path)
+                          file = "$($s.id).$ext" })
+        }
+    }
+    if ($items.Count -eq 0) {
+        Write-Info "no sessions to export"
+        return 0
+    }
+    if (-not (Test-Path -LiteralPath $out)) {
+        New-Item -ItemType Directory -Path $out -Force | Out-Null
+    }
+    $count = 0
+    foreach ($it in $items) {
+        $src = Get-LocalSessionPath $it.project $it.id
+        if (-not (Test-Path -LiteralPath $src)) {
+            Write-Warn2 "  [!]  skipped $($it.id) (local copy vanished)"
+            continue
+        }
+        $text = ConvertTo-ExportMarkdown $it.project $it.id $src
+        if ($Html) { $text = ConvertTo-ExportSessionHtml $it.project $it.id $src }
+        [System.IO.File]::WriteAllText((Join-Path $out $it.file), $text,
+            (New-Object System.Text.UTF8Encoding($false)))
+        $count++
+    }
+    if ($Html -and $All) {
+        [System.IO.File]::WriteAllText((Join-Path $out "index.html"),
+            (ConvertTo-ExportIndexHtml $items.ToArray()),
+            (New-Object System.Text.UTF8Encoding($false)))
+    }
+    $suffix = ""
+    if ($Html -and $All) { $suffix = "  (+ index.html)" }
+    Write-Info "exported $count session(s) to $((Resolve-Path -LiteralPath $out).Path)$suffix"
+    return 0
+}
+
+<# First-run report: what is set up, what is missing, what to run next.
+   Non-fatal — every check prints a line and the worst gap decides the
+   suggested next step. Same report as Linux cmd_onboard(), with the
+   systemd-timer check swapped for the schtasks task. #>
+function Invoke-Onboard {
+    Write-Info "sessium onboard — setup checklist"
+    Write-Info ""
+    $nextSteps = New-Object System.Collections.Generic.List[object]
+
+    $version = ""
+    try {
+        $out = Invoke-Rclone -RcloneArgs @("version") -TimeoutSec 15
+        if ("$out") { $version = ("$out" -split "`r?`n")[0] } else { $version = "unknown" }
+        Write-Info "[OK] rclone present ($version)"
+    } catch {
+        Write-FailLine "rclone: $($_.Exception.Message)"
+        $nextSteps.Add(@{ what = "install rclone"; cmd = "sessium setup" })
+    }
+
+    $cfg = Get-SessiumConfig
+    if ($cfg.Remote -eq $script:CryptName) {
+        Write-Info "[OK] encryption: on ($($script:CryptName))"
+    } else {
+        Write-Warn2 "  [!]  encryption: off — Drive copies are plaintext (optional: sessium setup --encrypted)"
+    }
+
+    try {
+        $null = Invoke-Rclone -RcloneArgs @("lsd", "$($cfg.Remote):") -TimeoutSec 30
+        Write-Info "[OK] Drive reachable (remote '$($cfg.Remote)')"
+    } catch {
+        Write-FailLine "Drive not reachable: $($_.Exception.Message)"
+        $nextSteps.Add(@{ what = "authorize rclone"; cmd = "sessium setup" })
+    }
+
+    $localMap = Get-LocalSessions
+    $sessionCount = 0
+    foreach ($k in $localMap.Keys) { $sessionCount += @($localMap[$k]).Count }
+    if ($sessionCount -gt 0) {
+        Write-Info "[OK] local repo: $($localMap.Count) project(s), $sessionCount session(s)"
+    } else {
+        Write-Warn2 "  [!]  no sessions found under $(Join-Path (Get-ClaudeDir) 'projects')"
+    }
+
+    $ledgerPath = Get-StatePath
+    if (Test-Path -LiteralPath $ledgerPath) {
+        try {
+            $raw = Get-Content -LiteralPath $ledgerPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            $n = 0
+            $sessions = Get-JsonProp $raw "sessions"
+            if ($sessions) { $n = @($sessions.PSObject.Properties).Count }
+            Write-Info "[OK] ledger: $n session(s) recorded (has synced at least once)"
+        } catch {
+            Write-Warn2 "  [!]  ledger unreadable — it will rebuild on next sync"
+        }
+    } else {
+        Write-Warn2 "  [!]  ledger: empty — nothing synced yet (first: sessium push, then sessium sync)"
+    }
+
+    # Linux checks for the systemd timer file; the Windows equivalent is the
+    # schtasks task. /Query through the same bin (SESSIUM_SCHTASKS_BIN) so the
+    # check stays hermetic — any failure to run or rc != 0 means "not installed".
+    $timerOk = $false
+    try {
+        $null = & (Get-SchtasksBin) /Query /TN "sessium-sync" 2>&1
+        if ($LASTEXITCODE -eq 0) { $timerOk = $true }
+    } catch { }
+    if ($timerOk) {
+        Write-Info "[OK] sync timer: installed (task 'sessium-sync')"
+    } else {
+        Write-Warn2 "  [!]  sync timer: not installed — sessium schedule (sync every 30 min)"
+        $nextSteps.Add(@{ what = "background sync"; cmd = "sessium schedule" })
+    }
+
+    $settingsPath = Join-Path (Get-ClaudeDir) "settings.json"
+    $hooked = $false
+    if (Test-Path -LiteralPath $settingsPath) {
+        try {
+            if ((Get-Content -LiteralPath $settingsPath -Raw -Encoding UTF8) -match "sessium.*push --quiet") {
+                $hooked = $true
+            }
+        } catch { }
+    }
+    if ($hooked) {
+        Write-Info "[OK] Stop hook: installed (pushes after every session turn)"
+    } else {
+        Write-Warn2 "  [!]  Stop hook: not installed — sessium hook (auto-push per turn)"
+        $nextSteps.Add(@{ what = "auto-push hook"; cmd = "sessium hook" })
+    }
+
+    Write-Info ""
+    if ($nextSteps.Count -gt 0) {
+        Write-Info "suggested next steps:"
+        foreach ($s in $nextSteps) {
+            Write-Info ("  {0,-24}  # {1}" -f $s.cmd, $s.what)
+        }
+    } else {
+        Write-Info "all set. everyday commands: status / sync / search / open"
+    }
+    # no man page on Windows; --help is the doc
+    Write-Info "help: sessium --help"
+    return 0
+}
+
 # ---------------------------------------------------------------- dispatch
 
 function Show-Usage {
@@ -2491,6 +2794,11 @@ usage: sessium <command> [args]
   open <id> [--go] [--adopt] [--dry-run]   print (or run) the claude --resume command
   adopt <munged-folder> <repo-path> [--dry-run]
                                            rehome sessions to this machine's path
+  export [<id>] [--all] [--html] [--out DIR] [--project <m>]
+                                           write sessions out as Markdown or a
+                                           static HTML viewer (default ./sessium-export)
+  onboard                                  first-run report: what is set up, what
+                                           to do next
 
 session ids: a prefix is enough ('sessium diff 9f8e'). Munged project names
 always start with '-' (e.g. -C--Users-me-repo) - fine after --project.
@@ -2509,6 +2817,7 @@ function Invoke-Main([string[]]$CliArgs) {
         full = $false; messages = $false; semantic = $false
         only = ""; limit = 0; keep = -1; name = ""
         print = $false; off = $false; interval = 0
+        all = $false; out = ""; html = $false
     }
     $i = 0
     while ($i -lt $CliArgs.Count) {
@@ -2526,6 +2835,12 @@ function Invoke-Main([string[]]$CliArgs) {
         if ($a -eq "--semantic") { $opt.semantic = $true; $i++; continue }
         if ($a -eq "--print") { $opt.print = $true; $i++; continue }
         if ($a -eq "--off") { $opt.off = $true; $i++; continue }
+        if ($a -eq "--all") { $opt.all = $true; $i++; continue }
+        if ($a -eq "--html") { $opt.html = $true; $i++; continue }
+        if ($a -like "--out=*") { $opt.out = $a.Substring(6); $i++; continue }
+        if ($a -eq "--out" -and ($i + 1) -lt $CliArgs.Count) {
+            $opt.out = [string]$CliArgs[$i + 1]; $i += 2; continue
+        }
         if ($a -like "--interval=*") { $opt.interval = [int]$a.Substring(11); $i++; continue }
         if ($a -eq "--interval" -and ($i + 1) -lt $CliArgs.Count) {
             $opt.interval = [int]$CliArgs[$i + 1]; $i += 2; continue
@@ -2609,6 +2924,12 @@ function Invoke-Main([string[]]$CliArgs) {
         }
         "seek" {
             return (Invoke-Seek $opt.name)
+        }
+        "export" {
+            return (Invoke-Export $positional[0] $opt.out $opt.project -All:$opt.all -Html:$opt.html)
+        }
+        "onboard" {
+            return (Invoke-Onboard)
         }
         "adopt" {
             if ($positional.Count -lt 2) {
