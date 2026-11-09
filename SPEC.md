@@ -93,6 +93,12 @@ crypt remote `sessium-crypt` and `drive_folder` becomes `""` (the crypt root
 IS the old plain root); the Drive layout is unchanged underneath, just
 ciphertext.
 
+A key present in config.json is honored **even when its value is an empty
+string** — only an absent key (or JSON `null`) falls back to the default.
+This matters after `setup --encrypted`: a truthy check on `drive_folder: ""`
+silently reverted to the default `claude-backup`, and every push forked into
+`<crypt>:claude-backup/` instead of landing at the crypt root.
+
 Env overrides (both versions honor the same names where the OS allows):
 
 | env var | meaning | default |
@@ -102,6 +108,8 @@ Env overrides (both versions honor the same names where the OS allows):
 | `SESSIUM_STATE` | ledger path | `<xdg state>/sessium/state.json` |
 | `SESSIUM_RCLONE_BIN` | rclone binary | `rclone` on PATH |
 | `SESSIUM_SYSTEMD_DIR` | user unit dir (`schedule`) | `~/.config/systemd/user` |
+| `SESSIUM_COPY_TIMEOUT` | fixed transfer timeout, seconds | size-scaled, see §8 |
+| `SESSIUM_RETRY_DELAY_SCALE` | multiplier on retry backoff (test knob) | `1.0` |
 
 ## 6. Conflict semantics (decided 2026-11-03, PLAN §3)
 
@@ -132,8 +140,16 @@ All tree-walking commands take `--project <munged>`. `--json`
 additionally `--interactive` and `--only memory|skills` (ledger-less
 two-way fast lane, per-file newest-wins, never deletes). `--quiet` on
 `push`/`pull`/`sync` silences chatter (hooks/cron); errors still print.
-Exit codes: `0` success (skips are not failures), `1` real failures,
-`130` interrupted.
+`--debug` (alias `--verbose`) prints every rclone call and is accepted
+on either side of the subcommand. Exit codes: `0` success (skips are
+not failures), `1` real failures, `130` interrupted.
+
+Every push/pull/sync ends with one summary line in this shape (both
+versions byte-identical; zero counts still shown):
+
+```
+pushed: N   pulled: N   in-sync: N [FAILED: N] [resolved: N] [skipped: N]
+```
 
 `push`/`pull`/`sync` hold a per-machine lock file (`sync.lock` beside the
 ledger) so a scheduled run and a manual run can't transfer concurrently;
@@ -156,11 +172,28 @@ config.json and prints the generated password exactly once.
 ## 8. Transport rules
 
 All Drive I/O goes through rclone; the only commands used are
-`version`, `lsd`, `lsf`, `lsjson --recursive --hash`, `copyto`, `mkdir`,
-`deletefile`, `rmdir`, `about`, `authorize`, `config file`. Uploads and
-downloads are `copyto` of exact paths (rclone creates missing parent
-folders). After a successful transfer, both ledger md5s are set to the
-transferred copy's md5.
+`version`, `lsd`, `lsf`, `lsjson --recursive --hash`, `copyto`, `copy`,
+`mkdir`, `deletefile`, `rmdir`, `about`, `authorize`, `config file`,
+`config create` (setup --encrypted). Uploads and downloads are `copyto` of
+exact paths (rclone creates missing parent folders). After a successful
+transfer, both ledger md5s are set to the transferred copy's md5.
+
+**Timeouts and retries** (both versions; metadata calls like `lsjson`/`lsd`
+keep the short fixed timeout and never retry):
+
+- A file transfer's timeout scales with the file size:
+  `max(300 s, 10 s/MB)` — ~100 KB/s sustained rate, floor 300 s.
+  `SESSIUM_COPY_TIMEOUT=<seconds>` overrides with a fixed value.
+- A timeout, or rclone exit code 5 (transient), 6 (retries exhausted) or
+  8 (transfers exhausted), is retried **2 times** with backoff 2 s then 4 s
+  (`SESSIUM_RETRY_DELAY_SCALE` multiplies the delays; tests use 0).
+  `copyto`/`copy` overwrite whole files, so a blind re-attempt is safe.
+- Everything else (rc 2/3/4 not-found, 7 fatal) fails immediately —
+  retrying a permanent error just burns time.
+
+**Remote URLs** tolerate a leading slash after the colon: with a crypt
+config (`drive_folder: ""`), sessium emits `<remote>:/projects/…` and both
+real rclone and the test fake treat that as the remote root.
 
 ## 9. `--json` output schema
 

@@ -215,8 +215,18 @@ not in PLAN.md or README.md.
   divergence vs a plain-text remote (0 parseable messages), search
   title/body/no-match/--json, unconfigured-seeker failures, deep-check happy
   path, memory/skills two-way sync including a Drive-only pull-down.
-- 🪟 Still to port: Batch 5 (schedule → schtasks equivalent, hook, setup
-  --encrypted), Batch 6 (export, onboard).
+- ✅ **Batch 5 ported to `windows/sessium.ps1`** (2026-11-08, committed 897a193):
+  `schedule` (Task Scheduler via `schtasks`, platform-stubbed in the smoke),
+  `hook` (Claude Code Stop hook, JSON-escaped identically to Python's
+  json.dumps), `setup --encrypted` (crypt remote + one-time password).
+- ✅ **Batch 6 ported to `windows/sessium.ps1`** (2026-11-08): `export`
+  (Markdown/HTML + index viewer, HTML escaping matching Python's
+  html.escape) and `onboard` (checklist + next steps). **Windows parity is
+  feature-complete** — the full smoke (180+ assertions) is green locally and
+  in CI.
+- 🪟 Transfer hardening (2026-11-08: size-aware timeout, engine retry,
+  `--verbose`, post-crypt config fix, `FAILED:` summary wording) — done on
+  both platforms, see the decisions log.
 
 ---
 
@@ -242,3 +252,34 @@ not in PLAN.md or README.md.
   fetches the files from master into a temp dir. It also installs
   `setup-ubuntu.sh` to `~/.local/bin` so an installed `sessium setup` works
   (cmd_setup falls back to PATH lookup). uninstall.sh matches.
+- 2026-11-08 — **Windows CI smoke is green and is the engine gate now**: the
+  hook settings.json came out invalid JSON because `ConvertTo-JsonString`'s
+  `continue` inside a `switch` clause exits only the switch (post-switch code
+  still ran, doubling every escaped quote). Exclusive switch with `default`
+  fixed it; the smoke now runs 180+ assertions on every CI push.
+- 2026-11-08 — **Transfer hardening from a real sync's failures** (3 sessions
+  lost to the fixed 300 s copyto timeout on big transcripts + 1 to rclone
+  rc=6, and `--verbose` typed after the subcommand was "unrecognized"):
+  size-aware transfer timeout `max(300 s, 10 s/MB)` with `SESSIUM_COPY_TIMEOUT`
+  override; engine-level retry (2 attempts, 2 s/4 s backoff,
+  `SESSIUM_RETRY_DELAY_SCALE` test knob) on timeouts and rclone rc 5/6/8 only —
+  permanent errors (2/3/4/7) fail immediately, and copyto/copy are idempotent
+  so a blind re-attempt is safe; `--verbose` accepted anywhere as a `--debug`
+  alias (Python: preprocess_argv hoisting; PS: the manual parser takes flags
+  anywhere). Wired at every transfer site on both platforms (upload with file
+  size, download, revert copy, remote-transcript cat, memory/skills
+  copy --update). Tests: 96 Linux (4 new) + a retry/verbose smoke section both
+  platforms (fake rclone `SESSIUM_FAKE_FAIL_FIRST="<rc>,<count>"` injects the
+  failures).
+- 2026-11-08 — **Post-crypt config no longer forks the upload path**: the
+  config loaders dropped `drive_folder: ""` (written by `setup --encrypted`)
+  on a truthy check, so every push after encryption went to
+  `<crypt>:claude-backup/` — a parallel tree — instead of the crypt root.
+  Both loaders now honor present-but-empty values (SPEC §5); the fake rclone
+  tolerates the leading slash that an empty folder puts after the colon
+  (real rclone always did). Regression tests both sides.
+- 2026-11-08 — **Transfer summary is byte-identical across platforms**: the
+  Windows push/pull/sync summary said `FAILURES: N` and omitted zero counts;
+  Linux (and the real incident paste) say `pushed: N   pulled: N   in-sync: N
+  FAILED: N`. Fixed in `Write-TransferSummary` + the sync summary; format
+  pinned in SPEC §7.

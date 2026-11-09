@@ -1338,12 +1338,13 @@ function Invoke-WithTransferLock([bool]$DryRun, [scriptblock]$Body) {
     }
 }
 
-function Write-TransferSummary([string]$Verb, [int]$Moved, [int]$Skipped, [int]$InSync, [int]$Failures) {
-    $parts = @()
-    if ($Moved -gt 0) { $parts += ("{0}: {1}" -f $Verb, $Moved) }
+<# Same shape as Linux's transfer_summary: both counts always shown (even 0),
+   and "FAILED:" — the wording a user sees in a real failure paste. #>
+function Write-TransferSummary([int]$Pushed, [int]$Pulled, [int]$Skipped, [int]$InSync, [int]$Failures) {
+    $parts = @("pushed: $Pushed", "pulled: $Pulled")
     if ($Skipped -gt 0) { $parts += "conflicts skipped: $Skipped" }
     $parts += "in-sync: $InSync"
-    if ($Failures -gt 0) { $parts += "FAILURES: $Failures" }
+    if ($Failures -gt 0) { $parts += "FAILED: $Failures" }
     Write-Info ("  " + ($parts -join "   "))
 }
 
@@ -1468,7 +1469,7 @@ function Invoke-Push([string]$Project, [switch]$DryRun, [switch]$Quiet) {
         }
     }
     if ($dirty) { Save-Ledger $ledger }
-    Write-TransferSummary "pushed" $pushed $skipped $inSync $failures
+    Write-TransferSummary $pushed 0 $skipped $inSync $failures
     if ($failures -gt 0) { exit 1 }
     }
 }
@@ -1523,7 +1524,7 @@ function Invoke-Pull([string]$Project, [switch]$DryRun, [switch]$Quiet) {
         }
     }
     if ($dirty) { Save-Ledger $ledger }
-    Write-TransferSummary "pulled" $pulled $skipped $inSync $failures
+    Write-TransferSummary 0 $pulled $skipped $inSync $failures
     if ($failures -gt 0) { exit 1 }
     }
 }
@@ -1637,13 +1638,12 @@ function Invoke-Sync([string]$Project, [string]$Only, [switch]$Interactive,
         }
     }
     if ($dirty) { Save-Ledger $ledger }
-    $parts = @()
-    if ($pushed -gt 0) { $parts += "pushed: $pushed" }
-    if ($pulled -gt 0) { $parts += "pulled: $pulled" }
+    # same shape as Linux's transfer_summary + resolved/skipped suffixes
+    $parts = @("pushed: $pushed", "pulled: $pulled")
+    $parts += "in-sync: $inSync"
+    if ($failures -gt 0) { $parts += "FAILED: $failures" }
     if ($resolved -gt 0) { $parts += "resolved: $resolved" }
     if ($skipped -gt 0) { $parts += "skipped: $skipped" }
-    $parts += "in-sync: $inSync"
-    if ($failures -gt 0) { $parts += "FAILURES: $failures" }
     $prefix = ""; if ($DryRun) { $prefix = "dry-run: " }
     Write-Info ("  " + $prefix + ($parts -join "   "))
     if ($failures -gt 0) { exit 1 }

@@ -6,7 +6,7 @@ Back up your conversations to Google Drive and replay any session on another
 machine's Claude Code, anytime — push, pull, diff, search and resolve sessions
 the way you would code with git.
 
-> **Status:** Linux CLI complete (Phases 1–4 + all feature batches; 84 hermetic
+> **Status:** Linux CLI complete (Phases 1–4 + all feature batches; 96 hermetic
 > tests, CI on Linux & Windows). Windows PowerShell twin ships in parallel —
 > see `SPEC.md` for the cross-platform contract, `docs/BUILD.md` for progress.
 
@@ -69,6 +69,23 @@ sessium hook                # Claude Code Stop hook: push --quiet after every se
 Scheduled runs have no terminal, so conflicts resolve **newest-wins
 automatically** — and the loser is always kept (see below). `schedule --print`
 shows the unit files without installing.
+
+## Transfers that survive a bad network
+
+File transfers (`push`/`pull`/`sync`/`sync --only`) retry on their own: a
+timed-out or retry-class rclone failure (rc 5/6/8) is re-attempted twice with a
+short backoff, because `copyto` overwrites whole files and is safe to repeat.
+The per-transfer timeout scales with the file size — `max(300 s, 10 s/MB)` —
+so a big transcript on a slow uplink gets the time it needs instead of dying
+at 300 s. Two knobs, rarely needed:
+
+```bash
+SESSIUM_COPY_TIMEOUT=600 sessium push       # fixed timeout override (seconds)
+SESSIUM_RETRY_DELAY_SCALE=0 ...             # collapse retry backoff (tests)
+```
+
+`--verbose` (alias of `--debug`) prints every rclone call, and is accepted on
+either side of the subcommand (`sessium sync --verbose`).
 
 ## Search
 

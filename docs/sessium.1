@@ -25,6 +25,10 @@ argument appears. A project's
 name is its absolute path with every "/" replaced by "\-" (leading slash
 included), e.g. \fI/home/me/repo\fR → \fI\-home\-me\-repo\fR. Windows munges
 every separator and the drive colon the same way.
+.PP
+File transfers retry twice with a short backoff on timeouts and rclone's
+transient errors (exit codes 5, 6, 8), and each transfer's timeout scales
+with the file size (max 300 s, 10 s/MB) — see ENVIRONMENT for overrides.
 .SH COMMANDS
 .TP
 .BR list " [\-\-titles] [\-\-project " \fImunged\fR "]"
@@ -116,8 +120,8 @@ and change nothing.
 .B \-\-interactive
 Force the conflict prompt even when no terminal is attached.
 .TP
-.B \-\-debug
-Print every rclone invocation.
+.BR \-\-debug " or " \-\-verbose
+Print every rclone invocation. Accepted on either side of the subcommand.
 .TP
 .B \-\-titles
 (list) Show session titles.
@@ -134,6 +138,14 @@ Ledger path (default ~/.local/state/sessium/state.json).
 .TP
 .B SESSIUM_RCLONE_BIN
 rclone binary (default "rclone" on PATH).
+.TP
+.B SESSIUM_COPY_TIMEOUT
+Fixed transfer timeout in seconds, overriding the size-scaled default of
+max(300 s, 10 s/MB).
+.TP
+.B SESSIUM_RETRY_DELAY_SCALE
+Multiplier on the retry backoff delays (2 s, 4 s); default 1. Set to 0 to
+collapse the waits (used by the test suite).
 .SH FILES
 .TP
 .I ~/.config/sessium/config.json

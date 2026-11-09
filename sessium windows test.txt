@@ -1,0 +1,49 @@
+Windows PowerShell
+Copyright (C) Microsoft Corporation. All rights reserved.
+
+PS C:\Users\find> sessium
+At C:\Users\find\sessium\sessium.ps1:249 char:72
++ ...   if ($line -match '^\s*(?:export\s+)?DRIVE_REMOTE\s*=\s*"?([^"\s]+)" ...
++                                                                  ~
+Missing type name after '['.
+At C:\Users\find\sessium\sessium.ps1:744 char:28
++     if ($hits.Count -gt 1) {
++                            ~
+Missing closing '}' in statement block or type definition.
+At C:\Users\find\sessium\sessium.ps1:739 char:50
++ function Find-OneSession([string]$Prefix, $Rows) {
++                                                  ~
+Missing closing '}' in statement block or type definition.
+At C:\Users\find\sessium\sessium.ps1:242 char:17
++         } catch {
++                 ~
+Missing closing '}' in statement block or type definition.
+At C:\Users\find\sessium\sessium.ps1:226 char:39
++     if (Test-Path -LiteralPath $path) {
++                                       ~
+Missing closing '}' in statement block or type definition.
+At C:\Users\find\sessium\sessium.ps1:223 char:28
++ function Get-SessiumConfig {
++                            ~
+Missing closing '}' in statement block or type definition.
+At C:\Users\find\sessium\sessium.ps1:848 char:105
++ ... €” both copies changed since the last sync" -f $Row.project, $Row.id)
++                                                                         ~
+Unexpected token ')' in expression or statement.
+At C:\Users\find\sessium\sessium.ps1:862 char:1
++ }
++ ~
+Unexpected token '}' in expression or statement.
+At C:\Users\find\sessium\sessium.ps1:975 char:21
++     if ($localOnly) {
++                     ~
+Missing closing '}' in statement block or type definition.
+At C:\Users\find\sessium\sessium.ps1:947 char:80
++ ... voke-ListSessions([string]$Project, [switch]$Titles, [switch]$Json) {
++                                                                         ~
+Missing closing '}' in statement block or type definition.
+Not all parse errors were reported.  Correct the reported errors and try again.
+    + CategoryInfo          : ParserError: (:) [], ParseException
+    + FullyQualifiedErrorId : MissingTypename
+
+PS C:\Users\find>
