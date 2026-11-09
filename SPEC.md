@@ -144,6 +144,14 @@ two-way fast lane, per-file newest-wins, never deletes). `--quiet` on
 on either side of the subcommand. Exit codes: `0` success (skips are
 not failures), `1` real failures, `130` interrupted.
 
+**Encoding contract:** every `.ps1` file in the repo ships as UTF-8 **with
+BOM**. Windows PowerShell 5.1 reads a BOM-less script in the ANSI codepage,
+where UTF-8 punctuation (em dash = `E2 80 94`) ends in a smart-quote byte
+that opens a string mid-file and detonates the parse — the box never gets
+past `sessium` with no arguments. 5.1 honors the BOM; pwsh 7 reads UTF-8
+either way. `sessium.cmd` stays BOM-less (cmd.exe rejects a BOM) and pure
+ASCII.
+
 Every push/pull/sync ends with one summary line in this shape (both
 versions byte-identical; zero counts still shown):
 

@@ -39,9 +39,9 @@ not in PLAN.md or README.md.
 
 - Same command surface, same ledger, same Drive layout (SPEC.md contract). ✅ code
 - `sessium.cmd` shim + `install.ps1` (%USERPROFILE%\sessium + user PATH). ✅
-- Verified structurally (bracket balance, strict-mode audit, 5.1-compat review:
-  no `.ArgumentList`, no `>N` format specs, safe JSON property access).
-- ⬜ **Runtime verification on a real Windows box / CI** — see §2 CI.
+- ✅ **Ran on a real Windows box (2026-11-09)** — which caught the encoding bug
+  (BOM-less UTF-8 under PowerShell 5.1, see the decisions log); fixed, and the
+  full engine smoke is hermetically green in CI's windows job.
 
 ### Installers & setup
 
@@ -283,3 +283,16 @@ not in PLAN.md or README.md.
   Linux (and the real incident paste) say `pushed: N   pulled: N   in-sync: N
   FAILED: N`. Fixed in `Write-TransferSummary` + the sync summary; format
   pinned in SPEC §7.
+- 2026-11-09 — **Every .ps1 ships UTF-8 with BOM** (found on the user's real
+  Windows box): Windows PowerShell 5.1 reads a BOM-less .ps1 in the ANSI
+  codepage, where a UTF-8 em dash (E2 80 94) ends in a smart-quote byte that
+  PowerShell treats as a string delimiter — each `—` in the source opened a
+  phantom string mid-file and the parse detonated into dozens of
+  "Missing closing '}'" errors before sessium could even run. pwsh 7 defaults
+  to UTF-8, which is why the local + CI smoke never caught it. Reproduced
+  locally by parsing a cp1252-view of the BOM-less file under pwsh (56 errors,
+  same lines as the box), then fixed by adding the BOM (content unchanged):
+  0 errors, full smoke green. Guards: a BOM assertion at the top of
+  `tests/ci_smoke.ps1` and a repo-wide `*.ps1` BOM test in the Linux suite.
+  All four .ps1 files carry the BOM now; `sessium.cmd` must stay BOM-less
+  (cmd.exe chokes on it) and is pure ASCII.
