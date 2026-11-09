@@ -1,4 +1,4 @@
-# ci_smoke.ps1 - hermetic engine round-trip for the Windows port.
+﻿# ci_smoke.ps1 - hermetic engine round-trip for the Windows port.
 # Runs on CI (windows-latest, pwsh) and works anywhere pwsh runs.
 #
 # Builds a fake ~/.claude for machines A and B sharing one fake Drive, points
@@ -10,6 +10,19 @@ $ErrorActionPreference = "Stop"
 
 $repo = $PSScriptRoot | Split-Path
 $ps1 = Join-Path $repo "windows\sessium.ps1"
+
+# --- encoding guard -----------------------------------------------------------
+# Windows PowerShell 5.1 reads a BOM-less .ps1 in the ANSI codepage, where a
+# UTF-8 em dash (E2 80 94) ends in a smart-quote byte that OPENS a string
+# mid-file and detonates the parse ("Missing closing '}'" cascades). The
+# shipped script must carry a UTF-8 BOM (5.1 honors it; pwsh 7 reads UTF-8
+# either way). Found on a real Windows box 2026-11-09.
+$bom = [System.IO.File]::ReadAllBytes($ps1)[0..2]
+if (-not ($bom[0] -eq 0xEF -and $bom[1] -eq 0xBB -and $bom[2] -eq 0xBF)) {
+    Write-Host "  FAIL windows/sessium.ps1 is missing its UTF-8 BOM (PowerShell 5.1 would misparse it)" -ForegroundColor Red
+    exit 1
+}
+Write-Host "  ok   windows/sessium.ps1 ships UTF-8 with BOM (PowerShell 5.1 safe)"
 
 # --- tiny assertion helpers -------------------------------------------------
 

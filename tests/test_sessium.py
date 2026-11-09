@@ -148,6 +148,19 @@ class UnitTests(unittest.TestCase):
         self.assertEqual(len(set(spread)), 10)                     # no duplicates
         self.assertEqual(spread, list(range(0, 100, 10)))          # evenly spread
 
+    def test_windows_ps1_files_have_utf8_bom(self):
+        # regression from a real Windows box: Windows PowerShell 5.1 reads a
+        # BOM-less .ps1 in the ANSI codepage, where a UTF-8 em dash (E2 80 94)
+        # ends in a smart-quote byte that OPENS a string mid-file — the parse
+        # detonates ("Missing closing '}'" cascades) before sessium runs.
+        # Every .ps1 we ship must therefore carry a UTF-8 BOM (5.1 honors it;
+        # pwsh 7 reads UTF-8 either way).
+        ps1s = sorted(REPO.rglob("*.ps1"))
+        self.assertTrue(ps1s, "expected at least one .ps1 in the repo")
+        for ps1 in ps1s:
+            self.assertEqual(ps1.read_bytes()[:3], b"\xef\xbb\xbf",
+                             f"{ps1.relative_to(REPO)} must ship as UTF-8 with BOM")
+
     def test_copy_timeout_scales_with_size(self):
         ct = self.mod.copy_timeout
         self.assertEqual(ct(0), 300)                # small files keep the base

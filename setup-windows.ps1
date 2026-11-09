@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   Interactive rclone + Google Drive setup for Claude Code backups (Windows).
 

@@ -1,4 +1,4 @@
-# sessium (Windows) - git-like version control for Claude Code sessions,
+﻿# sessium (Windows) - git-like version control for Claude Code sessions,
 # with Google Drive (via rclone) as the remote.
 #
 # Native PowerShell 5.1+ port of linux/sessium. Reads and writes the same

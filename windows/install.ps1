@@ -1,4 +1,4 @@
-# install.ps1 - install sessium on Windows (Phase 4).
+﻿# install.ps1 - install sessium on Windows (Phase 4).
 # Copies sessium.ps1 + sessium.cmd to %USERPROFILE%\sessium and adds that
 # folder to the user PATH. Nothing admin-required, nothing removed.
 #
