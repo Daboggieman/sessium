@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """sessium test suite (Phase 1) — stdlib unittest, fully hermetic.
 
-Every test runs against a throwaway CLAUDE_DIR and a fake Drive built in a
-temp directory, with rclone pointed at tests/fake_rclone. Nothing here
-touches your real ~/.claude or any network.
+Every test runs against a throwaway CLAUDE_DIR, a throwaway CODEX home
+(SESSIUM_CODEX_HOME — the codex integration classifies its sessions too,
+so the real ~/.codex must never leak into counts) and a fake Drive built
+in a temp directory, with rclone pointed at tests/fake_rclone. Nothing
+here touches your real ~/.claude, ~/.codex or any network.
 
 Run from anywhere:   python3 tests/run_tests.py      (see run_tests.py)
 """
@@ -43,6 +45,40 @@ SESSION_ONLY_COMMANDS = "\n".join([
     json.dumps({"type": "user", "message": {"content": "<ide_opened_file>x.py</ide_opened_file>"}}),
 ]) + "\n"
 
+# ------------------------------------------------------------- codex rollouts
+
+CODEX_SID = "11111111-2222-3333-4444-555555555555"
+CODEX_SID2 = "99999999-8888-7777-6666-555555555555"
+
+CODEX_META = json.dumps({"type": "session_meta", "payload": {
+    "session_id": CODEX_SID, "cwd": "/home/test/proj",
+    "originator": "codex_cli_rs", "cli_version": "0.167.0"}})
+
+CODEX_ROLLOUT = "\n".join([
+    CODEX_META,
+    # codex's own <environment_context> wrapper — titles must skip it
+    json.dumps({"type": "response_item", "payload": {
+        "role": "user",
+        "content": [{"type": "input_text",
+                     "text": "<environment_context> sandbox </environment_context>"}]}}),
+    json.dumps({"type": "response_item", "payload": {
+        "role": "user",
+        "content": [{"type": "input_text", "text": "hey codex, build a bridge"}]}}),
+    json.dumps({"type": "response_item", "payload": {
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": "on it"}]}}),
+]) + "\n"
+
+
+def codex_with_body(text: str) -> str:
+    """A rollout variant: same session_meta line, a fresh conversation body.
+    Codex discovery REQUIRES a session_meta first line, so conflict edits on
+    codex sessions must stay valid rollouts."""
+    return CODEX_META + "\n" + json.dumps(
+        {"type": "response_item", "payload": {
+            "role": "user",
+            "content": [{"type": "input_text", "text": text}]}}) + "\n"
+
 
 class Fixture:
     """Builds a fake local repo + fake Drive with known session contents."""
@@ -50,6 +86,7 @@ class Fixture:
     def __init__(self, tmp: Path):
         self.tmp = tmp
         self.claude = tmp / "claude"
+        self.codex = tmp / "codex"
         self.drive = tmp / "drive"
         self.project = "-home-test-proj"
         (self.claude / "projects" / self.project).mkdir(parents=True)
@@ -69,6 +106,7 @@ class Fixture:
         e = os.environ.copy()
         e.update({
             "SESSIUM_CLAUDE_DIR": str(self.claude),
+            "SESSIUM_CODEX_HOME": str(self.codex),
             "SESSIUM_RCLONE_BIN": str(FAKE_RCLONE),
             "SESSIUM_CONFIG": str(self.tmp / "config.json"),
             "SESSIUM_STATE": str(self.tmp / "state.json"),
@@ -147,6 +185,43 @@ class UnitTests(unittest.TestCase):
         self.assertEqual(len(spread), 10)
         self.assertEqual(len(set(spread)), 10)                     # no duplicates
         self.assertEqual(spread, list(range(0, 100, 10)))          # evenly spread
+
+    def test_codex_meta_and_title(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / f"rollout-2026-11-09T10-00-00-{CODEX_SID}.jsonl"
+            p.write_text(CODEX_ROLLOUT, encoding="utf-8")
+            self.assertEqual(self.mod.codex_meta(p),
+                             (CODEX_SID, "/home/test/proj"))
+            self.assertEqual(self.mod.codex_title(p), "hey codex, build a bridge")
+            # not a rollout: no session_meta first line
+            p.write_text("{\"type\": \"response_item\"}\n", encoding="utf-8")
+            self.assertEqual(self.mod.codex_meta(p), ("", ""))
+
+    def test_codex_local_path_finds_and_synthesizes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            existing = (home / "sessions" / "2026" / "11" / "09" /
+                        f"rollout-2026-11-09T10-00-00-{CODEX_SID}.jsonl")
+            existing.parent.mkdir(parents=True)
+            existing.write_text(CODEX_ROLLOUT, encoding="utf-8")
+            # an existing rollout whose name ends in the uuid is found...
+            self.assertEqual(
+                self.mod.codex_local_path(home, CODEX_SID), existing)
+            # ...an unknown sid gets a synthesized date-folder path
+            from datetime import datetime as dt, UTC as _UTC
+            guess = self.mod.codex_local_path(
+                home, CODEX_SID2, dt(2026, 11, 9, 10, 0, tzinfo=_UTC))
+            self.assertTrue(guess.name.startswith("rollout-"))
+            self.assertTrue(guess.name.endswith(f"-{CODEX_SID2}.jsonl"))
+            self.assertIn("sessions", guess.parts)
+
+    def test_ledger_key_namespacing(self):
+        lk = self.mod.ledger_key
+        self.assertEqual(lk("-home-u-proj", "sid1"), "-home-u-proj/sid1")
+        self.assertEqual(lk("-home-u-proj", "sid1", "claude"),
+                         "-home-u-proj/sid1")
+        self.assertEqual(lk("-home-u-proj", "sid1", "codex"),
+                         "codex/-home-u-proj/sid1")
 
     def test_windows_ps1_files_have_utf8_bom(self):
         # regression from a real Windows box: Windows PowerShell 5.1 reads a

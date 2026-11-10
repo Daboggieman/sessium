@@ -1503,9 +1503,9 @@ def cmd_sync(args) -> int:
     cfg = load_config()
     with transfer_lock(args.dry_run):
         if getattr(args, "only", None):
-            if selected_apps(args) != ["claude"]:
+            if getattr(args, "app", None) == "codex":
                 fail("--only memory/skills syncs Claude Code folders — "
-                     "use --app claude (or drop --app)")
+                     "drop --app or use --app claude")
                 return 1
             return sync_only(cfg, args.only, args.dry_run)
         try:
