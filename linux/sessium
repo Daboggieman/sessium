@@ -79,6 +79,106 @@ def claude_dir() -> Path:
     return Path(os.environ.get("SESSIUM_CLAUDE_DIR", str(Path.home() / ".claude")))
 
 
+def app_home(app: str) -> Path:
+    """The CLI's data root per app: ~/.claude for Claude Code,
+    ~/.codex for Codex (SESSIUM_CODEX_HOME overrides, for tests)."""
+    if app == "codex":
+        env = os.environ.get("SESSIUM_CODEX_HOME")
+        if env:
+            return Path(env)
+        return Path.home() / ".codex"
+    return claude_dir()
+
+
+def selected_apps(args) -> list:
+    """Apps a command operates on: --app claude|codex, default both."""
+    want = getattr(args, "app", "all") or "all"
+    if want == "claude":
+        return ["claude"]
+    if want == "codex":
+        return ["codex"]
+    return ["claude", "codex"]
+
+
+# Codex rollout names end in the session uuid: rollout-<ts>-<uuid>.jsonl,
+# where the timestamp itself contains dashes.
+CODEX_UUID_RE = re.compile(
+    r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$")
+
+
+def codex_meta(path: Path) -> tuple:
+    """(session_id, cwd) from a rollout's first line (type session_meta);
+    ("", "") when the file is unreadable or not a recognized rollout."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            first = handle.readline()
+    except OSError:
+        return "", ""
+    try:
+        entry = json.loads(first)
+    except json.JSONDecodeError:
+        return "", ""
+    if entry.get("type") != "session_meta":
+        return "", ""
+    payload = entry.get("payload") or {}
+    return str(payload.get("session_id") or ""), str(payload.get("cwd") or "")
+
+
+def codex_local_path(home: Path, sid: str, mtime=None) -> Path:
+    """Where a codex session lives locally: an existing rollout whose name
+    ends in the uuid (any date folder), or a synthesized
+    sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl for downloads."""
+    root = home / "sessions"
+    if root.is_dir():
+        for path in sorted(root.rglob("*.jsonl")):
+            if path.stem.endswith(f"-{sid}") or path.stem == sid:
+                return path
+    stamp = None
+    if mtime is not None:
+        stamp = mtime  # an aware datetime (Drive ModTime) or epoch float
+    if stamp in (None, ""):
+        stamp = datetime.now().astimezone()
+    if isinstance(stamp, datetime):
+        local = stamp.astimezone()
+    else:
+        local = datetime.fromtimestamp(stamp).astimezone()
+    name_ts = local.strftime("%Y-%m-%dT%H-%M-%S")
+    return (root / f"{local.year:04d}" / f"{local.month:02d}" / f"{local.day:02d}"
+            / f"rollout-{name_ts}-{sid}.jsonl")
+
+
+def codex_title(path: Path, max_lines: int = 400) -> str:
+    """Best-effort title for a codex rollout: the first user message that
+    isn't one of codex's <wrapper> blocks (environment context etc.)."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            for index, line in enumerate(handle):
+                if index >= max_lines:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if entry.get("type") != "response_item":
+                    continue
+                payload = entry.get("payload") or {}
+                if payload.get("role") != "user":
+                    continue
+                parts = []
+                for block in payload.get("content") or []:
+                    if isinstance(block, dict) and block.get("type", "").endswith("_text"):
+                        parts.append(str(block.get("text", "")))
+                text = " ".join(parts).strip()
+                if text and not text.startswith("<"):
+                    return text
+    except OSError:
+        pass
+    return ""
+
+
 def config_path() -> Path:
     env = os.environ.get("SESSIUM_CONFIG")
     if env:
@@ -151,7 +251,12 @@ def drive_url(cfg: dict, sub: str = "") -> str:
 LEDGER_VERSION = 1
 
 
-def ledger_key(project: str, sid: str) -> str:
+def ledger_key(project: str, sid: str, app: str = "claude") -> str:
+    """Ledger key. Claude keeps the original '<munged>/<sid>' shape (existing
+    ledgers stay valid, no migration); codex sessions are namespaced under
+    'codex/' so the two apps can never collide on one key."""
+    if app == "codex":
+        return f"codex/{project}/{sid}"
     return f"{project}/{sid}"
 
 
@@ -184,8 +289,8 @@ def save_ledger(ledger: dict) -> None:
 
 
 def record_sync(ledger: dict, project: str, sid: str,
-                local_md5: str, remote_md5: str) -> None:
-    ledger.setdefault("sessions", {})[ledger_key(project, sid)] = {
+                local_md5: str, remote_md5: str, app: str = "claude") -> None:
+    ledger.setdefault("sessions", {})[ledger_key(project, sid, app)] = {
         "project": project,
         "id": sid,
         "local_md5": local_md5,
@@ -202,7 +307,7 @@ def record_bootstrap(ledger: dict, rows: list) -> int:
     for row in rows:
         if row["state"] == "in-sync" and not row["entry"]:
             record_sync(ledger, row["project"], row["id"],
-                        row["local"]["md5"], row["remote"]["md5"])
+                        row["local"]["md5"], row["remote"]["md5"], row["app"])
             n += 1
     return n
 
@@ -405,10 +510,36 @@ def fmt_time(value) -> str:
 # discovery — local side
 # ---------------------------------------------------------------------------
 
-def local_sessions() -> dict:
-    """munged project name -> sorted list of session dicts (id, path, size, mtime, md5)."""
-    root = claude_dir() / "projects"
+def local_sessions(app: str = "claude") -> dict:
+    """munged project name -> sorted list of session dicts (id, path, size,
+    mtime, md5). Claude reads the projects tree; codex walks the sessions/
+    tree and reads each rollout's session_meta line for the session id and
+    the cwd it was launched in."""
     result = {}
+    if app == "codex":
+        root = app_home("codex") / "sessions"
+        if not root.is_dir():
+            return result
+        for path in sorted(root.rglob("*.jsonl")):
+            sid, cwd = codex_meta(path)
+            if not sid:
+                continue               # not a rollout (truncated/foreign file)
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            project = munge(cwd) if cwd else "-unknown-cwd"
+            result.setdefault(project, []).append({
+                "id": sid,
+                "path": str(path),
+                "size": stat.st_size,
+                "mtime": stat.st_mtime,
+                "md5": md5_of(path),
+            })
+        for sessions in result.values():
+            sessions.sort(key=lambda s: s["id"])
+        return result
+    root = claude_dir() / "projects"
     if not root.is_dir():
         return result
     for project in sorted(root.iterdir()):
@@ -476,10 +607,12 @@ def session_title(path: Path, max_lines: int = 200) -> str:
 # discovery — remote side
 # ---------------------------------------------------------------------------
 
-def remote_sessions(cfg: dict) -> dict:
-    """munged project name -> list of session dicts, read straight off Drive."""
+def remote_sessions(cfg: dict, app: str = "claude") -> dict:
+    """munged project name -> list of session dicts, read straight off Drive.
+    Claude lives under projects/, codex under codex/projects/."""
+    prefix = "codex/projects" if app == "codex" else "projects"
     try:
-        proc = rclone("lsjson", "--recursive", "--hash", drive_url(cfg, "projects"))
+        proc = rclone("lsjson", "--recursive", "--hash", drive_url(cfg, prefix))
     except RcloneError as exc:
         # a fresh remote has no projects/ folder yet — that is "empty", not
         # "unreachable" (push creates the folder chain on its first upload)
@@ -508,7 +641,8 @@ def remote_sessions(cfg: dict) -> dict:
     return result
 
 
-def classify_row(project: str, sid: str, local, remote, entry) -> dict:
+def classify_row(project: str, sid: str, local, remote, entry,
+                 app: str = "claude") -> dict:
     """Classify one (project, session) against its ledger record (PLAN §2)."""
     if entry:
         l_match = bool(local) and entry.get("local_md5") == local["md5"]
@@ -537,24 +671,27 @@ def classify_row(project: str, sid: str, local, remote, entry) -> dict:
         "project": project,
         "id": sid,
         "state": state,
+        "app": app,
         "local": local,
         "remote": remote,
         "entry": entry,
     }
 
 
-def classify_ledger(local_map: dict, remote_map: dict, ledger: dict) -> list:
+def classify_ledger(local_map: dict, remote_map: dict, ledger: dict,
+                    app: str = "claude") -> list:
     """One row per (project, session) present on either side, classified
     against the ledger. States: in-sync / push / pull / conflict /
-    new-here / new-there."""
+    new-here / new-there. Rows carry the owning 'app'."""
     sessions = ledger.get("sessions", {})
     rows = []
     for project in sorted(set(local_map) | set(remote_map)):
         here = {s["id"]: s for s in local_map.get(project, [])}
         there = {s["id"]: s for s in remote_map.get(project, [])}
         for sid in sorted(set(here) | set(there)):
-            entry = sessions.get(ledger_key(project, sid))
-            rows.append(classify_row(project, sid, here.get(sid), there.get(sid), entry))
+            entry = sessions.get(ledger_key(project, sid, app))
+            rows.append(classify_row(project, sid, here.get(sid),
+                                     there.get(sid), entry, app))
     return rows
 
 
@@ -562,28 +699,80 @@ def classify_ledger(local_map: dict, remote_map: dict, ledger: dict) -> list:
 # transfers — the only code that moves session bytes
 # ---------------------------------------------------------------------------
 
-def find_sessions(prefix: str, local_map: dict, remote_map: dict) -> list:
-    """Rows whose session id starts with prefix. Callers turn zero/multiple
-    matches into their own error."""
-    rows = classify_ledger(local_map, remote_map, load_ledger())
-    return [r for r in rows if r["id"].startswith(prefix)]
+def session_remote_url(cfg: dict, project: str, sid: str,
+                       app: str = "claude") -> str:
+    """Drive path of one transcript. Claude: projects/<munged>/<sid>.jsonl;
+    codex: codex/projects/<munged>/<sid>.jsonl (never mixed in one tree —
+    the file layouts differ and one bad write could strand both)."""
+    base = "codex/projects" if app == "codex" else "projects"
+    return drive_url(cfg, f"{base}/{project}/{sid}.jsonl")
 
 
-def find_one_session(args_session: str, local_map: dict, remote_map: dict):
-    """resolve/diff share this: exactly one match or a printed error."""
-    rows = find_sessions(args_session, local_map, remote_map)
-    if not rows:
-        fail(f"no session id starts with {args_session!r}")
+def local_root(app: str) -> Path:
+    """Machine-local root holding <munged>/revert/ and <munged>/<sid>/history/
+    for an app. Claude uses the projects tree itself (its listing only globs
+    top-level *.jsonl). Codex must NOT: codex globs sessions/**/*.jsonl, so
+    anything under ~/.codex/sessions would show up as duplicate sessions —
+    keep quarantines under ~/.codex/.sessium/projects instead."""
+    if app == "codex":
+        return app_home("codex") / ".sessium" / "projects"
+    return claude_dir() / "projects"
+
+def collect_rows(cfg: dict, args, project=None, apps=None,
+                 hard: bool = False) -> tuple:
+    """Classify every session across the selected apps (--app; a row carries
+    its owning 'app'). Returns (rows, reachable). With hard=True a Drive
+    listing failure raises RcloneError; otherwise that app classifies against
+    a local-only view and reachable comes back False."""
+    if apps is None:
+        apps = selected_apps(args)
+    ledger = load_ledger()
+    rows = []
+    reachable = True
+    for app in apps:
+        local_map = filter_map(local_sessions(app), project)
+        try:
+            remote_map = filter_map(remote_sessions(cfg, app), project)
+        except RcloneError:
+            if hard:
+                raise
+            reachable = False
+            remote_map = {}
+        rows += classify_ledger(local_map, remote_map, ledger, app)
+    return rows, reachable
+
+
+def pick_row(rows: list, prefix: str):
+    """Rows whose session id starts with prefix — exactly one, or a printed
+    error. Callers turn None into their own exit code."""
+    matches = [r for r in rows if r["id"].startswith(prefix)]
+    if not matches:
+        fail(f"no session id starts with {prefix!r}")
         return None
-    if len(rows) > 1:
-        fail(f"ambiguous id prefix {args_session!r} — matches:")
-        for row in rows:
-            say(f"  {row['project']}/{row['id']}")
+    if len(matches) > 1:
+        fail(f"ambiguous id prefix {prefix!r} — matches:")
+        for row in matches:
+            say(f"  {row['app']:<6} {row['project']}/{row['id']}")
         return None
-    return rows[0]
+    return matches[0]
 
 
-def local_session_path(project: str, sid: str) -> Path:
+def find_one_session(args_session: str, cfg: dict, args, apps=None):
+    """Commands that tolerate an unreachable Drive (checkout/log/open/export):
+    exactly one match or a printed error; offline means a local-only view."""
+    rows, reachable = collect_rows(cfg, args, apps=apps)
+    if not reachable:
+        warn("cannot reach Drive right now — searching local sessions only")
+    return pick_row(rows, args_session)
+
+
+def local_session_path(project: str, sid: str, app: str = "claude",
+                       mtime=None) -> Path:
+    """Where a session lives locally. Claude: the projects tree path. Codex:
+    the existing rollout whose name ends in the uuid, or a synthesized
+    date-folder path for downloads of sessions this machine doesn't have."""
+    if app == "codex":
+        return codex_local_path(app_home("codex"), sid, mtime)
     return claude_dir() / "projects" / project / f"{sid}.jsonl"
 
 
@@ -642,35 +831,38 @@ def session_cwd(path: Path, max_lines: int = 50) -> str:
     return ""
 
 
-def fetch_remote_transcript(cfg: dict, project: str, sid: str) -> Path:
+def fetch_remote_transcript(cfg: dict, project: str, sid: str,
+                            app: str = "claude") -> Path:
     """Download a transcript for inspection; caller removes the temp file."""
     fd, name = tempfile.mkstemp(prefix=f"sessium-{sid[:8]}-")
     os.close(fd)
     path = Path(name)
-    copy_retrying(["cat", drive_url(cfg, f"projects/{project}/{sid}.jsonl")],
+    copy_retrying(["cat", session_remote_url(cfg, project, sid, app)],
                   to_file=str(path))
     return path
 
 
-def upload_session(cfg: dict, project: str, sid: str, local_path: str) -> None:
+def upload_session(cfg: dict, project: str, sid: str, local_path: str,
+                   app: str = "claude") -> None:
     size = os.path.getsize(local_path)
     copy_retrying(["copyto", local_path,
-                   drive_url(cfg, f"projects/{project}/{sid}.jsonl")],
+                   session_remote_url(cfg, project, sid, app)],
                   size_bytes=size)
 
 
-def download_session(cfg: dict, project: str, sid: str, local_path: str) -> None:
+def download_session(cfg: dict, project: str, sid: str, local_path: str,
+                     app: str = "claude") -> None:
     Path(local_path).parent.mkdir(parents=True, exist_ok=True)
     # size unknown without an extra lsjson round-trip — base timeout + retries
-    copy_retrying(["copyto", drive_url(cfg, f"projects/{project}/{sid}.jsonl"),
+    copy_retrying(["copyto", session_remote_url(cfg, project, sid, app),
                    local_path])
 
 
-def revert_path(project: str, sid: str) -> Path:
+def revert_path(project: str, sid: str, app: str = "claude") -> Path:
     """A not-yet-taken name in the project's revert/ folder. Revert copies
-    live under <claude-dir>/projects/<project>/revert/ so they never pollute
-    the session listing (which only globs top-level *.jsonl)."""
-    d = claude_dir() / "projects" / project / "revert"
+    live under local_root(app)'s revert/ so they never pollute the session
+    listing (top-level *.jsonl for Claude; the sessions/ tree for codex)."""
+    d = local_root(app) / project / "revert"
     d.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     dst = d / f"{sid}.revert-{stamp}.jsonl"
@@ -681,18 +873,20 @@ def revert_path(project: str, sid: str) -> Path:
     return dst
 
 
-def save_local_revert(project: str, sid: str, src: Path) -> Path:
+def save_local_revert(project: str, sid: str, src: Path,
+                      app: str = "claude") -> Path:
     """Preserve a losing LOCAL copy: move it into revert/."""
-    dst = revert_path(project, sid)
+    dst = revert_path(project, sid, app)
     src.replace(dst)
     return dst
 
 
-def save_remote_revert(cfg: dict, project: str, sid: str) -> Path:
+def save_remote_revert(cfg: dict, project: str, sid: str,
+                       app: str = "claude") -> Path:
     """Preserve a losing REMOTE copy: download it into revert/ before the
     upload overwrites it on Drive."""
-    dst = revert_path(project, sid)
-    copy_retrying(["copyto", drive_url(cfg, f"projects/{project}/{sid}.jsonl"),
+    dst = revert_path(project, sid, app)
+    copy_retrying(["copyto", session_remote_url(cfg, project, sid, app),
                    str(dst)])
     return dst
 
@@ -701,11 +895,12 @@ def save_remote_revert(cfg: dict, project: str, sid: str) -> Path:
 # history — content-addressed snapshots of every replaced copy (SPEC §10)
 # ---------------------------------------------------------------------------
 
-def history_dir(project: str, sid: str) -> Path:
-    return claude_dir() / "projects" / project / sid / "history"
+def history_dir(project: str, sid: str, app: str = "claude") -> Path:
+    return local_root(app) / project / sid / "history"
 
 
-def snapshot_history(project: str, sid: str, src: Path) -> Path | None:
+def snapshot_history(project: str, sid: str, src: Path,
+                     app: str = "claude") -> Path | None:
     """Keep the bytes of a copy that is about to be (or was just) replaced,
     content-addressed: <seq>-<md5[:8]>.jsonl. Identical content lands under
     an identical name — the second save is a free dedup no-op. Never touches
@@ -714,7 +909,7 @@ def snapshot_history(project: str, sid: str, src: Path) -> Path | None:
         digest = md5_of(src)
     except OSError:
         return None
-    hdir = history_dir(project, sid)
+    hdir = history_dir(project, sid, app)
     hdir.mkdir(parents=True, exist_ok=True)
     suffix = f"-{digest[:8]}.jsonl"
     for existing in hdir.glob("*.jsonl"):
@@ -783,7 +978,10 @@ def emit_json(data) -> None:
 
 def cmd_list(args) -> int:
     """Inventory of local sessions (no Drive access)."""
-    local_map = filter_map(local_sessions(), args.project)
+    local_map = {}
+    for app in selected_apps(args):
+        for k, v in filter_map(local_sessions(app), args.project).items():
+            local_map.setdefault(k, []).extend({**s, "app": app} for s in v)
     if args.project and not local_map:
         fail(f"no local project folder named {args.project!r}")
         return 1
@@ -794,12 +992,15 @@ def cmd_list(args) -> int:
                 row = {
                     "project": project,
                     "id": s["id"],
+                    "app": s["app"],
                     "path": s["path"],
                     "size": s["size"],
                     "mtime": iso_time(s["mtime"]),
                 }
                 if args.titles:
-                    row["title"] = session_title(Path(s["path"]))
+                    row["title"] = (codex_title(Path(s["path"]))
+                                    if s["app"] == "codex"
+                                    else session_title(Path(s["path"])))
                 rows.append(row)
         rows.sort(key=lambda r: r["mtime"] or "", reverse=True)
         emit_json(rows)
@@ -811,7 +1012,8 @@ def cmd_list(args) -> int:
         say(f"\n{project}  ({len(sessions)} session{'s' if len(sessions) != 1 else ''})")
         for s in sorted(sessions, key=lambda x: x["mtime"], reverse=True):
             total += 1
-            title = session_title(Path(s["path"])) if args.titles else ""
+            title = (codex_title(Path(s["path"])) if s["app"] == "codex"
+                     else session_title(Path(s["path"]))) if args.titles else ""
             title_col = f"  {title}" if title else ""
             say(f"  {fmt_local_time(s['mtime'])}  {human_size(s['size']):>8}  "
                 f"{short_id(s['id'])}{title_col}")
@@ -830,17 +1032,10 @@ def filter_map(session_map: dict, project) -> dict:
 def cmd_status(args) -> int:
     """Compare local sessions against Drive, classified by the ledger."""
     cfg = load_config()
-    local_map = filter_map(local_sessions(), args.project)
-    reachable = True
-    try:
-        remote_map = filter_map(remote_sessions(cfg), args.project)
-    except RcloneError as exc:
-        warn(f"cannot reach Drive right now: {exc}")
+    rows, reachable = collect_rows(cfg, args, project=args.project)
+    if not reachable:
+        warn("cannot reach Drive right now")
         warn("showing local-only view — run 'sessium check' for details")
-        remote_map = {}
-        reachable = False
-
-    rows = classify_ledger(local_map, remote_map, load_ledger())
     counts = {}
     for row in rows:
         counts[row["state"]] = counts.get(row["state"], 0) + 1
@@ -849,10 +1044,11 @@ def cmd_status(args) -> int:
         emit_json({
             "remote": drive_url(cfg),
             "reachable": reachable,
-            "projects": len(set(local_map) | set(remote_map)),
+            "projects": len({(r["app"], r["project"]) for r in rows}),
             "sessions": len(rows),
             "counts": counts,
             "rows": [{
+                "app": r["app"],
                 "project": r["project"],
                 "id": r["id"],
                 "state": r["state"],
@@ -867,13 +1063,14 @@ def cmd_status(args) -> int:
                     "mtime": iso_time(r["remote"]["mtime"]),
                 },
                 "last_synced": (r["entry"] or {}).get("last_synced"),
-            } for r in sorted(rows, key=lambda r: (r["project"], r["id"]))],
+            } for r in sorted(rows, key=lambda r: (r["app"], r["project"],
+                                                   r["id"]))],
         })
         return 0
 
     say(f"remote: {drive_url(cfg)}")
     summary = "   ".join(f"{fmt_state(k)}: {v}" for k, v in sorted(counts.items()))
-    say(f"projects: {len(set(local_map) | set(remote_map))}   "
+    say(f"projects: {len({(r['app'], r['project']) for r in rows})}   "
         f"sessions: {len(rows)}" + (f"   {summary}" if summary else ""))
     if not rows:
         say("Nothing to report — no sessions on either side (filtered).")
@@ -882,12 +1079,14 @@ def cmd_status(args) -> int:
     say("")
     header = f"  {'STATE':<12}{'ID':<10}{'MODIFIED':<18}{'SIZE':>9}  PROJECT"
     say(header)
-    for row in sorted(rows, key=lambda r: (r["project"], r["state"], r["id"])):
+    for row in sorted(rows, key=lambda r: (r["app"], r["project"],
+                                           r["state"], r["id"])):
         source = row["local"] or row["remote"]
         modified = fmt_time(source.get("mtime"))
         size = human_size(source.get("size", 0))
+        app_col = "" if row["app"] == "claude" else f"[{row['app']}] "
         say(f"  {fmt_state(row['state']):<12}{short_id(row['id']):<10}"
-            f"{modified:<18}{size:>9}  {row['project']}")
+            f"{modified:<18}{size:>9}  {app_col}{row['project']}")
     if counts.get("conflict"):
         say("\n[!] CONFLICT sessions: both copies changed since the last sync. "
             "Run 'sessium sync' to resolve (newest wins unless you answer the "
@@ -930,11 +1129,14 @@ def cmd_check(args) -> int:
         warn(f"backup folder '{cfg['drive_folder']}' not on Drive yet — "
              "it will be created on first push/sync")
 
-    # 5. local repo
-    projects = local_sessions()
-    session_count = sum(len(v) for v in projects.values())
-    ok(f"local repo: {len(projects)} project(s), {session_count} session(s) "
-       f"under {claude_dir() / 'projects'}")
+    # 5. local repo(s)
+    for app in selected_apps(args):
+        projects = local_sessions(app)
+        session_count = sum(len(v) for v in projects.values())
+        root = (app_home("codex") / "sessions" if app == "codex"
+                else claude_dir() / "projects")
+        ok(f"local repo ({app}): {len(projects)} project(s), "
+           f"{session_count} session(s) under {root}")
 
     # 6. ledger
     if state_path().is_file():
@@ -945,7 +1147,7 @@ def cmd_check(args) -> int:
 
     if not getattr(args, "full", False):
         return 0
-    return deep_check(cfg, projects)
+    return deep_check(cfg, args)
 
 
 def pick_sample(items: list, count: int) -> list:
@@ -956,31 +1158,34 @@ def pick_sample(items: list, count: int) -> list:
     return [items[min(len(items) - 1, int(i * step))] for i in range(count)]
 
 
-def deep_check(cfg: dict, projects: dict) -> int:
+def deep_check(cfg: dict, args) -> int:
     """The --full half of check: audit the ledger against both sides and
     spot-verify a sample of in-sync sessions (local bytes vs Drive hash).
     Read-only. Orphans and dead ledger entries are informational (sessium
     never deletes); an md5 spot-check mismatch is a real failure."""
     say("")
     say("deep check (--full):")
-    try:
-        remote_map = remote_sessions(cfg)
-    except RcloneError as exc:
-        fail(f"deep check: cannot list Drive: {exc}")
-        return 1
+    apps = selected_apps(args)
+    remote_keys, remote_md5s = set(), {}
+    for app in apps:
+        try:
+            remote_map = remote_sessions(cfg, app)
+        except RcloneError as exc:
+            fail(f"deep check: cannot list Drive: {exc}")
+            return 1
+        for project, sessions in remote_map.items():
+            for sess in sessions:
+                key = ledger_key(project, sess["id"], app)
+                remote_keys.add(key)
+                remote_md5s[key] = sess["md5"]
 
     local_keys, local_md5s = set(), {}
-    for project, sessions in projects.items():
-        for sess in sessions:
-            key = f"{project}/{sess['id']}"
-            local_keys.add(key)
-            local_md5s[key] = sess["md5"]
-    remote_keys, remote_md5s = set(), {}
-    for project, sessions in remote_map.items():
-        for sess in sessions:
-            key = f"{project}/{sess['id']}"
-            remote_keys.add(key)
-            remote_md5s[key] = sess["md5"]
+    for app in apps:
+        for project, sessions in local_sessions(app).items():
+            for sess in sessions:
+                key = ledger_key(project, sess["id"], app)
+                local_keys.add(key)
+                local_md5s[key] = sess["md5"]
     live = local_keys | remote_keys
 
     ledger = load_ledger().get("sessions", {})
