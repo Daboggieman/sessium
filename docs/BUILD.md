@@ -228,6 +228,46 @@ not in PLAN.md or README.md.
   `--verbose`, post-crypt config fix, `FAILED:` summary wording) — done on
   both platforms, see the decisions log.
 
+### Batch 8 — Codex CLI session sync *(user-requested 2026-11-09)* 🪟 Linux ✅
+
+`sessium` now versions Codex CLI sessions alongside Claude Code ones. Same
+ledger, same md5 classification, one new flag.
+
+- **What's synced**: only the rollout transcripts — `~/.codex/sessions/
+  YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl`. NEVER `auth.json`, the sqlite
+  DBs, `history.jsonl` or `session_index.jsonl` (machine-local secrets/state).
+- **Drive layout**: a separate `codex/projects/<munged-path>/<uuid>.jsonl`
+  tree (SPEC §1) — rollout format differs from Claude transcripts; one bad
+  write must not strand both apps.
+- **Discovery**: each rollout's first `session_meta` line carries the
+  `session_id` and the `cwd` it was launched in; the munged project name
+  comes from that cwd (no adopt needed — codex groups by session, sessium
+  regroups by repo). Rollouts without a valid meta line are skipped, never
+  quarantined.
+- **Ledger keys**: `codex/<munged>/<session-id>`; Claude keys unchanged
+  (`<munged>/<session-id>`) — no migration, the two apps can never collide.
+- **`--app claude|codex|all`** (default `all`) on every session-facing
+  command: `status`, `list`, `log`, `push`, `pull`, `sync`, `diff`,
+  `resolve`, `revert`, `checkout`, `gc`, `open`, `export`, `search`.
+  v1 deferrals: `export`/`search` are Claude-only (`--app codex` → clear
+  error), `sync --only memory|skills` is Claude-only by nature
+  (`--app codex` there is a hard error), and `open` resumes codex with
+  `cd <cwd> && codex resume <id>` (from `session_meta`, so it works across
+  machines).
+- **Quarantine root**: `~/.codex/.sessium/projects/` (NOT inside
+  `sessions/` — codex globs `sessions/**/*.jsonl`, so revert/history copies
+  there would show up as duplicate sessions). SPEC §6 documents it.
+- **Tests**: suite grew 97 → 107 (3 unit tests for the codex helpers +
+  a `CodexTests` class: roundtrip with the synthesized download path,
+  status `[codex]` rows + the additive `"app"` JSON field, codex conflict
+  newest-wins with the loser kept outside the sessions tree, `--app`
+  scoping, the `--only --app codex` guard regression, `open`'s resume
+  line, export/search rejection). Hermetic: the suite runs against
+  `SESSIUM_CODEX_HOME` throwaways, the real `~/.codex` never leaks.
+- 🪟 **Windows parity not started** — `windows/sessium.ps1` still
+  syncs Claude only (SPEC already pins the contract; smoke additions to
+  follow the port).
+
 ---
 
 ## 3. Decisions log (feature-era)
@@ -296,3 +336,18 @@ not in PLAN.md or README.md.
   `tests/ci_smoke.ps1` and a repo-wide `*.ps1` BOM test in the Linux suite.
   All four .ps1 files carry the BOM now; `sessium.cmd` must stay BOM-less
   (cmd.exe chokes on it) and is pure ASCII.
+- 2026-11-10 — **Codex sessions sync from the sessions tree only, into
+  their own Drive prefix**: `~/.codex` mixes secrets (`auth.json`), binary
+  state (sqlite), and the rollouts — sessium syncs ONLY
+  `sessions/**/*.jsonl`, and lands them at `codex/projects/<munged>/<uuid>`
+  instead of the Claude `projects/` tree (rollout format differs; one bad
+  write must not strand both). Ledger keys get a `codex/` prefix rather
+  than a schema bump — Claude keys keep their shape, no migration, no
+  cross-app collision. Codex quarantines live under `~/.codex/.sessium/`
+  because codex itself globs `sessions/**/*.jsonl` — a revert copy there
+  would resurface as a duplicate session. Discovery requires a valid
+  `session_meta` first line (truncated/foreign .jsonl is skipped, never
+  classified); the project name comes from the meta's `cwd`, so conflicts
+  on codex sessions are edited as valid rollouts in tests. Export/search
+  stay Claude-only for v1 (different transcript formats; defer, don't
+  half-parse).

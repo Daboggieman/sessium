@@ -1,12 +1,12 @@
 # sessium
 
-**Git-like version control for Claude Code sessions, with Google Drive as the remote.**
+**Git-like version control for Claude Code and Codex CLI sessions, with Google Drive as the remote.**
 
 Back up your conversations to Google Drive and replay any session on another
-machine's Claude Code, anytime — push, pull, diff, search and resolve sessions
+machine's agent, anytime — push, pull, diff, search and resolve sessions
 the way you would code with git.
 
-> **Status:** Linux CLI complete (Phases 1–4 + all feature batches; 96 hermetic
+> **Status:** Linux CLI complete (Phases 1–4 + all feature batches; 107 hermetic
 > tests, CI on Linux & Windows). Windows PowerShell twin ships in parallel —
 > see `SPEC.md` for the cross-platform contract, `docs/BUILD.md` for progress.
 
@@ -40,6 +40,10 @@ bash setup-ubuntu.sh     # installs rclone, does the Drive sign-in, self-tests
 - A per-machine **ledger** (`~/.local/state/sessium/state.json`) remembers what
   was synced, so `sessium status` can tell in-sync from push from pull from
   CONFLICT — like `git status` for your sessions.
+- **Codex CLI** sessions (`~/.codex/sessions/**` rollouts) sync the same way,
+  into their own `codex/projects/` Drive tree. Every session command takes
+  `--app claude|codex|all` (default `all`); `export`/`search` are Claude-only
+  for now. Never synced: `auth.json`, the sqlite DBs, codex's index/history.
 
 ## Day to day
 

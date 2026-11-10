@@ -11,6 +11,7 @@ from test_sessium import (
     Batch4Tests,
     Batch5Tests,
     Batch6Tests,
+    CodexTests,
     CommandTests,
     Phase3Tests,
     SyncTests,
@@ -28,5 +29,6 @@ if __name__ == "__main__":
     suite.addTests(loader.loadTestsFromTestCase(Batch4Tests))
     suite.addTests(loader.loadTestsFromTestCase(Batch5Tests))
     suite.addTests(loader.loadTestsFromTestCase(Batch6Tests))
+    suite.addTests(loader.loadTestsFromTestCase(CodexTests))
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     sys.exit(0 if result.wasSuccessful() else 1)

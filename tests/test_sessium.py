@@ -396,14 +396,17 @@ class SyncBase(unittest.TestCase):
         self._tmp.cleanup()
 
     def _machine(self, name: str) -> dict:
-        claude = self.tmp / f"machine-{name}" / ".claude"
+        root = self.tmp / f"machine-{name}"
+        claude = root / ".claude"
         (claude / "projects" / PROJ).mkdir(parents=True, exist_ok=True)
-        return {"claude": claude, "state": self.tmp / f"machine-{name}" / "state.json"}
+        codex = root / ".codex"     # hermetic — the real ~/.codex never leaks
+        return {"claude": claude, "codex": codex, "state": root / "state.json"}
 
     def env(self, machine: dict) -> dict:
         e = os.environ.copy()
         e.update({
             "SESSIUM_CLAUDE_DIR": str(machine["claude"]),
+            "SESSIUM_CODEX_HOME": str(machine["codex"]),
             "SESSIUM_STATE": str(machine["state"]),
             "SESSIUM_RCLONE_BIN": str(FAKE_RCLONE),
             "SESSIUM_CONFIG": str(self.tmp / "config.json"),
@@ -416,6 +419,22 @@ class SyncBase(unittest.TestCase):
 
     def drive_file(self, sid: str) -> Path:
         return self.drive / "backup" / "projects" / PROJ / f"{sid}.jsonl"
+
+    def codex_rollout(self, machine: dict, sid: str,
+                      body: str = CODEX_ROLLOUT) -> Path:
+        """A codex rollout in machine's home: sessions/YYYY/MM/DD/rollout-*.jsonl."""
+        path = (machine["codex"] / "sessions" / "2026" / "11" / "09" /
+                f"rollout-2026-11-09T10-00-00-{sid}.jsonl")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body, encoding="utf-8")
+        return path
+
+    def codex_drive_file(self, sid: str) -> Path:
+        return self.drive / "backup" / "codex" / "projects" / PROJ / f"{sid}.jsonl"
+
+    def codex_revert_files(self, machine: dict, sid: str) -> list:
+        d = machine["codex"] / ".sessium" / "projects" / PROJ / "revert"
+        return sorted(d.glob(f"{sid}.revert-*")) if d.is_dir() else []
 
     def revert_files(self, machine: dict, sid: str) -> list:
         d = machine["claude"] / "projects" / PROJ / "revert"
@@ -1519,3 +1538,123 @@ class Batch6Tests(SyncBase):
                        "sync timer: installed", "Stop hook: installed",
                        "all set"):
             self.assertIn(marker, p.stdout)
+
+
+class CodexTests(SyncBase):
+    """Codex CLI integration: same ledger/md5 machine, a separate Drive tree
+    (codex/projects/), 'codex/'-namespaced ledger keys, --app scoping."""
+
+    def test_codex_push_pull_roundtrip(self):
+        self.codex_rollout(self.a, CODEX_SID)
+        p = run_sessium(self.env(self.a), "push")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("pushed: 1", p.stdout)
+        f = self.codex_drive_file(CODEX_SID)
+        self.assertTrue(f.is_file())
+        self.assertEqual(f.read_text(encoding="utf-8"), CODEX_ROLLOUT)
+        # ledger key is namespaced under codex/ (claude keys unchanged)
+        self.assertIn(f"codex/{PROJ}/{CODEX_SID}", self.ledger(self.a)["sessions"])
+        # B pulls: the rollout lands in a synthesized date folder named
+        # rollout-<ts>-<uuid>.jsonl (exact date depends on the local timezone)
+        p = run_sessium(self.env(self.b), "pull")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("pulled: 1", p.stdout)
+        local = self.b["codex"] / "sessions"
+        hits = sorted(local.rglob(f"*{CODEX_SID}.jsonl"))
+        self.assertEqual(len(hits), 1, hits)
+        self.assertTrue(hits[0].name.startswith("rollout-"))
+        self.assertTrue(hits[0].name.endswith(f"-{CODEX_SID}.jsonl"))
+        self.assertIn("sessions", hits[0].parts)
+        self.assertEqual(hits[0].read_text(encoding="utf-8"), CODEX_ROLLOUT)
+        self.assertIn(f"codex/{PROJ}/{CODEX_SID}", self.ledger(self.b)["sessions"])
+        p = run_sessium(self.env(self.b), "status")
+        self.assertIn("in-sync: 1", p.stdout)
+
+    def test_codex_status_rows_and_app_field(self):
+        self.local_file(self.a, "aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
+        self.codex_rollout(self.a, CODEX_SID)
+        p = run_sessium(self.env(self.a), "status", "--json")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        doc = json.loads(p.stdout)
+        # projects count as (app, project) pairs: one claude + one codex
+        self.assertEqual(doc["projects"], 2)
+        self.assertEqual(doc["sessions"], 2)
+        self.assertEqual({r["app"] for r in doc["rows"]}, {"claude", "codex"})
+        codex_rows = [r for r in doc["rows"] if r["app"] == "codex"]
+        self.assertEqual(codex_rows[0]["id"], CODEX_SID)
+        self.assertEqual(codex_rows[0]["state"], "new-here")
+        # human output marks codex rows with a [codex] prefix
+        p = run_sessium(self.env(self.a), "status")
+        self.assertIn("[codex] ", p.stdout)
+
+    def test_codex_conflict_newest_wins(self):
+        """A pushes a codex rollout; B pulls; both edit; A pushes last. B's
+        sync resolves newest-wins: A's copy wins, B's loser is kept in
+        revert/ — which lives OUTSIDE the sessions tree (codex globs
+        sessions/**/*.jsonl and would show quarantines as sessions)."""
+        self.codex_rollout(self.a, CODEX_SID)
+        self.assertEqual(run_sessium(self.env(self.a), "push").returncode, 0)
+        self.assertEqual(run_sessium(self.env(self.b), "pull").returncode, 0)
+        b_local = sorted(
+            (self.b["codex"] / "sessions").rglob(f"*{CODEX_SID}.jsonl"))[0]
+        b_local.write_text(codex_with_body("b rewrote the ending"),
+                           encoding="utf-8")
+        self.codex_rollout(self.a, CODEX_SID,
+                           body=codex_with_body("a rewrote the ending"))
+        self.assertEqual(run_sessium(self.env(self.a), "push").returncode, 0)
+        p = run_sessium(self.env(self.b), "sync")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        # B's losing copy is preserved in ~/.codex/.sessium/projects/<proj>/revert/
+        losers = self.codex_revert_files(self.b, CODEX_SID)
+        self.assertEqual(len(losers), 1, losers)
+        self.assertIn("b rewrote the ending", losers[0].read_text(encoding="utf-8"))
+        # the winner overwrote B's local rollout; sessions/ holds exactly ONE
+        # jsonl for this sid (no quarantine ever leaks into the sessions tree)
+        tree = sorted((self.b["codex"] / "sessions").rglob("*.jsonl"))
+        self.assertEqual(len(tree), 1, tree)
+        self.assertIn("a rewrote the ending", tree[0].read_text(encoding="utf-8"))
+        entry = self.ledger(self.b)["sessions"][f"codex/{PROJ}/{CODEX_SID}"]
+        self.assertEqual(entry["local_md5"], entry["remote_md5"])
+
+    def test_app_flag_scopes_push_and_status(self):
+        # both apps have new sessions; push --app claude must not touch codex
+        self.local_file(self.a, "aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
+        self.codex_rollout(self.a, CODEX_SID)
+        p = run_sessium(self.env(self.a), "push", "--app", "claude")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertTrue(self.drive_file("aaa").is_file())
+        self.assertFalse(self.codex_drive_file(CODEX_SID).exists())
+        p = run_sessium(self.env(self.a), "push", "--app", "codex")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertTrue(self.codex_drive_file(CODEX_SID).is_file())
+        p = run_sessium(self.env(self.a), "status", "--json", "--app", "codex")
+        rows = json.loads(p.stdout)["rows"]
+        self.assertEqual([r["app"] for r in rows], ["codex"])
+
+    def test_sync_only_codex_guard(self):
+        # regression: --only memory/skills syncs Claude Code folders; with
+        # --app codex that is a hard error, the default (--app all) still works
+        p = run_sessium(self.env(self.a), "sync", "--only", "memory",
+                        "--app", "codex")
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("--only", p.stderr)
+        p = run_sessium(self.env(self.a), "sync", "--only", "memory")
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    def test_codex_open_prints_resume(self):
+        # resume cwd comes from the rollout's own session_meta, so it works
+        # across machines despite the lossy munging
+        self.codex_rollout(self.a, CODEX_SID)
+        p = run_sessium(self.env(self.a), "open", CODEX_SID)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn(f"cd /home/test/proj && codex resume {CODEX_SID}", p.stdout)
+
+    def test_export_and_search_reject_codex(self):
+        # v1 deferral: export/search parse Claude transcripts only
+        p = run_sessium(self.env(self.a), "export", "--app", "codex", "--all",
+                        "--out", str(self.tmp / "x.md"))
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("only for now", p.stderr)
+        p = run_sessium(self.env(self.a), "search", "--app", "codex", "bridge")
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("only for now", p.stderr)

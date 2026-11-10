@@ -12,6 +12,7 @@ wins and one of them gets fixed.
   projects/<munged-path>/<session-id>.jsonl     ← conversations
   projects/<munged-path>/<session-id>/...       ← session data folders
   projects/<munged-path>/memory/...             ← persistent memory
+  codex/projects/<munged-path>/<session-id>.jsonl ← Codex CLI rollouts
   config/settings.json, config/skills/, config/file-history/
   config/installed_plugins.json                 ← plugin registry only
 ```
@@ -19,6 +20,12 @@ wins and one of them gets fixed.
 Default `<remote>` is `gdrive`, default `<folder>` is `claude-backup`;
 both come from `~/.config/sessium/config.json` (or the platform fallbacks —
 see §5). sessium never deletes from the remote.
+
+Codex CLI sessions live in their own `codex/` tree, never mixed into
+`projects/` — the rollout format differs from Claude transcripts and one
+bad write could strand both apps. Only `~/.codex/sessions/**` rollouts are
+synced: `auth.json`, sqlite DBs, `history.jsonl`, and `session_index.jsonl`
+are machine-local and must never leave the box.
 
 ## 2. Munging rule
 
@@ -29,7 +36,15 @@ with every `/` replaced by `-`, leading slash included:
 
 Windows paths munge the same way: every `\` becomes `-` (e.g.
 `C:\Users\me\repo` → `C:-Users-me-repo`). A session id is the transcript
-file's stem (UUID). The ledger key is `<munged>/<session-id>`.
+file's stem (UUID). The ledger key is `<munged>/<session-id>` (codex keys
+are namespaced — see §3).
+
+Codex rollouts don't live in a per-project folder — they sit in
+`~/.codex/sessions/YYYY/MM/DD/` — so the munged project name comes from
+the rollout's own `session_meta` first line (`payload.cwd`); a rollout
+without one is skipped (not a recognized session). The session id is the
+uuid at the end of the rollout filename. On download, sessium synthesizes
+a date-folder path `rollout-<mtime>-<uuid>.jsonl` from the Drive ModTime.
 
 ## 3. Ledger (per machine — never synced)
 
@@ -55,6 +70,12 @@ Path: `~/.local/state/sessium/state.json` (Linux) /
 classification uses md5s only. An unreadable ledger is a loud warning plus a
 fresh start; the bootstrap rule (§4) re-records matching sessions, so losing
 it must never cause data loss or mass conflicts.
+
+Codex sessions are namespaced in the same ledger as
+`codex/<munged>/<session-id>`; Claude keys keep the original
+`<munged>/<session-id>` shape, so existing ledgers stay valid with no
+migration. A record's `project`/`id` fields are the same for both apps —
+only the key prefix differs.
 
 ## 4. Classification (one row per session present on either side)
 
@@ -104,6 +125,7 @@ Env overrides (both versions honor the same names where the OS allows):
 | env var | meaning | default |
 |---|---|---|
 | `SESSIUM_CLAUDE_DIR` | Claude data root | `~/.claude` |
+| `SESSIUM_CODEX_HOME` | Codex CLI data root | `~/.codex` |
 | `SESSIUM_CONFIG` | config file path | `<xdg config>/sessium/config.json` |
 | `SESSIUM_STATE` | ledger path | `<xdg state>/sessium/state.json` |
 | `SESSIUM_RCLONE_BIN` | rclone binary | `rclone` on PATH |
@@ -121,7 +143,10 @@ Transcripts are never line-merged.
   (newest wins) / [S]kip`; empty answer = newest-wins.
 - `push` / `pull` never touch conflicts — they skip and say so.
 - **The loser is never deleted.** A losing local copy is moved to
-  `<claude-dir>/projects/<munged>/revert/<id>.revert-<YYYYmmdd-HHMMSS>.jsonl`;
+  `<claude-dir>/projects/<munged>/revert/<id>.revert-<YYYYmmdd-HHMMSS>.jsonl`
+  — for codex, `<codex-home>/.sessium/projects/<munged>/revert/…`, outside
+  the sessions tree on purpose: codex globs `sessions/**/*.jsonl`, so
+  anything quarantined there would show up as duplicate sessions;
   a losing remote copy is downloaded there first, then overwritten.
   Sub-second collisions of the timestamp get a `-N` suffix before `.jsonl`.
 - The `revert/` folder is machine-local, never synced, and is what a future
@@ -134,7 +159,14 @@ Transcripts are never line-merged.
 `log` (no id: alias for `list`; with an id: history snapshots), `open`
 (phase 3.5) · `search`, `seek`, `checkout`, `gc` (Batch 4) · `schedule`,
 `hook`, `setup --encrypted` (Batch 5) · `export`, `onboard` (Batch 6).
-All tree-walking commands take `--project <munged>`. `--json`
+All tree-walking commands take `--project <munged>`. Every session-facing
+command takes `--app claude|codex|all` (default `all`): `status`, `list`,
+`log`, `push`, `pull`, `sync`, `diff`, `resolve`, `revert`, `checkout`,
+`gc`, `open`, `export`, `search`. v1 limits: `export` and `search` parse
+Claude transcripts only — with `--app codex` they fail with a clear
+message — and `sync --only memory|skills` syncs Claude Code folders, so
+`--app codex` there is a hard error. `adopt`, `setup`, `version`,
+`schedule`, `hook`, `onboard`, and `seek` take no `--app`. `--json`
 (SPEC §9) on `list`, `status`, `diff`, `search`; `--dry-run` on `push`,
 `pull`, `sync`, `revert`, `adopt`, `open`, `checkout`, `gc`; `sync`
 additionally `--interactive` and `--only memory|skills` (ledger-less
@@ -210,6 +242,8 @@ prints ONE JSON document on stdout — indent 2, keys sorted — and nothing
 else. Human chatter stays on stderr. All mtimes are UTC
 `%Y-%m-%dT%H:%M:%SZ` strings or `null`, so both versions serialize
 identically. Consumers must ignore unknown keys (the schema is additive).
+`list`/`status`/`diff` rows carry an additive `"app"` field
+(`"claude"` or `"codex"`) naming the app that owns the row.
 
 - **`list --json [--titles]`** — array, newest first:
   `[{ "project", "id", "path", "size", "mtime", ("title") }]`.
