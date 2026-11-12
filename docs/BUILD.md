@@ -224,11 +224,11 @@ not in PLAN.md or README.md.
   html.escape) and `onboard` (checklist + next steps). **Windows parity is
   feature-complete** — the full smoke (180+ assertions) is green locally and
   in CI.
-- 🪟 Transfer hardening (2026-11-08: size-aware timeout, engine retry,
+- ✅ Transfer hardening (2026-11-08: size-aware timeout, engine retry,
   `--verbose`, post-crypt config fix, `FAILED:` summary wording) — done on
   both platforms, see the decisions log.
 
-### Batch 8 — Codex CLI session sync *(user-requested 2026-11-09)* 🪟 Linux ✅
+### Batch 8 — Codex CLI session sync *(user-requested 2026-11-09)* 🪟 Linux ✅ Windows ✅
 
 `sessium` now versions Codex CLI sessions alongside Claude Code ones. Same
 ledger, same md5 classification, one new flag.
@@ -264,9 +264,20 @@ ledger, same md5 classification, one new flag.
   scoping, the `--only --app codex` guard regression, `open`'s resume
   line, export/search rejection). Hermetic: the suite runs against
   `SESSIUM_CODEX_HOME` throwaways, the real `~/.codex` never leaks.
-- 🪟 **Windows parity not started** — `windows/sessium.ps1` still
-  syncs Claude only (SPEC already pins the contract; smoke additions to
-  follow the port).
+- 🪟 **Windows parity done** (2026-11-10) — `windows/sessium.ps1` carries the
+  full codex engine: `Get-AppHome`/`Get-SelectedApps` (`SESSIUM_CODEX_HOME`,
+  `--app` validation), `Get-CodexMeta`/`Get-CodexTitle`/`Get-CodexLocalPath`
+  (first-64KB meta read, 400-line title scan, synthesized
+  `rollout-<mtime>-<uuid>` download path), app-aware ledger keys, remote
+  trees (`codex/projects`), quarantine root (`<codex-home>\.sessium\projects`),
+  `Get-CollectRows` fan-out, and `--app` threaded through all 15 session
+  commands incl. `open`'s `cd <cwd>; codex resume <id>`. Smoke grew to 209
+  assertions (codex roundtrip, `[codex]` status rows, ledger namespace,
+  quarantine-on-conflict, `--app` scoping, `--only`×`--app codex` guard,
+  export/search rejection). Port gotcha worth remembering: PowerShell
+  variables are case-INsensitive — a `foreach ($app …)` loop silently
+  overwrites an `$App` parameter (found via the deep check auditing only
+  "codex" after `check --full`; the step-6 loop var is now `$which`).
 
 ---
 

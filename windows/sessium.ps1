@@ -203,6 +203,25 @@ function Get-ClaudeDir {
     return (Join-Path $env:USERPROFILE ".claude")
 }
 
+<# The CLI's data root per app: ~/.claude for Claude Code, ~/.codex for Codex
+   (SESSIUM_CODEX_HOME overrides, for hermetic tests). #>
+function Get-AppHome([string]$App) {
+    if ($App -eq "codex") {
+        if ($env:SESSIUM_CODEX_HOME) { return $env:SESSIUM_CODEX_HOME }
+        return (Join-Path $env:USERPROFILE ".codex")
+    }
+    return (Get-ClaudeDir)
+}
+
+<# Apps a command operates on: --app claude|codex, default both. An unknown
+   value is a hard error (the Linux side rejects it in argparse). #>
+function Get-SelectedApps([string]$App) {
+    if (-not $App -or $App -eq "all") { return @("claude", "codex") }
+    if ($App -eq "claude" -or $App -eq "codex") { return @($App) }
+    Write-Fail "unknown --app '$App' — use claude, codex, or all"
+    return @("claude", "codex")     # unreachable; Write-Fail exits 1
+}
+
 function Get-ConfigPath {
     if ($env:SESSIUM_CONFIG) { return $env:SESSIUM_CONFIG }
     return (Join-Path $env:LOCALAPPDATA "sessium\config.json")
@@ -394,7 +413,13 @@ function New-Ledger {
     return @{ version = $script:LedgerVersion; sessions = @{} }
 }
 
-function Get-LedgerKey([string]$Project, [string]$Sid) { return "$Project/$Sid" }
+<# Ledger key. Claude keeps the original '<munged>/<sid>' shape (existing
+   ledgers stay valid, no migration); codex sessions are namespaced under
+   'codex/' so the two apps can never collide on one key (SPEC section 3). #>
+function Get-LedgerKey([string]$Project, [string]$Sid, [string]$App) {
+    if ($App -eq "codex") { return "codex/$Project/$Sid" }
+    return "$Project/$Sid"
+}
 
 <# pwsh's ConvertFrom-Json coerces ISO-8601 strings to DateTime, and the
    ledger's last_synced must round-trip as the exact string sessium wrote
@@ -463,8 +488,8 @@ function Save-Ledger($Ledger) {
 }
 
 function Set-LedgerEntry($Ledger, [string]$Project, [string]$Sid,
-                         [string]$LocalMd5, [string]$RemoteMd5) {
-    $Ledger.sessions[(Get-LedgerKey $Project $Sid)] = @{
+                         [string]$LocalMd5, [string]$RemoteMd5, [string]$App) {
+    $Ledger.sessions[(Get-LedgerKey $Project $Sid $App)] = @{
         project = $Project; id = $Sid
         local_md5 = $LocalMd5; remote_md5 = $RemoteMd5
         last_synced = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
@@ -481,13 +506,128 @@ function Get-FileMd5([string]$Path) {
     }
 }
 
+<# (session_id, cwd) from a rollout's first line (type session_meta).
+   Returns $null when the file is unreadable or not a recognized rollout.
+   Read only the first line - rollouts can be tens of MB. #>
+function Get-CodexMeta([string]$Path) {
+    try {
+        if (-not (Test-Path -LiteralPath $Path)) { return $null }
+        $fs = [System.IO.File]::OpenRead($Path)
+        try {
+            $buf = New-Object byte[] 65536
+            $n = $fs.Read($buf, 0, $buf.Length)
+            if ($n -le 0) { return $null }
+            $first = [System.Text.Encoding]::UTF8.GetString($buf, 0, $n)
+            $nl = $first.IndexOf("`n")
+            if ($nl -ge 0) { $first = $first.Substring(0, $nl) }
+        } finally {
+            $fs.Close()
+        }
+    } catch {
+        return $null
+    }
+    try { $entry = $first | ConvertFrom-Json } catch { return $null }
+    if ((Get-JsonProp $entry "type") -ne "session_meta") { return $null }
+    $payload = Get-JsonProp $entry "payload"
+    return @{
+        sid = [string](Get-JsonProp $payload "session_id")
+        cwd = [string](Get-JsonProp $payload "cwd")
+    }
+}
+
+<# Best-effort title for a codex rollout: the first user message that isn't
+   one of codex's <wrapper> blocks (environment context etc.). Same scan
+   limits as Get-SessionTitle. #>
+function Get-CodexTitle([string]$Path, [int]$MaxLines = 400) {
+    if (-not (Test-Path -LiteralPath $Path)) { return "" }
+    $n = 0
+    foreach ($line in (Get-Content -LiteralPath $Path -Encoding UTF8)) {
+        if ($n -ge $MaxLines) { break }
+        $n++
+        if (-not $line.Trim()) { continue }
+        try { $obj = $line | ConvertFrom-Json } catch { continue }
+        if ((Get-JsonProp $obj "type") -ne "response_item") { continue }
+        $payload = Get-JsonProp $obj "payload"
+        if (-not $payload -or (Get-JsonProp $payload "role") -ne "user") { continue }
+        $parts = @()
+        $content = Get-JsonProp $payload "content"
+        foreach ($block in @($content)) {
+            if (-not $block) { continue }
+            $type = [string](Get-JsonProp $block "type")
+            if ($type.EndsWith("_text") -and (Get-JsonProp $block "text")) {
+                $parts += [string](Get-JsonProp $block "text")
+            }
+        }
+        $text = (($parts -join " ").Trim())
+        if ($text -and -not $text.StartsWith("<")) { return $text }
+    }
+    return ""
+}
+
+<# Where a codex session lives locally: an existing rollout whose name ends
+   in the uuid (any date folder), or a synthesized
+   sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl for downloads. -Mtime (UTC
+   DateTime or $null) feeds the synthesized name; it is rendered LOCAL (the
+   same date folder codex itself would have created on this box). #>
+function Get-CodexLocalPath([string]$Sid, $Mtime) {
+    $root = Join-Path (Get-AppHome "codex") "sessions"
+    if (Test-Path -LiteralPath $root) {
+        foreach ($f in (Get-ChildItem -LiteralPath $root -File -Filter "*.jsonl" -Recurse | Sort-Object FullName)) {
+            if ($f.BaseName.EndsWith("-$Sid") -or $f.BaseName -eq $Sid) { return $f.FullName }
+        }
+    }
+    $stamp = $null
+    if ($Mtime) { $stamp = $Mtime }
+    if (-not $stamp) { $stamp = (Get-Date) }
+    $local = $stamp
+    if ($stamp -is [DateTime]) {
+        if ($stamp.Kind -eq [System.DateTimeKind]::Utc) { $local = $stamp.ToLocalTime() }
+    } else {
+        try { $local = [DateTime]$stamp } catch { $local = (Get-Date) }
+    }
+    $name = "rollout-{0}-{1}.jsonl" -f $local.ToString("yyyy-MM-ddTHH-mm-ss"), $Sid
+    return (Join-Path (Join-Path (Join-Path (Join-Path $root `
+        ("{0:D4}" -f $local.Year)) ("{0:D2}" -f $local.Month)) ("{0:D2}" -f $local.Day)) $name)
+}
+
 <# Discover local sessions: @{ "<munged>" = @( @{ id, path, size, mtime, md5 } ) }
    mtime is a UTC DateTime (LastWriteTimeUtc). md5 matches Linux's
-   local_sessions(), which hashes every transcript on every scan. #>
-function Get-LocalSessions {
-    $root = Join-Path (Get-ClaudeDir) "projects"
+   local_sessions(), which hashes every transcript on every scan. Codex
+   rows come from <codex-home>/sessions/** rollouts; the project name is
+   munged from each rollout's session_meta cwd (SPEC §2). #>
+function Get-LocalSessions([string]$App) {
+    $root = Join-Path (Get-AppHome $App) "projects"
+    if ($App -eq "codex") { $root = Join-Path (Get-AppHome "codex") "sessions" }
     $map = @{}
     if (-not (Test-Path -LiteralPath $root)) { return $map }
+    if ($App -eq "codex") {
+        $rowsByProj = @{}
+        foreach ($f in (Get-ChildItem -LiteralPath $root -File -Filter "*.jsonl" -Recurse |
+                         Sort-Object FullName)) {
+            $meta = Get-CodexMeta $f.FullName
+            if (-not $meta -or -not $meta.sid) { continue }
+            $proj = ConvertTo-Munge $meta.cwd
+            if (-not $proj) { $proj = "-unknown-cwd" }
+            $row = @{
+                id = $meta.sid
+                path = $f.FullName
+                size = $f.Length
+                mtime = $f.LastWriteTimeUtc
+                md5 = (Get-FileMd5 $f.FullName)
+            }
+            if (-not $rowsByProj.ContainsKey($proj)) {
+                $rowsByProj[$proj] = New-Object System.Collections.Generic.List[object]
+            }
+            $rowsByProj[$proj].Add($row)
+        }
+        foreach ($k in @($rowsByProj.Keys | Sort-Object)) {
+            # object[], not List[object]: pwsh 7.4 throws "Argument types do
+            # not match" for @(<List[object]>) under StrictMode (see below);
+            # Sort-Object already materializes to object[]
+            $map[$k] = @(($rowsByProj[$k].ToArray() | Sort-Object { $_.id }))
+        }
+        return $map
+    }
     foreach ($projDir in (Get-ChildItem -LiteralPath $root -Directory | Sort-Object Name)) {
         $rows = New-Object System.Collections.Generic.List[object]
         foreach ($f in (Get-ChildItem -LiteralPath $projDir.FullName -File -Filter "*.jsonl" |
@@ -569,14 +709,14 @@ function Read-Transcript([string]$Path) {
 
 <# Fetch a remote transcript to a temp file (rclone cat), caller unlinks.
    Returns the temp path, or $null when the fetch fails. #>
-function Get-RemoteTranscript($Cfg, [string]$Project, [string]$Sid) {
+function Get-RemoteTranscript($Cfg, [string]$Project, [string]$Sid, [string]$App) {
     # real ids are 32+ hex chars; the smoke's fake ones can be shorter
     $keep = if ($Sid.Length -gt 8) { $Sid.Substring(0, 8) } else { $Sid }
     $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("sessium-" + $keep + ".jsonl")
     try {
         # $null = : discard output so nothing extra joins this function's
         # return stream beside the temp path
-        $null = Invoke-CopyWithRetry -RcloneArgs @("cat", (ConvertTo-DriveUrl $Cfg "projects/$Project/$Sid.jsonl")) `
+        $null = Invoke-CopyWithRetry -RcloneArgs @("cat", (ConvertTo-DriveUrl $Cfg "$(Get-RemoteBase $App)/$Project/$Sid.jsonl")) `
             -ToFile $tmp
         return $tmp
     } catch {
@@ -633,10 +773,13 @@ function Get-MessageDivergence($LocalMsgs, $RemoteMsgs) {
 }
 
 <# Remote sessions via one recursive lsjson: @{ "<munged>" = @( @{ id, size,
-   mtime (UTC DateTime), md5 } ) }. Only top-level .jsonl per project. #>
-function Get-RemoteSessions($Cfg) {
+   mtime (UTC DateTime), md5 } ) }. Only top-level .jsonl per project. Codex
+   sessions live under the separate codex/projects tree (SPEC §1). #>
+function Get-RemoteSessions($Cfg, [string]$App) {
     $map = @{}
-    $url = ConvertTo-DriveUrl $Cfg "projects"
+    $base = "projects"
+    if ($App -eq "codex") { $base = "codex/projects" }
+    $url = ConvertTo-DriveUrl $Cfg $base
     $text = $null
     try {
         $text = Invoke-Rclone -RcloneArgs @("lsjson", "--recursive", "--hash", $url)
@@ -676,8 +819,9 @@ function Get-RemoteSessions($Cfg) {
 <# The SPEC section 4 state machine. Compare the CURRENT md5s against the
    ledger record. Never line-merges, never deletes: one side missing with a
    ledger entry means the other side gets re-uploaded / re-downloaded. #>
-function Get-ClassificationRow([string]$Project, [string]$Sid, $Local, $Remote, $Entry) {
+function Get-ClassificationRow([string]$App, [string]$Project, [string]$Sid, $Local, $Remote, $Entry) {
     $row = @{
+        app = $App
         project = $Project; id = $Sid
         local = $Local; remote = $Remote; entry = $Entry
         local_md5 = $null; remote_md5 = $null
@@ -710,7 +854,7 @@ function Get-ClassificationRow([string]$Project, [string]$Sid, $Local, $Remote, 
     return $row
 }
 
-function Get-Classification($LocalMap, $RemoteMap, $Ledger) {
+function Get-Classification([string]$App, $LocalMap, $RemoteMap, $Ledger) {
     $rows = New-Object System.Collections.Generic.List[object]
     $projects = @($LocalMap.Keys + $RemoteMap.Keys | Sort-Object -Unique)
     foreach ($proj in $projects) {
@@ -724,14 +868,41 @@ function Get-Classification($LocalMap, $RemoteMap, $Ledger) {
             $local = $null; foreach ($l in $locals) { if ($l.id -eq $sid) { $local = $l; break } }
             $remote = $null; foreach ($r in $remotes) { if ($r.id -eq $sid) { $remote = $r; break } }
             $entry = $null
-            $key = Get-LedgerKey $proj $sid
+            $key = Get-LedgerKey $proj $sid $App
             if ($Ledger.sessions.ContainsKey($key)) { $entry = $Ledger.sessions[$key] }
-            $rows.Add((Get-ClassificationRow $proj $sid $local $remote $entry))
+            $rows.Add((Get-ClassificationRow $App $proj $sid $local $remote $entry))
         }
     }
     # leading comma: a single-row List unrolls to a SCALAR on return, and a
     # caller's $rows.Count then reads the row's key count (8) instead of 1
     return ,$rows
+}
+
+<# Classify every session across the selected apps (SPEC §7 --app). One row
+   per session, stamped with its owning app — the two apps' project
+   namespaces never merge, since a munged Claude path and a munged codex cwd
+   can collide while their ledger keys cannot. Returns @{ rows; reachable }:
+   reachable=$false means an app classified against a local-only view.
+   $Hard rethrows a Drive listing failure instead (push/pull/diff/resolve
+   keep their fail-loud contract). #>
+function Get-CollectRows($Cfg, [string]$App, $Ledger, [bool]$Hard) {
+    $rows = New-Object System.Collections.Generic.List[object]
+    $reachable = $true
+    foreach ($app in (Get-SelectedApps $App)) {
+        $localMap = Get-LocalSessions $app
+        $remoteMap = $null
+        try {
+            $remoteMap = Get-RemoteSessions $Cfg $app
+        } catch {
+            if ($Hard) { throw }
+            $remoteMap = @{}
+            $reachable = $false
+        }
+        foreach ($r in (Get-Classification $app $localMap $remoteMap $Ledger)) {
+            $rows.Add($r)
+        }
+    }
+    return @{ rows = $rows; reachable = $reachable }
 }
 
 <# Resolve a session id prefix against the classified rows. Zero matches ->
@@ -744,7 +915,7 @@ function Find-OneSession([string]$Prefix, $Rows) {
     if ($hits.Count -gt 1) {
         Write-Info "ambiguous id prefix '$Prefix' — could be:"
         foreach ($m in $hits) {
-            Write-Info ("    {0}  {1}/{2}" -f (Get-ShortId $m.id), $m.project, $m.id)
+            Write-Info ("    {0}  {1,-6}  {2}/{3}" -f (Get-ShortId $m.id), $m.app, $m.project, $m.id)
         }
         exit 1
     }
@@ -758,8 +929,24 @@ function Format-State([string]$State) {
 
 # ---------------------------------------------------------------- transfers
 
-function Get-LocalSessionPath([string]$Project, [string]$Sid) {
-    return (Join-Path (Join-Path (Join-Path (Get-ClaudeDir) "projects") $Project) "$Sid.jsonl")
+<# Where an app's session tree lives locally (also the quarantine root for
+   revert/history copies — for codex that is OUTSIDE sessions/, because
+   codex globs sessions/**/*.jsonl and would see quarantined copies as
+   duplicate sessions; SPEC §6). #>
+function Get-LocalRoot([string]$App) {
+    if ($App -eq "codex") { return (Join-Path (Get-AppHome "codex") ".sessium\projects") }
+    return (Join-Path (Get-ClaudeDir) "projects")
+}
+
+<# Remote tree for an app's transcripts (SPEC §1: codex lives separately). #>
+function Get-RemoteBase([string]$App) {
+    if ($App -eq "codex") { return "codex/projects" }
+    return "projects"
+}
+
+function Get-LocalSessionPath([string]$Project, [string]$Sid, [string]$App, $Mtime) {
+    if ($App -eq "codex") { return (Get-CodexLocalPath $Sid $Mtime) }
+    return (Join-Path (Join-Path (Get-LocalRoot $App) $Project) "$Sid.jsonl")
 }
 
 function Copy-Up([string]$LocalPath, [string]$RemoteUrl) {
@@ -777,10 +964,10 @@ function Copy-Down([string]$RemoteUrl, [string]$LocalPath) {
     Invoke-CopyWithRetry -RcloneArgs @("copyto", $RemoteUrl, $LocalPath)
 }
 
-<# Unique revert-copy path: <dir>/revert/<sid>.revert-<yyyyMMdd-HHmmss>.jsonl,
+<# Unique revert-copy path: <local-root>/revert/<sid>.revert-<yyyyMMdd-HHmmss>.jsonl,
    sub-second collisions get a -N before .jsonl (SPEC section 6). #>
-function Get-RevertPath([string]$Project, [string]$Sid) {
-    $dir = Join-Path (Join-Path (Join-Path (Get-ClaudeDir) "projects") $Project) "revert"
+function Get-RevertPath([string]$Project, [string]$Sid, [string]$App) {
+    $dir = Join-Path (Join-Path (Get-LocalRoot $App) $Project) "revert"
     if (-not (Test-Path -LiteralPath $dir)) {
         New-Item -ItemType Directory -Path $dir -Force | Out-Null
     }
@@ -795,17 +982,17 @@ function Get-RevertPath([string]$Project, [string]$Sid) {
 }
 
 # A losing LOCAL copy is moved (not copied) into revert/.
-function Save-LocalRevert([string]$Project, [string]$Sid, [string]$Src) {
-    $dst = Get-RevertPath $Project $Sid
+function Save-LocalRevert([string]$Project, [string]$Sid, [string]$Src, [string]$App) {
+    $dst = Get-RevertPath $Project $Sid $App
     Move-Item -LiteralPath $Src -Destination $dst -Force
     Write-Info "         local copy kept as $(Split-Path -Leaf $dst)"
     return $dst
 }
 
 # A losing REMOTE copy is downloaded into revert/ before anything overwrites it.
-function Save-RemoteRevert($Cfg, [string]$Project, [string]$Sid) {
-    $dst = Get-RevertPath $Project $Sid
-    Copy-Down (ConvertTo-DriveUrl $Cfg "projects/$Project/$Sid.jsonl") $dst
+function Save-RemoteRevert($Cfg, [string]$Project, [string]$Sid, [string]$App) {
+    $dst = Get-RevertPath $Project $Sid $App
+    Copy-Down (ConvertTo-DriveUrl $Cfg "$(Get-RemoteBase $App)/$Project/$Sid.jsonl") $dst
     Write-Info "         remote copy kept as $(Split-Path -Leaf $dst)"
     return $dst
 }
@@ -816,11 +1003,11 @@ function Save-RemoteRevert($Cfg, [string]$Project, [string]$Sid) {
    replaced: history/<seq>-<md5[:8]>.jsonl. Identical content lands under an
    identical name - the second save is a free dedup no-op. Never touches the
    ledger. Returns the new snapshot path, or $null when it already existed. #>
-function Save-HistorySnapshot([string]$Project, [string]$Sid, [string]$Src) {
+function Save-HistorySnapshot([string]$Project, [string]$Sid, [string]$Src, [string]$App) {
     if (-not (Test-Path -LiteralPath $Src)) { return $null }
     $digest = Get-FileMd5 $Src
     if (-not $digest) { return $null }
-    $hDir = Join-Path (Join-Path (Join-Path (Join-Path (Get-ClaudeDir) "projects") $Project) $Sid) "history"
+    $hDir = Join-Path (Join-Path (Join-Path (Get-LocalRoot $App) $Project) $Sid) "history"
     if (-not (Test-Path -LiteralPath $hDir)) {
         New-Item -ItemType Directory -Path $hDir -Force | Out-Null
     }
@@ -886,8 +1073,9 @@ function Describe-Conflict($Row) {
 }
 
 function Invoke-ApplyConflict($Cfg, $Row, [string]$Choice, $Ledger) {
+    $app = "$($Row.app)"
     $localPath = $Row.local.path
-    $remoteUrl = ConvertTo-DriveUrl $Cfg "projects/$($Row.project)/$($Row.id).jsonl"
+    $remoteUrl = ConvertTo-DriveUrl $Cfg "$(Get-RemoteBase $app)/$($Row.project)/$($Row.id).jsonl"
 
     if ($Choice -eq "skip") {
         Write-Warn2 "  skipped (still conflicted)"
@@ -896,25 +1084,25 @@ function Invoke-ApplyConflict($Cfg, $Row, [string]$Choice, $Ledger) {
 
     if ($Choice -eq "local") {
         if ($Row.remote) {
-            $kept = Save-RemoteRevert $Cfg $Row.project $Row.id
-            Save-HistorySnapshot $Row.project $Row.id $kept | Out-Null
+            $kept = Save-RemoteRevert $Cfg $Row.project $Row.id $app
+            Save-HistorySnapshot $Row.project $Row.id $kept $app | Out-Null
             Copy-Up $localPath $remoteUrl
         } else {
             Copy-Up $localPath $remoteUrl
         }
-        Set-LedgerEntry $Ledger $Row.project $Row.id $Row.local_md5 $Row.local_md5
+        Set-LedgerEntry $Ledger $Row.project $Row.id $Row.local_md5 $Row.local_md5 $app
         Write-Info "  ->  local wins, uploaded"
         return "resolved"
     }
 
     if ($Choice -eq "remote") {
         if ($Row.local) {
-            $saved = Save-LocalRevert $Row.project $Row.id $localPath
-            Save-HistorySnapshot $Row.project $Row.id $saved | Out-Null
+            $saved = Save-LocalRevert $Row.project $Row.id $localPath $app
+            Save-HistorySnapshot $Row.project $Row.id $saved $app | Out-Null
         }
-        $tmpLocal = Get-LocalSessionPath $Row.project $Row.id
+        $tmpLocal = Get-LocalSessionPath $Row.project $Row.id $app $Row.remote.mtime
         Copy-Down $remoteUrl $tmpLocal
-        Set-LedgerEntry $Ledger $Row.project $Row.id $Row.remote_md5 $Row.remote_md5
+        Set-LedgerEntry $Ledger $Row.project $Row.id $Row.remote_md5 $Row.remote_md5 $app
         Write-Info "  ->  remote wins, downloaded"
         return "resolved"
     }
@@ -924,19 +1112,19 @@ function Invoke-ApplyConflict($Cfg, $Row, [string]$Choice, $Ledger) {
                 ($Row.local.mtime -ge $Row.remote.mtime)
     if ($useLocal) {
         if ($Row.remote) {
-            $kept = Save-RemoteRevert $Cfg $Row.project $Row.id
-            Save-HistorySnapshot $Row.project $Row.id $kept | Out-Null
+            $kept = Save-RemoteRevert $Cfg $Row.project $Row.id $app
+            Save-HistorySnapshot $Row.project $Row.id $kept $app | Out-Null
         }
         Copy-Up $localPath $remoteUrl
-        Set-LedgerEntry $Ledger $Row.project $Row.id $Row.local_md5 $Row.local_md5
+        Set-LedgerEntry $Ledger $Row.project $Row.id $Row.local_md5 $Row.local_md5 $app
         Write-Info ("  ->  local wins (newer: {0}), uploaded" -f (Format-Time $Row.local.mtime))
     } else {
         if ($Row.local) {
-            $saved = Save-LocalRevert $Row.project $Row.id $localPath
-            Save-HistorySnapshot $Row.project $Row.id $saved | Out-Null
+            $saved = Save-LocalRevert $Row.project $Row.id $localPath $app
+            Save-HistorySnapshot $Row.project $Row.id $saved $app | Out-Null
         }
-        Copy-Down $remoteUrl (Get-LocalSessionPath $Row.project $Row.id)
-        Set-LedgerEntry $Ledger $Row.project $Row.id $Row.remote_md5 $Row.remote_md5
+        Copy-Down $remoteUrl (Get-LocalSessionPath $Row.project $Row.id $app $Row.remote.mtime)
+        Set-LedgerEntry $Ledger $Row.project $Row.id $Row.remote_md5 $Row.remote_md5 $app
         Write-Info ("  ->  remote wins (newer: {0}), downloaded" -f (Format-Time $Row.remote.mtime))
     }
     return "resolved"
@@ -944,30 +1132,34 @@ function Invoke-ApplyConflict($Cfg, $Row, [string]$Choice, $Ledger) {
 
 # ---------------------------------------------------------------- commands
 
-function Invoke-ListSessions([string]$Project, [switch]$Titles, [switch]$Json) {
+function Invoke-ListSessions([string]$Project, [switch]$Titles, [switch]$Json, [string]$App) {
     $cfg = Get-SessiumConfig
     $ledger = Get-Ledger
-    $localMap = Get-LocalSessions
-    $remoteMap = $null
-    try { $remoteMap = Get-RemoteSessions $cfg } catch { $remoteMap = $null }
-    $localOnly = ($null -eq $remoteMap)
-    if ($localOnly) { $remoteMap = @{} }
-
     $items = New-Object System.Collections.Generic.List[object]
-    $projects = @($localMap.Keys + $remoteMap.Keys | Sort-Object -Unique)
-    foreach ($proj in $projects) {
-        if ($Project -and $proj -ne $Project) { continue }
-        $seen = @{}
-        if ($localMap.ContainsKey($proj)) {
-            foreach ($l in $localMap[$proj]) {
-                $seen[$l.id] = $true
-                $items.Add(@{ proj = $proj; id = $l.id; size = $l.size; mtime = $l.mtime; where = "local" })
+    $localRows = New-Object System.Collections.Generic.List[object]
+    $localOnly = $false
+    foreach ($app in (Get-SelectedApps $App)) {
+        $localMap = Get-LocalSessions $app
+        $remoteMap = $null
+        try { $remoteMap = Get-RemoteSessions $cfg $app } catch { $remoteMap = $null }
+        if ($null -eq $remoteMap) { $remoteMap = @{}; $localOnly = $true }
+
+        $projects = @($localMap.Keys + $remoteMap.Keys | Sort-Object -Unique)
+        foreach ($proj in $projects) {
+            if ($Project -and $proj -ne $Project) { continue }
+            $seen = @{}
+            if ($localMap.ContainsKey($proj)) {
+                foreach ($l in $localMap[$proj]) {
+                    $seen[$l.id] = $true
+                    $items.Add(@{ app = $app; proj = $proj; id = $l.id; size = $l.size; mtime = $l.mtime; path = $l.path; where = "local" })
+                    $localRows.Add(@{ app = $app; proj = $proj; id = $l.id; path = $l.path; size = $l.size; mtime = $l.mtime })
+                }
             }
-        }
-        if ($remoteMap.ContainsKey($proj)) {
-            foreach ($r in $remoteMap[$proj]) {
-                if ($seen.ContainsKey($r.id)) { continue }
-                $items.Add(@{ proj = $proj; id = $r.id; size = $r.size; mtime = $r.mtime; where = "remote" })
+            if ($remoteMap.ContainsKey($proj)) {
+                foreach ($r in $remoteMap[$proj]) {
+                    if ($seen.ContainsKey($r.id)) { continue }
+                    $items.Add(@{ app = $app; proj = $proj; id = $r.id; size = $r.size; mtime = $r.mtime; path = $null; where = "remote" })
+                }
             }
         }
     }
@@ -979,19 +1171,20 @@ function Invoke-ListSessions([string]$Project, [switch]$Titles, [switch]$Json) {
         # SPEC section 9: list --json is the LOCAL inventory (same as Linux;
         # remote-only sessions have no local path to report)
         $rows = New-Object System.Collections.Generic.List[object]
-        foreach ($proj in ($localMap.Keys | Sort-Object)) {
-            if ($Project -and $proj -ne $Project) { continue }
-            foreach ($l in $localMap[$proj]) {
-                $row = @{
-                    project = $proj
-                    id = $l.id
-                    path = $l.path
-                    size = [long]$l.size
-                    mtime = (Get-IsoTime $l.mtime)
-                }
-                if ($Titles) { $row.title = (Get-SessionTitle $l.path) }
-                $rows.Add($row)
+        foreach ($l in $localRows) {
+            $row = @{
+                app = $l.app
+                project = $l.proj
+                id = $l.id
+                path = $l.path
+                size = [long]$l.size
+                mtime = (Get-IsoTime $l.mtime)
             }
+            if ($Titles) {
+                if ($l.app -eq "codex") { $row.title = (Get-CodexTitle $l.path) }
+                else { $row.title = (Get-SessionTitle $l.path) }
+            }
+            $rows.Add($row)
         }
         $jsonRows = @($rows | Sort-Object -Property @{Expression = "mtime"; Descending = $true })
         Emit-Json $jsonRows
@@ -1002,7 +1195,7 @@ function Invoke-ListSessions([string]$Project, [switch]$Titles, [switch]$Json) {
         return
     }
     foreach ($it in $sorted) {
-        $key = Get-LedgerKey $it.proj $it.id
+        $key = Get-LedgerKey $it.proj $it.id $it.app
         $state = "new-" + $(if ($it.where -eq "local") { "here" } else { "there" })
         if ($ledger.sessions.ContainsKey($key)) { $state = "in-sync?" }
         $line = "{0}  {1}  {2}  {3}  {4}" -f `
@@ -1010,11 +1203,16 @@ function Invoke-ListSessions([string]$Project, [switch]$Titles, [switch]$Json) {
             (Get-HumanSize $it.size), $it.proj, $it.id
         Write-Info $line
         if ($Titles) {
-            $title = Get-SessionTitle (Get-LocalSessionPath $it.proj $it.id)
+            $title = ""
+            if ($it.path) {
+                if ($it.app -eq "codex") { $title = (Get-CodexTitle $it.path) }
+                else { $title = (Get-SessionTitle $it.path) }
+            }
             if (-not $title -and $it.where -eq "remote") {
-                $tmp = Get-RemoteTranscript $cfg $it.proj $it.id
+                $tmp = Get-RemoteTranscript $cfg $it.proj $it.id $it.app
                 if ($tmp) {
-                    $title = Get-SessionTitle $tmp
+                    if ($it.app -eq "codex") { $title = (Get-CodexTitle $tmp) }
+                    else { $title = (Get-SessionTitle $tmp) }
                     Remove-Item -LiteralPath $tmp -Force
                 }
             }
@@ -1025,19 +1223,14 @@ function Invoke-ListSessions([string]$Project, [switch]$Titles, [switch]$Json) {
     Write-Info ("{0} session(s)" -f $sorted.Count)
 }
 
-function Invoke-Status([string]$Project, [switch]$Json) {
+function Invoke-Status([string]$Project, [switch]$Json, [string]$App) {
     $cfg = Get-SessiumConfig
     $ledger = Get-Ledger
-    $localMap = Get-LocalSessions
-    $remoteMap = $null
-    $reachable = $true
-    try { $remoteMap = Get-RemoteSessions $cfg } catch {
-        Write-Warn2 "  [!]  remote unreachable ($($_.Exception.Message)) — local-only view"
-        $remoteMap = @{}
-        $reachable = $false
+    $col = Get-CollectRows $cfg $App $ledger $false
+    $rows = $col.rows
+    if (-not $col.reachable) {
+        Write-Warn2 "  [!]  remote unreachable — local-only view"
     }
-
-    $rows = Get-Classification $localMap $remoteMap $ledger
     if ($Project) { $rows = @($rows | Where-Object { $_.project -eq $Project }) }
 
     $counts = @{}
@@ -1045,11 +1238,12 @@ function Invoke-Status([string]$Project, [switch]$Json) {
         if (-not $counts.ContainsKey($r.state)) { $counts[$r.state] = 0 }
         $counts[$r.state]++
     }
-    $projCount = @($rows | ForEach-Object { $_.project } | Sort-Object -Unique).Count
+    # a project name can exist under BOTH apps — count unique (app, project) pairs
+    $projCount = @($rows | ForEach-Object { "$($_.app)|$($_.project)" } | Sort-Object -Unique).Count
 
     if ($Json) {
         $jsonRows = New-Object System.Collections.Generic.List[object]
-        foreach ($r in ($rows | Sort-Object -Property project, id)) {
+        foreach ($r in ($rows | Sort-Object -Property app, project, id)) {
             $localObj = $null
             if ($r.local) {
                 $localObj = @{
@@ -1069,6 +1263,7 @@ function Invoke-Status([string]$Project, [switch]$Json) {
             $lastSynced = $null
             if ($r.entry) { $lastSynced = $r.entry.last_synced }
             $jsonRows.Add(@{
+                app = $r.app
                 project = $r.project
                 id = $r.id
                 state = $r.state
@@ -1079,7 +1274,7 @@ function Invoke-Status([string]$Project, [switch]$Json) {
         }
         Emit-Json @{
             remote = (ConvertTo-DriveUrl $cfg $null)
-            reachable = $reachable
+            reachable = $col.reachable
             projects = $projCount
             sessions = $rows.Count
             counts = $counts
@@ -1104,8 +1299,10 @@ function Invoke-Status([string]$Project, [switch]$Json) {
         $when = "-"; $size = "-"
         if ($r.local) { $when = Format-Time $r.local.mtime; $size = Get-HumanSize $r.local.size }
         elseif ($r.remote) { $when = Format-Time $r.remote.mtime; $size = Get-HumanSize $r.remote.size }
-        Write-Info ("{0,-10}  {1,-8}  {2,-11}  {3,7}  {4}" -f `
-            (Format-State $r.state), (Get-ShortId $r.id), $when, $size, $r.project)
+        $appCol = ""
+        if ($r.app -eq "codex") { $appCol = "[codex] " }
+        Write-Info ("{0,-10}  {1,-8}  {2,-11}  {3,7}  {4}{5}" -f `
+            (Format-State $r.state), (Get-ShortId $r.id), $when, $size, $appCol, $r.project)
     }
     if ($counts.ContainsKey("conflict")) {
         Write-Info ""
@@ -1114,7 +1311,7 @@ function Invoke-Status([string]$Project, [switch]$Json) {
     }
 }
 
-function Invoke-Check([switch]$Full) {
+function Invoke-Check([switch]$Full, [string]$App) {
     $ok = $true
     $cfg = Get-SessiumConfig
     $ledger = Get-Ledger
@@ -1167,22 +1364,26 @@ function Invoke-Check([switch]$Full) {
     }
 
     Write-Info "6. session counts"
-    $localCount = 0; $remoteCount = 0
-    $localMap = @{}
-    try {
-        $localMap = Get-LocalSessions
-        foreach ($l in $localMap.Values) { $localCount += @($l).Count }
-        foreach ($r in (Get-RemoteSessions $cfg).Values) { $remoteCount += @($r).Count }
-        Write-Info ("   local: {0} session(s), remote: {1} session(s)" -f $localCount, $remoteCount)
-    } catch {
-        Write-Warn2 "   FAIL: could not count sessions: $($_.Exception.Message)"
-        $ok = $false
+    # $which, not $app: PowerShell variables are CASE-INSENSITIVE — a foreach
+    # ($app …) loop would clobber the $App parameter (it did: the deep check
+    # then ran with the last loop value, "codex", and audited nothing)
+    foreach ($which in (Get-SelectedApps $App)) {
+        $localCount = 0; $remoteCount = 0
+        try {
+            $localMap = Get-LocalSessions $which
+            foreach ($l in $localMap.Values) { $localCount += @($l).Count }
+            foreach ($r in (Get-RemoteSessions $cfg $which).Values) { $remoteCount += @($r).Count }
+            Write-Info ("   {0}: local: {1} session(s), remote: {2} session(s)" -f $which, $localCount, $remoteCount)
+        } catch {
+            Write-Warn2 "   FAIL: could not count $which sessions: $($_.Exception.Message)"
+            $ok = $false
+        }
     }
 
     Write-Info ""
     if ($ok) { Write-Info "all checks passed" } else { Write-Fail "some checks failed (see above)" }
     if (-not $Full) { return 0 }
-    return (Invoke-DeepCheck $cfg $localMap)
+    return (Invoke-DeepCheck $cfg $App)
 }
 
 <# Deterministic, evenly spread sample of a sorted list (up to count). #>
@@ -1203,28 +1404,34 @@ function Pick-Sample($Items, [int]$Count) {
    spot-verify a sample of in-sync sessions (local bytes vs Drive hash).
    Read-only. Orphans and dead ledger entries are informational (sessium
    never deletes); an md5 spot-check mismatch is a real failure. #>
-function Invoke-DeepCheck($Cfg, $LocalMap) {
+function Invoke-DeepCheck($Cfg, [string]$App) {
     Write-Info ""
     Write-Info "deep check (--full):"
-    $remoteMap = @{}
-    try { $remoteMap = Get-RemoteSessions $Cfg } catch {
-        Write-Fail "deep check: cannot list Drive: $($_.Exception.Message)"
+    $apps = Get-SelectedApps $App
+    $remoteKeys = @{}; $remoteMd5s = @{}
+    foreach ($app in $apps) {
+        $remoteMap = @{}
+        try { $remoteMap = Get-RemoteSessions $Cfg $app } catch {
+            Write-Fail "deep check: cannot list Drive: $($_.Exception.Message)"
+        }
+        foreach ($proj in $remoteMap.Keys) {
+            foreach ($s in @($remoteMap[$proj])) {
+                $k = Get-LedgerKey $proj $s.id $app
+                $remoteKeys[$k] = $true
+                $remoteMd5s[$k] = $s.md5
+            }
+        }
     }
 
     $localKeys = @{}; $localMd5s = @{}
-    foreach ($proj in $LocalMap.Keys) {
-        foreach ($s in @($LocalMap[$proj])) {
-            $k = "$proj/$($s.id)"
-            $localKeys[$k] = $true
-            $localMd5s[$k] = $s.md5
-        }
-    }
-    $remoteKeys = @{}; $remoteMd5s = @{}
-    foreach ($proj in $remoteMap.Keys) {
-        foreach ($s in @($remoteMap[$proj])) {
-            $k = "$proj/$($s.id)"
-            $remoteKeys[$k] = $true
-            $remoteMd5s[$k] = $s.md5
+    foreach ($app in $apps) {
+        $localMap = Get-LocalSessions $app
+        foreach ($proj in $localMap.Keys) {
+            foreach ($s in @($localMap[$proj])) {
+                $k = Get-LedgerKey $proj $s.id $app
+                $localKeys[$k] = $true
+                $localMd5s[$k] = $s.md5
+            }
         }
     }
 
@@ -1418,18 +1625,18 @@ function Invoke-SyncOnly([string]$What, [bool]$DryRun) {
     return 0
 }
 
-function Invoke-Push([string]$Project, [switch]$DryRun, [switch]$Quiet) {
+function Invoke-Push([string]$Project, [string]$App, [switch]$DryRun, [switch]$Quiet) {
     if ($Quiet) { $script:Quiet = $true }
     Invoke-WithTransferLock $DryRun {
     $cfg = Get-SessiumConfig
     $ledger = Get-Ledger
-    $localMap = Get-LocalSessions
-    $remoteMap = @{}
-    try { $remoteMap = Get-RemoteSessions $cfg } catch {
-        Write-Warn2 "  [!]  remote unreachable ($($_.Exception.Message)) — nothing can be pushed"
-        exit 1
+    try {
+        $col = Get-CollectRows $cfg $App $ledger $true
+    } catch {
+        Write-Fail "cannot reach Drive: $($_.Exception.Message)"
+        return
     }
-    $rows = Get-Classification $localMap $remoteMap $ledger
+    $rows = $col.rows
     if ($Project) { $rows = @($rows | Where-Object { $_.project -eq $Project }) }
 
     $pushed = 0; $skipped = 0; $failures = 0; $dirty = $false
@@ -1440,7 +1647,7 @@ function Invoke-Push([string]$Project, [switch]$DryRun, [switch]$Quiet) {
             if ($r.entry) { continue }
             # bootstrap rule: matching copies with no record are recorded, not pushed
             if ($DryRun) { continue }
-            Set-LedgerEntry $ledger $r.project $r.id $r.local_md5 $r.remote_md5
+            Set-LedgerEntry $ledger $r.project $r.id $r.local_md5 $r.remote_md5 $r.app
             $bootstrapCount++
             $dirty = $true
             continue
@@ -1460,8 +1667,8 @@ function Invoke-Push([string]$Project, [switch]$DryRun, [switch]$Quiet) {
         }
         Write-Info "  pushing $label"
         try {
-            Copy-Up $r.local.path (ConvertTo-DriveUrl $cfg "projects/$($r.project)/$($r.id).jsonl")
-            Set-LedgerEntry $ledger $r.project $r.id $r.local_md5 $r.local_md5
+            Copy-Up $r.local.path (ConvertTo-DriveUrl $cfg "$(Get-RemoteBase $r.app)/$($r.project)/$($r.id).jsonl")
+            Set-LedgerEntry $ledger $r.project $r.id $r.local_md5 $r.local_md5 $r.app
             $pushed++; $dirty = $true
         } catch {
             Write-Warn2 "  [!]  push failed for ${label}: $($_.Exception.Message)"
@@ -1474,18 +1681,18 @@ function Invoke-Push([string]$Project, [switch]$DryRun, [switch]$Quiet) {
     }
 }
 
-function Invoke-Pull([string]$Project, [switch]$DryRun, [switch]$Quiet) {
+function Invoke-Pull([string]$Project, [string]$App, [switch]$DryRun, [switch]$Quiet) {
     if ($Quiet) { $script:Quiet = $true }
     Invoke-WithTransferLock $DryRun {
     $cfg = Get-SessiumConfig
     $ledger = Get-Ledger
-    $localMap = Get-LocalSessions
-    $remoteMap = @{}
-    try { $remoteMap = Get-RemoteSessions $cfg } catch {
-        Write-Warn2 "  [!]  remote unreachable ($($_.Exception.Message)) — nothing can be pulled"
-        exit 1
+    try {
+        $col = Get-CollectRows $cfg $App $ledger $true
+    } catch {
+        Write-Fail "cannot reach Drive: $($_.Exception.Message)"
+        return
     }
-    $rows = Get-Classification $localMap $remoteMap $ledger
+    $rows = $col.rows
     if ($Project) { $rows = @($rows | Where-Object { $_.project -eq $Project }) }
 
     $pulled = 0; $skipped = 0; $failures = 0; $dirty = $false
@@ -1495,7 +1702,7 @@ function Invoke-Pull([string]$Project, [switch]$DryRun, [switch]$Quiet) {
             $inSync++
             if ($r.entry) { continue }
             if ($DryRun) { continue }
-            Set-LedgerEntry $ledger $r.project $r.id $r.local_md5 $r.remote_md5
+            Set-LedgerEntry $ledger $r.project $r.id $r.local_md5 $r.remote_md5 $r.app
             $dirty = $true
             continue
         }
@@ -1514,9 +1721,10 @@ function Invoke-Pull([string]$Project, [switch]$DryRun, [switch]$Quiet) {
         }
         Write-Info "  pulling $label"
         try {
-            $dest = Get-LocalSessionPath $r.project $r.id
-            Copy-Down (ConvertTo-DriveUrl $cfg "projects/$($r.project)/$($r.id).jsonl") $dest
-            Set-LedgerEntry $ledger $r.project $r.id $r.remote_md5 $r.remote_md5
+            # codex: the mtime drives the synthesized rollout-<mtime>-<uuid> path
+            $dest = Get-LocalSessionPath $r.project $r.id $r.app $r.remote.mtime
+            Copy-Down (ConvertTo-DriveUrl $cfg "$(Get-RemoteBase $r.app)/$($r.project)/$($r.id).jsonl") $dest
+            Set-LedgerEntry $ledger $r.project $r.id $r.remote_md5 $r.remote_md5 $r.app
             $pulled++; $dirty = $true
         } catch {
             Write-Warn2 "  [!]  pull failed for ${label}: $($_.Exception.Message)"
@@ -1529,20 +1737,28 @@ function Invoke-Pull([string]$Project, [switch]$DryRun, [switch]$Quiet) {
     }
 }
 
-function Invoke-Sync([string]$Project, [string]$Only, [switch]$Interactive,
+function Invoke-Sync([string]$Project, [string]$Only, [string]$App, [switch]$Interactive,
                      [switch]$DryRun, [switch]$Quiet) {
     if ($Quiet) { $script:Quiet = $true }
     Invoke-WithTransferLock $DryRun {
     $cfg = Get-SessiumConfig
-    if ($Only) { return (Invoke-SyncOnly $Only $DryRun) }
-    $ledger = Get-Ledger
-    $localMap = Get-LocalSessions
-    $remoteMap = @{}
-    try { $remoteMap = Get-RemoteSessions $cfg } catch {
-        Write-Warn2 "  [!]  remote unreachable ($($_.Exception.Message)) — nothing can sync"
-        exit 1
+    if ($Only) {
+        # sync --only memory/skills walks the CLAUDE tree's memory/ and skills/
+        # folders — codex has no such folders, so --app codex here is a mistake
+        if ($App -eq "codex") {
+            Write-Fail "--only memory/skills syncs Claude Code folders — drop --app or use --app claude"
+            return
+        }
+        return (Invoke-SyncOnly $Only $DryRun)
     }
-    $rows = Get-Classification $localMap $remoteMap $ledger
+    $ledger = Get-Ledger
+    try {
+        $col = Get-CollectRows $cfg $App $ledger $true
+    } catch {
+        Write-Fail "cannot reach Drive: $($_.Exception.Message)"
+        return
+    }
+    $rows = $col.rows
     if ($Project) { $rows = @($rows | Where-Object { $_.project -eq $Project }) }
 
     $wantInteractive = $Interactive -or (Get-WantInteractive)
@@ -1550,11 +1766,12 @@ function Invoke-Sync([string]$Project, [string]$Only, [switch]$Interactive,
     $inSync = 0; $dirty = $false
     foreach ($r in $rows) {
         $label = "{0}/{1}" -f $r.project, (Get-ShortId $r.id)
+        $rUrl = ConvertTo-DriveUrl $cfg "$(Get-RemoteBase $r.app)/$($r.project)/$($r.id).jsonl"
         switch ($r.state) {
             "in-sync" {
                 $inSync++
                 if (-not $r.entry -and -not $DryRun) {
-                    Set-LedgerEntry $ledger $r.project $r.id $r.local_md5 $r.remote_md5
+                    Set-LedgerEntry $ledger $r.project $r.id $r.local_md5 $r.remote_md5 $r.app
                     $dirty = $true
                 }
             }
@@ -1566,8 +1783,8 @@ function Invoke-Sync([string]$Project, [string]$Only, [switch]$Interactive,
                 }
                 Write-Info "  pushing $label"
                 try {
-                    Copy-Up $r.local.path (ConvertTo-DriveUrl $cfg "projects/$($r.project)/$($r.id).jsonl")
-                    Set-LedgerEntry $ledger $r.project $r.id $r.local_md5 $r.local_md5
+                    Copy-Up $r.local.path $rUrl
+                    Set-LedgerEntry $ledger $r.project $r.id $r.local_md5 $r.local_md5 $r.app
                     $pushed++; $dirty = $true
                 } catch {
                     Write-Warn2 "  [!]  push failed for ${label}: $($_.Exception.Message)"
@@ -1582,9 +1799,9 @@ function Invoke-Sync([string]$Project, [string]$Only, [switch]$Interactive,
                 }
                 Write-Info "  pulling $label"
                 try {
-                    $dest = Get-LocalSessionPath $r.project $r.id
-                    Copy-Down (ConvertTo-DriveUrl $cfg "projects/$($r.project)/$($r.id).jsonl") $dest
-                    Set-LedgerEntry $ledger $r.project $r.id $r.remote_md5 $r.remote_md5
+                    $dest = Get-LocalSessionPath $r.project $r.id $r.app $r.remote.mtime
+                    Copy-Down $rUrl $dest
+                    Set-LedgerEntry $ledger $r.project $r.id $r.remote_md5 $r.remote_md5 $r.app
                     $pulled++; $dirty = $true
                 } catch {
                     Write-Warn2 "  [!]  pull failed for ${label}: $($_.Exception.Message)"
@@ -1599,8 +1816,8 @@ function Invoke-Sync([string]$Project, [string]$Only, [switch]$Interactive,
                 }
                 Write-Info "  pushing (new) $label"
                 try {
-                    Copy-Up $r.local.path (ConvertTo-DriveUrl $cfg "projects/$($r.project)/$($r.id).jsonl")
-                    Set-LedgerEntry $ledger $r.project $r.id $r.local_md5 $r.local_md5
+                    Copy-Up $r.local.path $rUrl
+                    Set-LedgerEntry $ledger $r.project $r.id $r.local_md5 $r.local_md5 $r.app
                     $pushed++; $dirty = $true
                 } catch {
                     Write-Warn2 "  [!]  push failed for ${label}: $($_.Exception.Message)"
@@ -1615,9 +1832,9 @@ function Invoke-Sync([string]$Project, [string]$Only, [switch]$Interactive,
                 }
                 Write-Info "  pulling (new) $label"
                 try {
-                    $dest = Get-LocalSessionPath $r.project $r.id
-                    Copy-Down (ConvertTo-DriveUrl $cfg "projects/$($r.project)/$($r.id).jsonl") $dest
-                    Set-LedgerEntry $ledger $r.project $r.id $r.remote_md5 $r.remote_md5
+                    $dest = Get-LocalSessionPath $r.project $r.id $r.app $r.remote.mtime
+                    Copy-Down $rUrl $dest
+                    Set-LedgerEntry $ledger $r.project $r.id $r.remote_md5 $r.remote_md5 $r.app
                     $pulled++; $dirty = $true
                 } catch {
                     Write-Warn2 "  [!]  pull failed for ${label}: $($_.Exception.Message)"
@@ -1665,7 +1882,7 @@ function Show-DiffRow($Row) {
         Write-Info "  local  : (absent)"
     }
     if ($Row.remote) {
-        $tmp = Get-RemoteTranscript (Get-SessiumConfig) $Row.project $Row.id
+        $tmp = Get-RemoteTranscript (Get-SessiumConfig) $Row.project $Row.id $Row.app
         if ($tmp) {
             $t = Read-Transcript $tmp
             Remove-Item -LiteralPath $tmp -Force
@@ -1687,15 +1904,16 @@ function Show-DiffRow($Row) {
     }
 }
 
-function Invoke-Diff([string]$Prefix, [string]$Project, [switch]$Json, [switch]$Messages) {
+function Invoke-Diff([string]$Prefix, [string]$Project, [string]$App, [switch]$Json, [switch]$Messages) {
     $cfg = Get-SessiumConfig
     $ledger = Get-Ledger
-    $localMap = Get-LocalSessions
-    $remoteMap = @{}
-    try { $remoteMap = Get-RemoteSessions $cfg } catch {
-        Write-Warn2 "  [!]  remote unreachable — diffing against nothing on the remote side"
+    try {
+        $col = Get-CollectRows $cfg $App $ledger $true
+    } catch {
+        Write-Fail "cannot reach Drive: $($_.Exception.Message)"
+        return
     }
-    $rows = Get-Classification $localMap $remoteMap $ledger
+    $rows = $col.rows
     if ($Project) { $rows = @($rows | Where-Object { $_.project -eq $Project }) }
     $row = Find-OneSession $Prefix $rows
 
@@ -1707,7 +1925,7 @@ function Invoke-Diff([string]$Prefix, [string]$Project, [switch]$Json, [switch]$
                 Write-Warn2 "  [!]  --messages needs both copies present (pull first if the remote side is missing)"
             } else {
                 $localMsgs = Get-TranscriptMessages $row.local.path
-                $tmp = Get-RemoteTranscript $cfg $row.project $row.id
+                $tmp = Get-RemoteTranscript $cfg $row.project $row.id $row.app
                 $remoteMsgs = @()
                 if ($tmp) { $remoteMsgs = Get-TranscriptMessages $tmp }
                 $preview = Get-MessageDivergence $localMsgs $remoteMsgs
@@ -1738,7 +1956,7 @@ function Invoke-Diff([string]$Prefix, [string]$Project, [switch]$Json, [switch]$
                 messages = 0
                 last = ""
             }
-            $tmp2 = Get-RemoteTranscript $cfg $row.project $row.id
+            $tmp2 = Get-RemoteTranscript $cfg $row.project $row.id $row.app
             if ($tmp2) {
                 $t = Read-Transcript $tmp2
                 Remove-Item -LiteralPath $tmp2 -Force
@@ -1755,6 +1973,7 @@ function Invoke-Diff([string]$Prefix, [string]$Project, [switch]$Json, [switch]$
             }
         }
         $doc = @{
+            app = $row.app
             project = $row.project
             id = $row.id
             state = $row.state
@@ -1799,15 +2018,16 @@ function Invoke-Diff([string]$Prefix, [string]$Project, [switch]$Json, [switch]$
     }
 }
 
-function Invoke-Resolve([string]$Prefix, [switch]$Interactive, [string]$Project) {
+function Invoke-Resolve([string]$Prefix, [switch]$Interactive, [string]$Project, [string]$App) {
     $cfg = Get-SessiumConfig
     $ledger = Get-Ledger
-    $localMap = Get-LocalSessions
-    $remoteMap = @{}
-    try { $remoteMap = Get-RemoteSessions $cfg } catch {
-        Write-Fail "remote unreachable ($($_.Exception.Message)) — nothing to resolve against"
+    try {
+        $col = Get-CollectRows $cfg $App $ledger $true
+    } catch {
+        Write-Fail "cannot reach Drive: $($_.Exception.Message)"
+        return
     }
-    $rows = Get-Classification $localMap $remoteMap $ledger
+    $rows = $col.rows
     if ($Project) { $rows = @($rows | Where-Object { $_.project -eq $Project }) }
     $row = Find-OneSession $Prefix $rows
 
@@ -1822,20 +2042,25 @@ function Invoke-Resolve([string]$Prefix, [switch]$Interactive, [string]$Project)
     if ($outcome -ne "skipped") { Save-Ledger $ledger }
 }
 
-function Invoke-Revert([string]$Prefix, [switch]$DryRun) {
-    $root = Join-Path (Get-ClaudeDir) "projects"
-    if (-not (Test-Path -LiteralPath $root)) {
-        Write-Fail "no revert copies found (nothing at $root)"
-    }
+function Invoke-Revert([string]$Prefix, [string]$App, [switch]$DryRun) {
     $found = New-Object System.Collections.Generic.List[object]
-    foreach ($projDir in (Get-ChildItem -LiteralPath $root -Directory)) {
-        $revDir = Join-Path $projDir.FullName "revert"
-        if (-not (Test-Path -LiteralPath $revDir)) { continue }
-        foreach ($f in (Get-ChildItem -LiteralPath $revDir -File -Filter "*.jsonl")) {
-            if (-not $f.Name.StartsWith("$Prefix.revert-")) { continue }
-            $sid = $f.Name.Substring(0, $f.Name.IndexOf(".revert-"))
-            $found.Add(@{ project = $projDir.Name; sid = $sid; path = $f.FullName })
+    $anyRoot = $false
+    foreach ($app in (Get-SelectedApps $App)) {
+        $root = Get-LocalRoot $app
+        if (-not (Test-Path -LiteralPath $root)) { continue }
+        $anyRoot = $true
+        foreach ($projDir in (Get-ChildItem -LiteralPath $root -Directory)) {
+            $revDir = Join-Path $projDir.FullName "revert"
+            if (-not (Test-Path -LiteralPath $revDir)) { continue }
+            foreach ($f in (Get-ChildItem -LiteralPath $revDir -File -Filter "*.jsonl")) {
+                if (-not $f.Name.StartsWith("$Prefix.revert-")) { continue }
+                $sid = $f.Name.Substring(0, $f.Name.IndexOf(".revert-"))
+                $found.Add(@{ app = $app; project = $projDir.Name; sid = $sid; path = $f.FullName })
+            }
         }
+    }
+    if (-not $anyRoot) {
+        Write-Fail "no revert copies found (nothing at $(Get-LocalRoot 'claude'))"
     }
     if ($found.Count -eq 0) {
         Write-Fail "no revert copies found for sessions starting with '$Prefix'"
@@ -1872,15 +2097,16 @@ function Invoke-Revert([string]$Prefix, [switch]$DryRun) {
     }
     $chosen = $copies[$n - 1]
     $parts = $key -split "/", 2
-    $target = Get-LocalSessionPath $parts[0] $parts[1]
+    $revApp = "$($copies[0].app)"
+    $target = Get-LocalSessionPath $parts[0] $parts[1] $revApp
     if (Test-Path -LiteralPath $target) {
-        Save-LocalRevert $parts[0] $parts[1] $target | Out-Null    # keep the current copy
+        Save-LocalRevert $parts[0] $parts[1] $target $revApp | Out-Null    # keep the current copy
     }
     Move-Item -LiteralPath $chosen.path -Destination $target
     $ledger = Get-Ledger
     if ($ledger.sessions.ContainsKey($key)) {
         $entry = $ledger.sessions[$key]
-        Set-LedgerEntry $ledger $parts[0] $parts[1] (Get-FileMd5 $target) $entry.remote_md5
+        Set-LedgerEntry $ledger $parts[0] $parts[1] (Get-FileMd5 $target) $entry.remote_md5 $revApp
         Save-Ledger $ledger
     }
     Write-Info "  restored $(Split-Path -Leaf $chosen.path) -> $target"
@@ -1890,17 +2116,16 @@ function Invoke-Revert([string]$Prefix, [switch]$DryRun) {
 <# Restore a content-addressed history snapshot (see 'sessium log <id>').
    The copy it displaces is snapshotted first, so checkout never loses
    bytes either. #>
-function Invoke-Checkout([string]$Prefix, [int]$Seq, [switch]$DryRun) {
+function Invoke-Checkout([string]$Prefix, [int]$Seq, [string]$App, [switch]$DryRun) {
     $cfg = Get-SessiumConfig
     $ledger = Get-Ledger
-    $localMap = Get-LocalSessions
-    $remoteMap = @{}
-    try { $remoteMap = Get-RemoteSessions $cfg } catch {
+    $col = Get-CollectRows $cfg $App $ledger $false
+    $rows = $col.rows
+    if (-not $col.reachable) {
         Write-Warn2 "  [!]  cannot reach Drive right now — searching locally only"
     }
-    $rows = Get-Classification $localMap $remoteMap $ledger
     $row = Find-OneSession $Prefix $rows
-    $hDir = Join-Path (Join-Path (Join-Path (Join-Path (Get-ClaudeDir) "projects") $row.project) $row.id) "history"
+    $hDir = Join-Path (Join-Path (Join-Path (Get-LocalRoot $row.app) $row.project) $row.id) "history"
     $snaps = @()
     if (Test-Path -LiteralPath $hDir) {
         $snaps = @(Get-ChildItem -LiteralPath $hDir -File -Filter "*.jsonl" | Sort-Object Name)
@@ -1921,20 +2146,21 @@ function Invoke-Checkout([string]$Prefix, [int]$Seq, [switch]$DryRun) {
         }
         exit 1
     }
-    $target = Get-LocalSessionPath $row.project $row.id
+    $target = Get-LocalSessionPath $row.project $row.id $row.app
     if ($DryRun) {
         Write-Info "dry-run: would restore $($chosen.Name) -> $target"
         return 0
     }
     if (Test-Path -LiteralPath $target) {          # preserve what it replaces
-        $displaced = Save-LocalRevert $row.project $row.id $target
-        Save-HistorySnapshot $row.project $row.id $displaced | Out-Null
+        $displaced = Save-LocalRevert $row.project $row.id $target $row.app
+        Save-HistorySnapshot $row.project $row.id $displaced $row.app | Out-Null
     }
     Move-Item -LiteralPath $chosen.FullName -Destination $target -Force
     Write-Info "restored $($chosen.Name) -> $target"
-    if ($ledger.sessions.ContainsKey("$($row.project)/$($row.id)")) {
+    $lKey = Get-LedgerKey $row.project $row.id $row.app
+    if ($ledger.sessions.ContainsKey($lKey)) {
         Set-LedgerEntry $ledger $row.project $row.id (Get-FileMd5 $target) `
-            $ledger.sessions["$($row.project)/$($row.id)"].remote_md5
+            $ledger.sessions[$lKey].remote_md5 $row.app
         Save-Ledger $ledger
         Write-Info "next: 'sessium sync' pushes the restored copy to Drive"
     }
@@ -1944,10 +2170,11 @@ function Invoke-Checkout([string]$Prefix, [int]$Seq, [switch]$DryRun) {
 <# Prune revert/ + history/ copies beyond -Keep N most recent per session
    (default 10). Canonical transcripts and the ledger are never touched.
    -DryRun lists what would go. #>
-function Invoke-Gc([int]$Keep = 10, [switch]$DryRun) {
-    $root = Join-Path (Get-ClaudeDir) "projects"
+function Invoke-Gc([int]$Keep = 10, [string]$App, [switch]$DryRun) {
     $doomed = New-Object System.Collections.Generic.List[object]
-    if (Test-Path -LiteralPath $root) {
+    foreach ($app in (Get-SelectedApps $App)) {
+        $root = Get-LocalRoot $app
+        if (-not (Test-Path -LiteralPath $root)) { continue }
         foreach ($projDir in (Get-ChildItem -LiteralPath $root -Directory | Sort-Object Name)) {
             $groups = @{}
             $revDir = Join-Path $projDir.FullName "revert"
@@ -2098,23 +2325,28 @@ function Get-SessionCwd([string]$Path) {
    path comes from the transcript's own cwd stamps, so this works across
    machines despite the lossy munging. -Adopt rehomes the sessions first
    when the repo is not at this machine's matching path. #>
-function Invoke-Open([string]$Prefix, [string]$Project, [switch]$Go,
+function Invoke-Open([string]$Prefix, [string]$Project, [string]$App, [switch]$Go,
                      [switch]$Adopt, [switch]$DryRun) {
     $cfg = Get-SessiumConfig
     $ledger = Get-Ledger
-    $localMap = Get-LocalSessions
-    $remoteMap = @{}
-    try { $remoteMap = Get-RemoteSessions $cfg } catch {
+    $col = Get-CollectRows $cfg $App $ledger $false
+    $rows = $col.rows
+    if (-not $col.reachable) {
         Write-Warn2 "  [!]  cannot reach Drive right now — searching locally only"
     }
-    $rows = Get-Classification $localMap $remoteMap $ledger
     if ($Project) { $rows = @($rows | Where-Object { $_.project -eq $Project }) }
     $row = Find-OneSession $Prefix $rows
 
     if (-not $row.local) {
         Write-Fail "$($row.project)/$($row.id) is not on this machine — run 'sessium pull' first"
     }
-    $cwd = Get-SessionCwd $row.local.path
+    $cwd = ""
+    if ($row.app -eq "codex") {
+        $meta = Get-CodexMeta $row.local.path
+        if ($meta) { $cwd = $meta.cwd }
+    } else {
+        $cwd = Get-SessionCwd $row.local.path
+    }
     if (-not $cwd) {
         # lossy inverse of munge(), as a last resort — flagged as a guess
         $cwd = $row.project.Replace("-", "\")
@@ -2129,14 +2361,16 @@ function Invoke-Open([string]$Prefix, [string]$Project, [switch]$Go,
         Invoke-Adopt $row.project $cwd
         return
     }
-    $resume = "cd $cwd; claude --resume $($row.id)"
+    $binary = "claude"; $goArgs = "claude --resume $($row.id)"
+    if ($row.app -eq "codex") { $binary = "codex"; $goArgs = "codex resume $($row.id)" }
+    $resume = "cd $cwd; $goArgs"
     if ($Go) {
         if ($DryRun) {
             Write-Info "dry-run: would launch: $resume"
             return
         }
         Start-Process -FilePath "powershell" -WorkingDirectory $cwd `
-            -ArgumentList "-NoExit", "-Command", "claude --resume $($row.id)"
+            -ArgumentList "-NoExit", "-Command", $goArgs
         return 0
     }
     Write-Info $resume
@@ -2145,22 +2379,21 @@ function Invoke-Open([string]$Prefix, [string]$Project, [switch]$Go,
 
 <# No id: git-style alias for `list`. With an id: list the session's
    content-addressed history snapshots (SPEC section 10). #>
-function Invoke-Log([string]$Prefix, [string]$Project, [switch]$Titles, [switch]$Json) {
+function Invoke-Log([string]$Prefix, [string]$Project, [string]$App, [switch]$Titles, [switch]$Json) {
     if (-not $Prefix) {
-        Invoke-ListSessions $Project -Titles:$Titles -Json:$Json
+        Invoke-ListSessions $Project -App $App -Titles:$Titles -Json:$Json
         return 0
     }
     $cfg = Get-SessiumConfig
     $ledger = Get-Ledger
-    $localMap = Get-LocalSessions
-    $remoteMap = @{}
-    try { $remoteMap = Get-RemoteSessions $cfg } catch {
+    $col = Get-CollectRows $cfg $App $ledger $false
+    $rows = $col.rows
+    if (-not $col.reachable) {
         Write-Warn2 "  [!]  cannot reach Drive right now — searching locally only"
     }
-    $rows = Get-Classification $localMap $remoteMap $ledger
     if ($Project) { $rows = @($rows | Where-Object { $_.project -eq $Project }) }
     $row = Find-OneSession $Prefix $rows
-    $hDir = Join-Path (Join-Path (Join-Path (Join-Path (Get-ClaudeDir) "projects") $row.project) $row.id) "history"
+    $hDir = Join-Path (Join-Path (Join-Path (Get-LocalRoot $row.app) $row.project) $row.id) "history"
     $snaps = @()
     if (Test-Path -LiteralPath $hDir) {
         $snaps = @(Get-ChildItem -LiteralPath $hDir -File -Filter "*.jsonl" | Sort-Object Name)
@@ -2228,7 +2461,7 @@ function Snippet-Around([string]$Text, [string]$Query, [int]$Width = 60) {
 <# Literal search over local transcripts. Title matches outrank body
    matches; Drive-only sessions need a pull first (documented). #>
 function Invoke-SearchLocal([string]$Query, [string]$Project, [int]$Limit) {
-    $localMap = Get-LocalSessions
+    $localMap = Get-LocalSessions "claude"
     $q = $Query.ToLower()
     $hits = New-Object System.Collections.Generic.List[object]
     foreach ($proj in ($localMap.Keys | Sort-Object)) {
@@ -2323,7 +2556,10 @@ function Show-SearchHits($Hits, [int]$Limit) {
    when configured. Local transcripts only - pull first to include
    Drive-only sessions. #>
 function Invoke-Search([string]$Query, [string]$Project, [int]$Limit,
-                       [switch]$Semantic, [switch]$Json) {
+                       [string]$App, [switch]$Semantic, [switch]$Json) {
+    # v1 limit (SPEC §7): the literal/semantic search pipeline parses Claude
+    # transcripts only — codex rollouts use a different format
+    if ($App -eq "codex") { Write-Fail "search reads Claude Code transcripts only for now" }
     $cfg = Get-SessiumConfig
     $hits = @()
     if ($Semantic) {
@@ -2653,15 +2889,18 @@ function ConvertTo-ExportIndexHtml($Items) {
 
 <# Write sessions out as Markdown (default) or HTML. -All exports every local
    session and, with -Html, adds an index.html viewer page. Same contract as
-   Linux cmd_export(). #>
+   Linux cmd_export(). Claude transcripts only for now — codex rollouts use
+   a different format. #>
 function Invoke-Export([string]$Prefix, [string]$OutDir, [string]$Project,
-                       [switch]$All, [switch]$Html) {
+                       [string]$App, [switch]$All, [switch]$Html) {
+    # v1 limit (SPEC §7): the export renderer parses Claude transcripts only
+    if ($App -eq "codex") { Write-Fail "export reads Claude Code transcripts only for now" }
     # Path.expanduser(): a leading ~ means home
     $out = "$OutDir"
     if ($out -like "~*") { $out = $out -replace '^~', $HOME }
     if (-not $out) { $out = "sessium-export" }
 
-    $localMap = Get-LocalSessions
+    $localMap = Get-LocalSessions "claude"
     if ($Project) {
         $filtered = @{}
         if ($localMap.ContainsKey($Project)) { $filtered[$Project] = $localMap[$Project] }
@@ -2673,9 +2912,9 @@ function Invoke-Export([string]$Prefix, [string]$OutDir, [string]$Project,
         }
         $cfg = Get-SessiumConfig
         $remoteMap = @{}
-        try { $remoteMap = Get-RemoteSessions $cfg } catch { }
+        try { $remoteMap = Get-RemoteSessions $cfg "claude" } catch { }
         $ledger = Get-Ledger
-        $rows = Get-Classification $localMap $remoteMap $ledger
+        $rows = Get-Classification "claude" $localMap $remoteMap $ledger
         if ($Project) { $rows = @($rows | Where-Object { $_.project -eq $Project }) }
         $row = Find-OneSession $Prefix $rows
         if (-not $row.local) {
@@ -2703,7 +2942,7 @@ function Invoke-Export([string]$Prefix, [string]$OutDir, [string]$Project,
     }
     $count = 0
     foreach ($it in $items) {
-        $src = Get-LocalSessionPath $it.project $it.id
+        $src = Get-LocalSessionPath $it.project $it.id "claude"
         if (-not (Test-Path -LiteralPath $src)) {
             Write-Warn2 "  [!]  skipped $($it.id) (local copy vanished)"
             continue
@@ -2759,13 +2998,19 @@ function Invoke-Onboard {
         $nextSteps.Add(@{ what = "authorize rclone"; cmd = "sessium setup" })
     }
 
-    $localMap = Get-LocalSessions
+    $localMap = Get-LocalSessions "claude"
     $sessionCount = 0
     foreach ($k in $localMap.Keys) { $sessionCount += @($localMap[$k]).Count }
     if ($sessionCount -gt 0) {
         Write-Info "[OK] local repo: $($localMap.Count) project(s), $sessionCount session(s)"
     } else {
         Write-Warn2 "  [!]  no sessions found under $(Join-Path (Get-ClaudeDir) 'projects')"
+    }
+    $codexMap = Get-LocalSessions "codex"
+    $codexCount = 0
+    foreach ($k in $codexMap.Keys) { $codexCount += @($codexMap[$k]).Count }
+    if ($codexCount -gt 0) {
+        Write-Info "[OK] codex repo: $($codexMap.Count) project(s), $codexCount session(s)"
     }
 
     $ledgerPath = Get-StatePath
@@ -2832,7 +3077,7 @@ function Invoke-Onboard {
 
 function Show-Usage {
     Write-Info @"
-sessium $script:Version - git for Claude Code sessions (Drive remote)
+sessium $script:Version - git for Claude Code and Codex CLI sessions (Drive remote)
 
 usage: sessium <command> [args]
 
@@ -2861,7 +3106,7 @@ usage: sessium <command> [args]
   revert <id> [--dry-run]                  swap a kept revert copy back in
   checkout <id> <seq> [--dry-run]          restore a history snapshot (see 'log <id>')
   gc [--keep N] [--dry-run]                prune revert/ + history/ beyond N per session
-  open <id> [--go] [--adopt] [--dry-run]   print (or run) the claude --resume command
+  open <id> [--go] [--adopt] [--dry-run]   print (or run) the claude/codex resume command
   adopt <munged-folder> <repo-path> [--dry-run]
                                            rehome sessions to this machine's path
   export [<id>] [--all] [--html] [--out DIR] [--project <m>]
@@ -2872,6 +3117,11 @@ usage: sessium <command> [args]
 
 session ids: a prefix is enough ('sessium diff 9f8e'). Munged project names
 always start with '-' (e.g. -C--Users-me-repo) - fine after --project.
+
+--app claude|codex|all on the session commands (list, status, check, push,
+pull, sync, diff, resolve, revert, checkout, gc, open, log): which CLI's
+sessions this run touches - Claude Code, Codex CLI, or both (default).
+export and search read Claude Code transcripts only for now.
 
 --debug/--verbose prints every rclone call. Exit codes: 0 ok (skips are not failures),
 1 real failures. (Ctrl+C exits via the PowerShell console itself.)
@@ -2888,6 +3138,7 @@ function Invoke-Main([string[]]$CliArgs) {
         only = ""; limit = 0; keep = -1; name = ""
         print = $false; off = $false; interval = 0
         all = $false; out = ""; html = $false
+        app = "all"
     }
     $i = 0
     while ($i -lt $CliArgs.Count) {
@@ -2919,6 +3170,10 @@ function Invoke-Main([string[]]$CliArgs) {
         if ($a -eq "--project" -and ($i + 1) -lt $CliArgs.Count) {
             $opt.project = $CliArgs[$i + 1]; $i += 2; continue
         }
+        if ($a -like "--app=*") { $opt.app = $a.Substring(6); $i++; continue }
+        if ($a -eq "--app" -and ($i + 1) -lt $CliArgs.Count) {
+            $opt.app = $CliArgs[$i + 1]; $i += 2; continue
+        }
         if ($a -like "--only=*") { $opt.only = $a.Substring(7); $i++; continue }
         if ($a -eq "--only" -and ($i + 1) -lt $CliArgs.Count) {
             $opt.only = $CliArgs[$i + 1]; $i += 2; continue
@@ -2941,9 +3196,9 @@ function Invoke-Main([string[]]$CliArgs) {
     if ($positional.Count -gt 0) { $cmd = $positional[0]; $positional.RemoveAt(0) }
 
     switch ($cmd) {
-        "list"     { Invoke-ListSessions $opt.project -Titles:$opt.titles -Json:$opt.json; return 0 }
-        "status"   { Invoke-Status $opt.project -Json:$opt.json; return 0 }
-        "check"    { return (Invoke-Check -Full:$opt.full) }
+        "list"     { Invoke-ListSessions $opt.project -App $opt.app -Titles:$opt.titles -Json:$opt.json; return 0 }
+        "status"   { Invoke-Status $opt.project -App $opt.app -Json:$opt.json; return 0 }
+        "check"    { return (Invoke-Check -App $opt.app -Full:$opt.full) }
         "setup"    {
             if ($positional -contains "--encrypted") { return (Invoke-SetupEncrypted) }
             Invoke-Setup @($positional); return 0
@@ -2953,50 +3208,50 @@ function Invoke-Main([string[]]$CliArgs) {
             return (Invoke-Schedule $interval -Off:$opt.off -Print:$opt.print)
         }
         "hook"     { return (Invoke-Hook -Off:$opt.off -Print:$opt.print) }
-        "push"     { Invoke-Push $opt.project -DryRun:$opt.dryrun -Quiet:$opt.quiet; return 0 }
-        "pull"     { Invoke-Pull $opt.project -DryRun:$opt.dryrun -Quiet:$opt.quiet; return 0 }
-        "sync"     { Invoke-Sync $opt.project $opt.only -Interactive:$opt.interactive -DryRun:$opt.dryrun -Quiet:$opt.quiet; return 0 }
+        "push"     { Invoke-Push $opt.project -App $opt.app -DryRun:$opt.dryrun -Quiet:$opt.quiet; return 0 }
+        "pull"     { Invoke-Pull $opt.project -App $opt.app -DryRun:$opt.dryrun -Quiet:$opt.quiet; return 0 }
+        "sync"     { Invoke-Sync $opt.project $opt.only -App $opt.app -Interactive:$opt.interactive -DryRun:$opt.dryrun -Quiet:$opt.quiet; return 0 }
         "version"  { return (Invoke-Version) }
         "log" {
             $prefix = ""
             if ($positional.Count -gt 0) { $prefix = $positional[0] }
-            return (Invoke-Log $prefix $opt.project -Titles:$opt.titles -Json:$opt.json)
+            return (Invoke-Log $prefix $opt.project -App $opt.app -Titles:$opt.titles -Json:$opt.json)
         }
         "open" {
             if ($positional.Count -lt 1) { Write-Fail "usage: sessium open <id> [--go] [--adopt]  (prefix ok)" }
-            return (Invoke-Open $positional[0] $opt.project -Go:$opt.go -Adopt:$opt.adopt -DryRun:$opt.dryrun)
+            return (Invoke-Open $positional[0] $opt.project -App $opt.app -Go:$opt.go -Adopt:$opt.adopt -DryRun:$opt.dryrun)
         }
         "diff" {
             if ($positional.Count -lt 1) { Write-Fail "usage: sessium diff <id> [--messages] [--json]  (prefix ok)" }
-            Invoke-Diff $positional[0] $opt.project -Json:$opt.json -Messages:$opt.messages; return 0
+            Invoke-Diff $positional[0] $opt.project -App $opt.app -Json:$opt.json -Messages:$opt.messages; return 0
         }
         "resolve" {
             if ($positional.Count -lt 1) { Write-Fail "usage: sessium resolve <id>  (prefix ok)" }
-            Invoke-Resolve $positional[0] -Interactive:$opt.interactive -Project $opt.project
+            Invoke-Resolve $positional[0] -Interactive:$opt.interactive -Project $opt.project -App $opt.app
             return 0
         }
         "revert" {
             if ($positional.Count -lt 1) { Write-Fail "usage: sessium revert <id>  (prefix ok)" }
-            return (Invoke-Revert $positional[0] -DryRun:$opt.dryrun)
+            return (Invoke-Revert $positional[0] -App $opt.app -DryRun:$opt.dryrun)
         }
         "checkout" {
             if ($positional.Count -lt 2) { Write-Fail "usage: sessium checkout <id> <seq>  (prefix ok)" }
-            return (Invoke-Checkout $positional[0] ([int]$positional[1]) -DryRun:$opt.dryrun)
+            return (Invoke-Checkout $positional[0] ([int]$positional[1]) -App $opt.app -DryRun:$opt.dryrun)
         }
         "gc" {
             $keep = $opt.keep; if ($keep -lt 0) { $keep = 10 }
-            return (Invoke-Gc -Keep $keep -DryRun:$opt.dryrun)
+            return (Invoke-Gc -Keep $keep -App $opt.app -DryRun:$opt.dryrun)
         }
         "search" {
             if ($positional.Count -lt 1) { Write-Fail "usage: sessium search <query> [--project <m>] [--limit N] [--semantic] [--json]" }
             $limit = $opt.limit; if ($limit -le 0) { $limit = $script:DefaultSearchLimit }
-            return (Invoke-Search $positional[0] $opt.project $limit -Semantic:$opt.semantic -Json:$opt.json)
+            return (Invoke-Search $positional[0] $opt.project $limit -App $opt.app -Semantic:$opt.semantic -Json:$opt.json)
         }
         "seek" {
             return (Invoke-Seek $opt.name)
         }
         "export" {
-            return (Invoke-Export $positional[0] $opt.out $opt.project -All:$opt.all -Html:$opt.html)
+            return (Invoke-Export $positional[0] $opt.out $opt.project -App $opt.app -All:$opt.all -Html:$opt.html)
         }
         "onboard" {
             return (Invoke-Onboard)

@@ -49,9 +49,13 @@ $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("sessium-ci-" + [guid]::NewG
 $proj = "-home-test-proj"
 $claudeA = Join-Path $tmp "machine-a\.claude"
 $claudeB = Join-Path $tmp "machine-b\.claude"
+$codexA = Join-Path $tmp "machine-a\.codex"
+$codexB = Join-Path $tmp "machine-b\.codex"
 $drive = Join-Path $tmp "drive"
 New-Item -ItemType Directory -Path (Join-Path $claudeA "projects\$proj") -Force | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $claudeB "projects\$proj") -Force | Out-Null
+New-Item -ItemType Directory -Path $codexA -Force | Out-Null
+New-Item -ItemType Directory -Path $codexB -Force | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $drive "backup\projects\$proj") -Force | Out-Null
 
 # a two-turn transcript as jsonl (summary + meta + command + real user + assistant)
@@ -74,17 +78,22 @@ function Write-Exact([string]$Path, [string]$Text) {
 $sessionA = Join-Path $claudeA "projects\$proj\aaa.jsonl"
 Write-Exact $sessionA $sessionText
 
-# Machine switch helper: ALWAYS move SESSIUM_CLAUDE_DIR and SESSIUM_STATE
-# together. A stale SESSIUM_STATE makes one machine's sync classify against
-# the other's ledger — A's edit-sync ran on B's ledger, recorded A's edited
-# md5s there, and B's sync then re-pushed the pre-edit file over A's edit
-# (every later assertion in the roundtrip failed). Use-Machine prevents it.
+# Machine switch helper: ALWAYS move SESSIUM_CLAUDE_DIR, SESSIUM_CODEX_HOME
+# and SESSIUM_STATE together. A stale SESSIUM_STATE makes one machine's sync
+# classify against the other's ledger — A's edit-sync ran on B's ledger,
+# recorded A's edited md5s there, and B's sync then re-pushed the pre-edit
+# file over A's edit (every later assertion in the roundtrip failed).
+# Use-Machine prevents it. SESSIUM_CODEX_HOME is set even for the claude-only
+# sections: default --app all scans the codex tree on every command, and an
+# unset variable would fall through to the developer's real ~/.codex.
 function Use-Machine([string]$Which) {
     if ($Which -eq "A") {
         $env:SESSIUM_CLAUDE_DIR = $claudeA
+        $env:SESSIUM_CODEX_HOME = $codexA
         $env:SESSIUM_STATE = Join-Path $tmp "machine-a\state.json"
     } else {
         $env:SESSIUM_CLAUDE_DIR = $claudeB
+        $env:SESSIUM_CODEX_HOME = $codexB
         $env:SESSIUM_STATE = Join-Path $tmp "machine-b\state.json"
     }
 }
@@ -593,6 +602,110 @@ Assert-True ($r.text -notmatch "retry 1/2") "permanent errors are not retried"
 
 Remove-Item Env:\SESSIUM_FAKE_FAIL_FIRST -ErrorAction SilentlyContinue
 Remove-Item Env:\SESSIUM_RETRY_DELAY_SCALE -ErrorAction SilentlyContinue
+
+# --- codex: two-app sync (SPEC §1-§7) -----------------------------------------
+# One rollout per machine in SESSIUM_CODEX_HOME/sessions/YYYY/MM/DD; the fake
+# Drive holds codex/ as a SEPARATE tree from projects/. Mirrors the Linux
+# CodexTests: roundtrip, quarantine-on-conflict, --app scoping, the
+# --only x --app guard, open's codex resume line, export/search rejection.
+
+Write-Host "== codex: two-app sync =="
+
+$codexProj = "-home-codex-proj"
+$codexId = "0198aaaa-bbbb-7ccc-8ddd-eeeeeeeeeeee"
+$codexDrive = Join-Path $drive "codex\projects\$codexProj\$codexId.jsonl"
+function New-RolloutText([string]$UserText, [string]$AssistantText) {
+    $meta = '{"type":"session_meta","payload":{"session_id":"' + $codexId + '","cwd":"/home/codex/proj"}}'
+    $u = '{"type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"' + $UserText + '"}]}}'
+    $a = '{"type":"response_item","payload":{"role":"assistant","content":[{"type":"output_text","text":"' + $AssistantText + '"}]}}'
+    return ($meta + "`n" + $u + "`n" + $a + "`n")
+}
+function Write-Rollout([string]$HomeRoot, [string]$Body) {
+    $dir = Join-Path $HomeRoot "sessions\2026\11\09"
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    Write-Exact (Join-Path $dir "rollout-2026-11-09T10-00-00-$codexId.jsonl") $Body
+}
+
+Use-Machine "A"
+Write-Rollout $codexA (New-RolloutText "hey codex, build a rocket" "ok, building")
+
+# status: the codex session classifies new-here, tagged [codex]
+$r = Run-Sessium @("status")
+Assert-True ($r.code -eq 0) "codex: status exits 0 with a codex session present"
+Assert-True ($r.text -match "\[codex\] $codexProj") "status tags codex rows with [codex]"
+
+# --app scoping: claude-only status shows no codex rows
+$r = Run-Sessium @("status", "--app", "claude")
+Assert-True ($r.text -notmatch "\[codex\]") "--app claude scopes status to the claude tree"
+
+# status --json --app codex: app field + classification ride along
+$r = Run-Sessium @("status", "--json", "--app", "codex")
+Assert-True ($r.code -eq 0) "status --json --app codex exits 0"
+$json = $r.text | ConvertFrom-Json
+Assert-True ($json.sessions -eq 1) "status --json --app codex counts one session"
+Assert-True ($json.rows[0].app -eq "codex" -and $json.rows[0].state -eq "new-here") "codex json row carries app + new-here"
+
+# push --app codex: lands in the codex/ Drive tree, ledger key namespaced
+$r = Run-Sessium @("push", "--app", "codex")
+Assert-True ($r.code -eq 0) "codex push exits 0"
+Assert-True ($r.text -match "pushed: 1") "codex push reports 1"
+Assert-True (Test-Path $codexDrive) "codex rollout landed in codex/projects/ on Drive"
+$stateA = Get-Content (Join-Path $tmp "machine-a\state.json") -Raw
+Assert-True ($stateA -match "codex/$codexProj/$codexId") "codex ledger key is codex/<proj>/<id>"
+
+# B pulls the rollout; the download synthesizes rollout-<mtime>-<uuid>.jsonl
+Use-Machine "B"
+$r = Run-Sessium @("pull", "--app", "codex")
+Assert-True ($r.code -eq 0) "codex pull exits 0"
+$rollB = @(Get-ChildItem -LiteralPath (Join-Path $codexB "sessions") -File -Filter "*.jsonl" -Recurse)
+Assert-True ($rollB.Count -eq 1) "codex rollout downloaded on B"
+Assert-True ($rollB[0].Name -like "rollout-*-$codexId.jsonl") "downloaded rollout name is rollout-<mtime>-<uuid>"
+Assert-Equal (New-RolloutText "hey codex, build a rocket" "ok, building") `
+    ((Get-Content $rollB[0].FullName -Raw) -replace "`r`n", "`n") "codex content survives the round-trip"
+
+$r = Run-Sessium @("status", "--app", "codex")
+Assert-True ($r.text -match "in-sync") "codex: B sees in-sync after pull"
+
+# list --json --titles --app codex: app field + codex-format title
+$r = Run-Sessium @("list", "--json", "--titles", "--app", "codex")
+$json = @($r.text | ConvertFrom-Json)
+Assert-True ($json.Count -eq 1 -and $json[0].app -eq "codex") "list --json --app codex shows the rollout"
+Assert-True ($json[0].title -eq "hey codex, build a rocket") "codex titles come from the first real user message"
+
+# conflict: A edits, B pushes, A syncs -> newest-wins (remote) and A's loser
+# is quarantined OUTSIDE sessions/ (codex globs sessions/**/*.jsonl)
+Use-Machine "A"
+Write-Rollout $codexA (New-RolloutText "A's codex edit" "still A")
+Use-Machine "B"
+Write-Rollout $codexB (New-RolloutText "B's codex edit" "still B")
+$null = Run-Sessium @("push", "--app", "codex")
+Use-Machine "A"
+$r = Run-Sessium @("sync", "--app", "codex")
+Assert-True ($r.text -match "remote wins") "codex conflict resolves newest-wins"
+Assert-True (Test-Path (Join-Path $codexA ".sessium\projects\$codexProj\revert")) "codex loser kept in the .sessium quarantine"
+$rollCount = @(Get-ChildItem -LiteralPath (Join-Path $codexA "sessions") -File -Filter "*.jsonl" -Recurse).Count
+Assert-True ($rollCount -eq 1) "codex sessions/ holds exactly one rollout (no quarantine pollution)"
+
+# open: cwd from session_meta, codex resume line
+$r = Run-Sessium @("open", "0198aaaa", "--app", "codex")
+Assert-True ($r.code -eq 0) "codex open exits 0"
+Assert-True ($r.text -match "codex resume $codexId") "open prints 'codex resume <id>'"
+Assert-True ($r.text -match "cd /home/codex/proj") "open takes the cwd from session_meta"
+
+# sync --only x --app codex is a hard error (memory/skills are Claude folders)
+$r = Run-Sessium @("sync", "--only", "memory", "--app", "codex")
+Assert-True ($r.code -eq 1) "--only memory with --app codex exits 1"
+Assert-True ($r.text -match "drop --app or use --app claude") "--only guard explains the conflict"
+
+# v1 limits: export and search parse Claude transcripts only
+$r = Run-Sessium @("export", "0198aaaa", "--app", "codex", "--out", (Join-Path $tmp "exp-codex"))
+Assert-True ($r.code -eq 1) "export --app codex exits 1"
+Assert-True ($r.text -match "Claude Code transcripts only") "export explains the v1 limit"
+$r = Run-Sessium @("search", "rocket", "--app", "codex")
+Assert-True ($r.code -eq 1) "search --app codex exits 1"
+Assert-True ($r.text -match "Claude Code transcripts only") "search explains the v1 limit"
+
+Write-Host ""
 
 Write-Host ""
 
