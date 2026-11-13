@@ -9,6 +9,7 @@ here touches your real ~/.claude, ~/.codex or any network.
 
 Run from anywhere:   python3 tests/run_tests.py      (see run_tests.py)
 """
+import gzip
 import json
 import os
 import shutil
@@ -119,11 +120,11 @@ class Fixture:
         return e
 
 
-def run_sessium(env: dict, *args, stdin_text=None):
+def run_sessium(env: dict, *args, stdin_text=None, cwd=None):
     return subprocess.run(
         [sys.executable, str(SESSIUM), *args],
         capture_output=True, text=True, env=env, timeout=60,
-        input=stdin_text,
+        input=stdin_text, cwd=cwd,
     )
 
 
@@ -343,9 +344,11 @@ class CommandTests(unittest.TestCase):
         self.fx.write_local("aaa", SESSION_WITH_TITLE)
         proc = run_sessium(self.fx.env(), "push")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        # the session vanishes from both sides afterwards
+        # the session vanishes from both sides afterwards (the Drive object
+        # carries the gzip name now, so match any form)
         (self.fx.claude / "projects" / self.fx.project / "aaa.jsonl").unlink()
-        (self.fx.drive / "backup" / "projects" / self.fx.project / "aaa.jsonl").unlink()
+        for obj in (self.fx.drive / "backup" / "projects" / self.fx.project).glob("aaa*"):
+            obj.unlink()
         proc = run_sessium(self.fx.env(), "check", "--full")
         self.assertEqual(proc.returncode, 0, proc.stdout)
         self.assertIn("dead ledger entries: 1", proc.stderr)
@@ -418,7 +421,44 @@ class SyncBase(unittest.TestCase):
         return machine["claude"] / "projects" / PROJ / f"{sid}.jsonl"
 
     def drive_file(self, sid: str) -> Path:
+        """Legacy-name Drive path — still valid for HAND-WRITING objects
+        (legacy <sid>.jsonl rows must stay pullable forever), but pushes
+        now write <sid>-<md5>.jsonl.gz, so existence/content assertions
+        must use drive_object()/drive_content() instead."""
         return self.drive / "backup" / "projects" / PROJ / f"{sid}.jsonl"
+
+    def _drive_object(self, base: Path, sid: str):
+        """The Drive object for sid in either name form (gzip-named or
+        legacy), or None when absent."""
+        for pattern in (f"{sid}-*.jsonl.gz", f"{sid}.jsonl"):
+            hits = sorted(base.glob(pattern))
+            if hits:
+                return hits[0]
+        return None
+
+    def _drive_content(self, base: Path, sid: str) -> str:
+        obj = self._drive_object(base, sid)
+        if obj is None:
+            raise AssertionError(f"no Drive object for {sid}")
+        raw = obj.read_bytes()
+        if raw[:2] == b"\x1f\x8b":
+            raw = gzip.decompress(raw)
+        return raw.decode("utf-8")
+
+    def drive_object(self, sid: str):
+        return self._drive_object(self.drive / "backup" / "projects" / PROJ, sid)
+
+    def drive_content(self, sid: str) -> str:
+        return self._drive_content(self.drive / "backup" / "projects" / PROJ, sid)
+
+    def write_drive(self, sid: str, content: str) -> None:
+        """Hand-write a LEGACY plaintext object, REPLACING anything a push
+        left under that sid (a .jsonl.gz would otherwise shadow the new
+        object — one_remote_row prefers the ledger's recorded copy). Use
+        this when simulating another machine's state after a push."""
+        for obj in (self.drive / "backup" / "projects" / PROJ).glob(f"{sid}*"):
+            obj.unlink()
+        self.drive_file(sid).write_text(content, encoding="utf-8")
 
     def codex_rollout(self, machine: dict, sid: str,
                       body: str = CODEX_ROLLOUT) -> Path:
@@ -431,6 +471,14 @@ class SyncBase(unittest.TestCase):
 
     def codex_drive_file(self, sid: str) -> Path:
         return self.drive / "backup" / "codex" / "projects" / PROJ / f"{sid}.jsonl"
+
+    def codex_drive_object(self, sid: str):
+        return self._drive_object(self.drive / "backup" / "codex" / "projects" / PROJ,
+                                  sid)
+
+    def codex_drive_content(self, sid: str) -> str:
+        return self._drive_content(self.drive / "backup" / "codex" / "projects" / PROJ,
+                                   sid)
 
     def codex_revert_files(self, machine: dict, sid: str) -> list:
         d = machine["codex"] / ".sessium" / "projects" / PROJ / "revert"
@@ -464,7 +512,7 @@ class SyncTests(SyncBase):
         self.local_file(self.a, "aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
         p = run_sessium(self.env(self.a), "sync")
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertTrue(self.drive_file("aaa").is_file())   # folder chain created
+        self.assertIsNotNone(self.drive_object("aaa"))     # folder chain created
         p = run_sessium(self.env(self.b), "pull")           # another machine pulls
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertTrue(self.local_file(self.b, "aaa").is_file())
@@ -473,7 +521,7 @@ class SyncTests(SyncBase):
         self.local_file(self.a, "aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
         p = run_sessium(self.env(self.a), "push")
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertTrue(self.drive_file("aaa").is_file())
+        self.assertIsNotNone(self.drive_object("aaa"))
         self.assertIn(f"{PROJ}/aaa", self.ledger(self.a)["sessions"])
         p = run_sessium(self.env(self.b), "pull")
         self.assertEqual(p.returncode, 0, p.stderr)
@@ -493,9 +541,7 @@ class SyncTests(SyncBase):
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn("retry 1/2", p.stderr)
         self.assertIn("pushed: 1", p.stdout)
-        self.assertTrue(self.drive_file("aaa").is_file())
-        self.assertEqual(self.drive_file("aaa").read_text(encoding="utf-8"),
-                         SESSION_WITH_TITLE)
+        self.assertEqual(self.drive_content("aaa"), SESSION_WITH_TITLE)
 
     def test_push_fails_after_retries_exhausted(self):
         # every copyto fails -> the session is quarantined, rc=1, nothing pushed
@@ -508,7 +554,7 @@ class SyncTests(SyncBase):
         self.assertIn("retry 1/2", p.stderr)
         self.assertIn("retry 2/2", p.stderr)
         self.assertIn("FAILED: 1", p.stdout)
-        self.assertFalse(self.drive_file("aaa").exists())
+        self.assertIsNone(self.drive_object("aaa"))
 
     def test_push_does_not_retry_permanent_errors(self):
         # rc=2 (not found) is permanent: fail fast, no retry chatter
@@ -547,7 +593,7 @@ class SyncTests(SyncBase):
         p = run_sessium(self.env(self.a), "sync")
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn("pushed: 1", p.stdout)
-        self.assertEqual(self.drive_file("aaa").read_text(encoding="utf-8"),
+        self.assertEqual(self.drive_content("aaa"),
                          SESSION_WITH_TITLE + "A's extra line\n")
         p = run_sessium(self.env(self.b), "sync")
         self.assertEqual(p.returncode, 0, p.stderr)
@@ -578,8 +624,7 @@ class SyncTests(SyncBase):
         p = run_sessium(self.env(self.a), "sync")
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn("local wins", p.stdout)
-        self.assertEqual(self.drive_file("aaa").read_text(encoding="utf-8"),
-                         "A was here\n")
+        self.assertEqual(self.drive_content("aaa"), "A was here\n")
         rev = self.revert_files(self.a, "aaa")
         self.assertEqual(len(rev), 1)
         self.assertEqual(rev[0].read_text(encoding="utf-8"), "B was here\n")
@@ -592,8 +637,7 @@ class SyncTests(SyncBase):
         p = run_sessium(self.env(self.a), "sync", "--interactive", stdin_text="L\n")
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn("local wins", p.stdout)
-        self.assertEqual(self.drive_file("aaa").read_text(encoding="utf-8"),
-                         "A was here\n")
+        self.assertEqual(self.drive_content("aaa"), "A was here\n")
         rev = self.revert_files(self.a, "aaa")       # losing REMOTE copy preserved
         self.assertEqual(len(rev), 1)
         self.assertEqual(rev[0].read_text(encoding="utf-8"), "B was here\n")
@@ -618,11 +662,11 @@ class SyncTests(SyncBase):
     def test_push_skips_conflict(self):
         self._baseline_conflict()
         self.local_file(self.a, "aaa").write_text("A was here\n", encoding="utf-8")
-        self.drive_file("aaa").write_text("B was here\n", encoding="utf-8")
+        self.write_drive("aaa", "B was here\n")
         p = run_sessium(self.env(self.a), "push")
         self.assertEqual(p.returncode, 0, p.stderr)      # skipping isn't failing
         self.assertIn("conflicts skipped: 1", p.stdout)
-        self.assertEqual(self.drive_file("aaa").read_text(encoding="utf-8"),
+        self.assertEqual(self.drive_content("aaa"),
                          "B was here\n")                 # Drive untouched
 
     def test_ledger_corrupt_starts_fresh(self):
@@ -640,7 +684,7 @@ class SyncTests(SyncBase):
         self.local_file(self.a, "bbb").write_text(SESSION_ONLY_COMMANDS, encoding="utf-8")
         self.assertEqual(run_sessium(self.env(self.a), "push").returncode, 0)
         self.local_file(self.a, "aaa").write_text("A edited\n", encoding="utf-8")
-        self.drive_file("bbb").write_text("B edited\n", encoding="utf-8")
+        self.write_drive("bbb", "B edited\n")
         p = run_sessium(self.env(self.a), "status")
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn("push: 1", p.stdout)
@@ -690,8 +734,7 @@ class Phase3Tests(SyncBase):
         p = run_sessium(self.env(self.a), "resolve", "aaa", stdin_text="L\n")
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn("local wins", p.stdout)
-        self.assertEqual(self.drive_file("aaa").read_text(encoding="utf-8"),
-                         "A was here\n")
+        self.assertEqual(self.drive_content("aaa"), "A was here\n")
 
     def test_resolve_not_conflicted_is_noop(self):
         self._baseline_conflict()
@@ -849,7 +892,7 @@ class Batch3Tests(SyncBase):
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn("would push", p.stdout)
         self.assertIn("dry-run: pushed: 1", p.stdout)
-        self.assertFalse(self.drive_file("aaa").exists())
+        self.assertIsNone(self.drive_object("aaa"))
         self.assertFalse(self.a["state"].exists())      # ledger untouched
 
     def test_dry_run_pull_touches_nothing(self):
@@ -900,7 +943,7 @@ class Batch3Tests(SyncBase):
         p = run_sessium(self.env(self.a), "push")
         self.assertEqual(p.returncode, 1)
         self.assertIn("another sessium transfer", p.stderr)
-        self.assertFalse(self.drive_file("aaa").exists())
+        self.assertIsNone(self.drive_object("aaa"))
         # dry-run ignores the lock entirely
         p = run_sessium(self.env(self.a), "push", "--dry-run")
         self.assertEqual(p.returncode, 0, p.stderr)
@@ -916,7 +959,7 @@ class Batch3Tests(SyncBase):
         p = run_sessium(self.env(self.a), "push")
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn("stale lock", p.stderr)
-        self.assertTrue(self.drive_file("aaa").exists())
+        self.assertIsNotNone(self.drive_object("aaa"))
         self.assertFalse(lock.exists())                 # released after the run
 
     def test_lock_released_after_run(self):
@@ -935,9 +978,11 @@ class Batch3Tests(SyncBase):
         entry = json.dumps({"type": "user", "cwd": "/home/test/proj",
                             "message": {"content": "hello"}})
         self.local_file(self.a, sid).write_text(entry + "\n", encoding="utf-8")
-        p = run_sessium(self.env(self.a), "open", sid)
+        # the recorded repo /home/test/proj doesn't exist on this machine,
+        # so the resume line falls back to the (pinned) current directory
+        p = run_sessium(self.env(self.a), "open", sid, cwd=str(self.tmp))
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertIn("cd /home/test/proj && claude --resume ", p.stdout)
+        self.assertIn(f"cd {self.tmp} && claude --resume ", p.stdout)
         # the full id is printed, not the prefix
         self.assertIn(sid, p.stdout)
 
@@ -949,11 +994,18 @@ class Batch3Tests(SyncBase):
         entry = json.dumps({"type": "user", "cwd": "/home/test/proj",
                             "message": {"content": "hello"}})
         (old_dir / f"{sid}.jsonl").write_text(entry + "\n", encoding="utf-8")
-        p = run_sessium(self.env(self.a), "open", sid, "--adopt")
+        # --adopt re-homes into THIS machine's name for the CURRENT directory
+        # (the old behaviour adopted into the transcript's own recorded cwd,
+        # which was always the source folder name — a silent no-op); the
+        # pinned cwd must exist for the subprocess
+        p = run_sessium(self.env(self.a), "open", sid, "--adopt", cwd=str(self.tmp))
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertIn("adopting sessions first", p.stdout)
-        self.assertTrue((self.a["claude"] / "projects" / PROJ / f"{sid}.jsonl").is_file())
-        self.assertIn(f"cd /home/test/proj && claude --resume {sid}", p.stdout)
+        self.assertIn("adopting it into", p.stdout)
+        # the session got a copy under the current directory's folder name
+        # (adopt copies, never moves — the old-machine copy stays)
+        hits = list((self.a["claude"] / "projects").rglob(f"{sid}.jsonl"))
+        self.assertTrue(any(h.parent != old_dir for h in hits), hits)
+        self.assertIn(f"cd {self.tmp} && claude --resume {sid}", p.stdout)
 
     def test_open_requires_local_copy(self):
         self.drive_file("aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
@@ -1258,7 +1310,7 @@ class Batch4Tests(SyncBase):
         (mem_dir / "MEMORY.md").write_text("A note\n", encoding="utf-8")
         p = run_sessium(self.env(self.a), "sync", "--only", "memory")
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertFalse(self.drive_file("aaa").exists())   # session not pushed
+        self.assertIsNone(self.drive_object("aaa"))   # session not pushed
 
     # ------------------------------------------------- diff --messages
 
@@ -1297,10 +1349,10 @@ class Batch5Tests(SyncBase):
         p = run_sessium(self.env(self.a), "push", "--quiet")
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertEqual(p.stdout, "")
-        self.assertTrue(self.drive_file("aaa").is_file())
+        self.assertIsNotNone(self.drive_object("aaa"))
         # errors/warnings stay loud even when quiet
         self.local_file(self.a, "aaa").write_text("changed locally\n", encoding="utf-8")
-        self.drive_file("aaa").write_text("changed remotely\n", encoding="utf-8")
+        self.write_drive("aaa", "changed remotely\n")
         future = time.time() + 1000
         os.utime(self.drive_file("aaa"), (future, future))
         # stale the ledger record so both sides look changed → conflict
@@ -1434,12 +1486,13 @@ class Batch5Tests(SyncBase):
         p = run_sessium(self.env(self.a), "push")
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn("pushed: 1", p.stdout)
-        crypt_root = self.drive / "projects" / PROJ / "aaa.jsonl"
-        self.assertTrue(crypt_root.is_file(), "push went to the crypt root")
-        self.assertEqual(crypt_root.read_bytes(),
-                         self.local_file(self.a, "aaa").read_bytes())
+        # the object lands at the crypt root, gzip-named with the raw md5
+        objs = sorted((self.drive / "projects" / PROJ).glob("aaa-*.jsonl.gz"))
+        self.assertEqual(len(objs), 1, "push went to the crypt root")
+        self.assertEqual(gzip.decompress(objs[0].read_bytes()).decode("utf-8"),
+                         self.local_file(self.a, "aaa").read_text(encoding="utf-8"))
         self.assertFalse(
-            (self.drive / "claude-backup" / "projects" / PROJ / "aaa.jsonl").exists(),
+            (self.drive / "claude-backup").exists(),
             "no parallel claude-backup tree appeared")
 
 
@@ -1549,9 +1602,7 @@ class CodexTests(SyncBase):
         p = run_sessium(self.env(self.a), "push")
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn("pushed: 1", p.stdout)
-        f = self.codex_drive_file(CODEX_SID)
-        self.assertTrue(f.is_file())
-        self.assertEqual(f.read_text(encoding="utf-8"), CODEX_ROLLOUT)
+        self.assertEqual(self.codex_drive_content(CODEX_SID), CODEX_ROLLOUT)
         # ledger key is namespaced under codex/ (claude keys unchanged)
         self.assertIn(f"codex/{PROJ}/{CODEX_SID}", self.ledger(self.a)["sessions"])
         # B pulls: the rollout lands in a synthesized date folder named
@@ -1622,11 +1673,11 @@ class CodexTests(SyncBase):
         self.codex_rollout(self.a, CODEX_SID)
         p = run_sessium(self.env(self.a), "push", "--app", "claude")
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertTrue(self.drive_file("aaa").is_file())
-        self.assertFalse(self.codex_drive_file(CODEX_SID).exists())
+        self.assertIsNotNone(self.drive_object("aaa"))
+        self.assertIsNone(self.codex_drive_object(CODEX_SID))
         p = run_sessium(self.env(self.a), "push", "--app", "codex")
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertTrue(self.codex_drive_file(CODEX_SID).is_file())
+        self.assertIsNotNone(self.codex_drive_object(CODEX_SID))
         p = run_sessium(self.env(self.a), "status", "--json", "--app", "codex")
         rows = json.loads(p.stdout)["rows"]
         self.assertEqual([r["app"] for r in rows], ["codex"])
@@ -1643,11 +1694,13 @@ class CodexTests(SyncBase):
 
     def test_codex_open_prints_resume(self):
         # resume cwd comes from the rollout's own session_meta, so it works
-        # across machines despite the lossy munging
+        # across machines despite the lossy munging; when the recorded repo
+        # doesn't exist on this machine the line falls back to the (pinned)
+        # current directory
         self.codex_rollout(self.a, CODEX_SID)
-        p = run_sessium(self.env(self.a), "open", CODEX_SID)
+        p = run_sessium(self.env(self.a), "open", CODEX_SID, cwd=str(self.tmp))
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertIn(f"cd /home/test/proj && codex resume {CODEX_SID}", p.stdout)
+        self.assertIn(f"cd {self.tmp} && codex resume {CODEX_SID}", p.stdout)
 
     def test_export_and_search_reject_codex(self):
         # v1 deferral: export/search parse Claude transcripts only
@@ -1658,3 +1711,265 @@ class CodexTests(SyncBase):
         p = run_sessium(self.env(self.a), "search", "--app", "codex", "bridge")
         self.assertEqual(p.returncode, 1)
         self.assertIn("only for now", p.stderr)
+
+
+# ------------------------------------------- batch 7: gzip + cross-machine
+
+class GzipUnitTests(UnitTests):
+    """Direct tests of the Drive-object naming helpers."""
+
+    def test_parse_remote_name_gz_form(self):
+        md5 = "d41d8cd98f00b204e9800998ecf8427e"
+        name = f"11111111-2222-3333-4444-555555555555-{md5}.jsonl.gz"
+        self.assertEqual(self.mod.parse_remote_name(name),
+                         ("11111111-2222-3333-4444-555555555555", md5, True))
+
+    def test_parse_remote_name_legacy_form(self):
+        self.assertEqual(self.mod.parse_remote_name("aaa.jsonl"), ("aaa", None, False))
+
+    def test_parse_remote_name_rejects_junk(self):
+        # a 32-hex tail is required for .gz names; everything else is junk
+        self.assertIsNone(self.mod.parse_remote_name("rollout.jsonl.gz"))
+        self.assertIsNone(self.mod.parse_remote_name("abc-xy.jsonl.gz"))
+        self.assertIsNone(self.mod.parse_remote_name(
+            "11111111-2222-3333-4444-555555555555-zzzznot-hex.jsonl.gz"))
+        self.assertIsNone(self.mod.parse_remote_name("notes.txt"))
+        self.assertIsNone(self.mod.parse_remote_name(".jsonl"))
+
+    def test_remote_object_name_embeds_raw_md5(self):
+        self.assertEqual(
+            self.mod.remote_object_name("sid-1", "abc123"),
+            "sid-1-abc123.jsonl.gz")
+
+    def test_one_remote_row_prefers_ledger_copy(self):
+        old = {"id": "s", "name": "s-aaa.jsonl.gz", "mtime": 1,
+               "md5": "aaa", "size": 1}
+        new = {"id": "s", "name": "s.jsonl", "mtime": 9, "md5": "bbb", "size": 2}
+        self.assertIs(self.mod.one_remote_row([old]), old)
+        # ledger recorded the old object's md5 -> it wins despite older mtime
+        self.assertIs(self.mod.one_remote_row(
+            [old, new], {"remote_md5": "aaa"}), old)
+        # no ledger match -> newest wins
+        self.assertIs(self.mod.one_remote_row([old, new]), new)
+
+
+class GzipTransportTests(SyncBase):
+    """Batch 7: Drive objects are gzip'd transcripts named
+    <sid>-<rawmd5>.jsonl.gz; legacy plaintext objects stay readable."""
+
+    def test_push_writes_gz_named_object_and_pull_roundtrips(self):
+        self.local_file(self.a, "aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
+        p = run_sessium(self.env(self.a), "push")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        import hashlib
+        raw_md5 = hashlib.md5(SESSION_WITH_TITLE.encode()).hexdigest()
+        obj = self.drive_object("aaa")
+        self.assertIsNotNone(obj)
+        self.assertEqual(obj.name, f"aaa-{raw_md5}.jsonl.gz")
+        # the wire bytes really are gzip, and the name embeds the RAW md5
+        self.assertEqual(obj.read_bytes()[:2], b"\x1f\x8b")
+        # B pulls: gunzipped to the byte-identical raw transcript
+        p = run_sessium(self.env(self.b), "pull")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(self.local_file(self.b, "aaa").read_text(encoding="utf-8"),
+                         SESSION_WITH_TITLE)
+
+    def test_legacy_object_pulls_and_classifies_in_sync(self):
+        # another machine's push from BEFORE the gzip change left a legacy
+        # plaintext object; a machine with only legacy local copies is in-sync
+        self.drive_file("aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
+        self.local_file(self.a, "aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
+        p = run_sessium(self.env(self.a), "sync")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("in-sync: 1", p.stdout)
+
+    def test_changed_push_migrates_legacy_to_gz(self):
+        # bootstrap against a legacy object, then edit + push: the new object
+        # is gzip-named and the superseded legacy object is GONE
+        self.drive_file("aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
+        self.local_file(self.a, "aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
+        self.assertEqual(run_sessium(self.env(self.a), "sync").returncode, 0)
+        self.local_file(self.a, "aaa").write_text(
+            SESSION_WITH_TITLE + "more\n", encoding="utf-8")
+        p = run_sessium(self.env(self.a), "sync")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("pushed: 1", p.stdout)
+        self.assertFalse(self.drive_file("aaa").exists(), "legacy object removed")
+        obj = self.drive_object("aaa")
+        self.assertIsNotNone(obj)
+        self.assertEqual(obj.suffixes[-2:], [".jsonl", ".gz"])
+        self.assertEqual(self.drive_content("aaa"),
+                         SESSION_WITH_TITLE + "more\n")
+
+    def test_corrupt_gz_fails_pull_loudly(self):
+        # valid name, valid ledger bookkeeping, but garbage wire bytes whose
+        # md5 cannot match the name-embedded raw md5 — the pull must fail
+        self.local_file(self.a, "aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
+        self.assertEqual(run_sessium(self.env(self.a), "push").returncode, 0)
+        obj = self.drive_object("aaa")
+        obj.write_text("definitely not a gzip stream", encoding="utf-8")
+        p = run_sessium(self.env(self.b), "pull")
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("integrity check failed", p.stderr)
+        self.assertFalse(self.local_file(self.b, "aaa").exists())
+
+    def test_corrupt_gzip_magic_fails_cleanly(self):
+        # gzip magic present but the stream is truncated — a clean transfer
+        # failure, not a traceback
+        self.local_file(self.a, "aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
+        self.assertEqual(run_sessium(self.env(self.a), "push").returncode, 0)
+        self.drive_object("aaa").write_bytes(b"\x1f\x8b" + b"\x00" * 10)
+        p = run_sessium(self.env(self.b), "pull")
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("corrupt gzip object", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+
+    def test_deep_check_spot_checks_gz_rows(self):
+        self.local_file(self.a, "aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
+        self.assertEqual(run_sessium(self.env(self.a), "push").returncode, 0)
+        p = run_sessium(self.env(self.a), "check", "--full")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("spot-check: 1 session(s) verified", p.stdout)
+
+    def test_stale_superseded_object_is_invisible(self):
+        # the supersede deletefile failed once (drive hiccup): a legacy-style
+        # older object lingers next to the current .gz. The ledger's recorded
+        # md5 must win the dedupe — status stays in-sync, and nothing
+        # re-pulls the stale bytes
+        self.local_file(self.a, "aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
+        self.assertEqual(run_sessium(self.env(self.a), "push").returncode, 0)
+        first = self.drive_object("aaa")
+        stale_copy = self.drive / "stale-copy.bin"
+        stale_copy.write_bytes(first.read_bytes())      # keep the old object
+        self.local_file(self.a, "aaa").write_text("v2\n", encoding="utf-8")
+        p = run_sessium(self.env(self.a), "push")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        # now restore the stale object the way a failed deletefile would
+        stale_copy.replace(self.drive / "backup" / "projects" / PROJ /
+                           first.name)
+        self.assertEqual(len(list((self.drive / "backup" / "projects" / PROJ).glob("aaa*"))),
+                         2)   # stale + fresh
+        p = run_sessium(self.env(self.a), "status")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("in-sync: 1", p.stdout)
+        self.assertNotIn("pull: 1", p.stdout)
+
+    def test_stale_object_cleanup_retries_on_next_push(self):
+        # the next successful push removes the lingering stale object
+        self.local_file(self.a, "aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
+        self.assertEqual(run_sessium(self.env(self.a), "push").returncode, 0)
+        self.local_file(self.a, "aaa").write_text("v2\n", encoding="utf-8")
+        self.assertEqual(run_sessium(self.env(self.a), "push").returncode, 0)
+        self.local_file(self.a, "aaa").write_text("v3\n", encoding="utf-8")
+        p = run_sessium(self.env(self.a), "push")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertNotIn("could not remove superseded object", p.stderr)
+        objects = list((self.drive / "backup" / "projects" / PROJ).glob("aaa*"))
+        self.assertEqual(len(objects), 1, objects)
+
+
+class ResumeTests(SyncBase):
+    """Batch 7: cross-machine resume — `resume <id>`, `resume` by repo
+    basename, `pull --adopt`, and the home-directory guard."""
+
+    def _foreign_session(self, machine, sid="sss", recorded="/home/test/proj",
+                         folder="-home-oldmachine-proj"):
+        d = machine["claude"] / "projects" / folder
+        d.mkdir(parents=True, exist_ok=True)
+        entry = json.dumps({"type": "user", "cwd": recorded,
+                            "message": {"content": "hello"}})
+        (d / f"{sid}.jsonl").write_text(entry + "\n", encoding="utf-8")
+        return d
+
+    def test_resume_with_id_adopts_and_prints_command(self):
+        self._foreign_session(self.a)
+        cwd = self.tmp / "repo"
+        cwd.mkdir()
+        p = run_sessium(self.env(self.a), "resume", "sss", cwd=str(cwd))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("adopted -home-oldmachine-proj", p.stdout)
+        # adopted into the current directory's munged name, whole folder
+        hits = list((self.a["claude"] / "projects").glob("-tmp-*/sss.jsonl"))
+        self.assertTrue(hits, "session adopted into the munged cwd folder")
+        self.assertIn(f"cd {cwd} && claude --resume sss", p.stdout)
+
+    def test_resume_dry_run_adopts_nothing(self):
+        self._foreign_session(self.a)
+        cwd = self.tmp / "repo"
+        cwd.mkdir()
+        p = run_sessium(self.env(self.a), "resume", "sss", "--dry-run",
+                        cwd=str(cwd))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        hits = list((self.a["claude"] / "projects").glob("-tmp-*/sss.jsonl"))
+        self.assertEqual(hits, [])
+        self.assertIn(f"cd {cwd} && claude --resume sss", p.stdout)
+
+    def test_resume_needs_local_copy(self):
+        self.drive_file("aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
+        cwd = self.tmp / "repo"
+        cwd.mkdir()
+        p = run_sessium(self.env(self.a), "resume", "aaa", cwd=str(cwd))
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("sessium pull", p.stderr)
+
+    def test_resume_codex_needs_no_adoption(self):
+        self.codex_rollout(self.a, CODEX_SID)
+        cwd = self.tmp / "repo"
+        cwd.mkdir()
+        p = run_sessium(self.env(self.a), "resume", CODEX_SID, cwd=str(cwd))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("codex resumes from anywhere", p.stdout)
+        self.assertIn(f"cd {cwd} && codex resume {CODEX_SID}", p.stdout)
+
+    def test_resume_no_id_matches_repo_by_basename(self):
+        # the recorded repo is /home/user/proj — the current dir is .../proj:
+        # same basename, lossy munging be damned
+        self._foreign_session(self.a, recorded="/home/user/proj")
+        cwd = self.tmp / "somewhere" / "proj"
+        cwd.mkdir(parents=True)
+        p = run_sessium(self.env(self.a), "resume", cwd=str(cwd))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("-home-oldmachine-proj", p.stdout)
+        hits = list((self.a["claude"] / "projects").glob("-tmp-*/sss.jsonl"))
+        self.assertTrue(hits, "matching folder adopted into the cwd name")
+        self.assertIn("next: claude --resume", p.stdout)
+
+    def test_resume_no_id_no_match_hints(self):
+        self._foreign_session(self.a, recorded="/home/other/zzz")
+        cwd = self.tmp / "repo"
+        cwd.mkdir()
+        p = run_sessium(self.env(self.a), "resume", cwd=str(cwd))
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("no sessions from other machines", p.stdout)
+        self.assertIn("sessium resume <id-prefix>", p.stdout)
+
+    def test_pull_adopt_rehomes_pulled_projects(self):
+        # the one-step new-computer flow: clone, cd in, pull --adopt
+        self.local_file(self.a, "aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
+        self.assertEqual(run_sessium(self.env(self.a), "push").returncode, 0)
+        cwd = self.tmp / "fresh-clone"
+        cwd.mkdir()
+        p = run_sessium(self.env(self.b), "pull", "--adopt", cwd=str(cwd))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("pulled: 1", p.stdout)
+        hits = list(
+            (self.b["claude"] / "projects").glob("-tmp-*fresh-clone/aaa.jsonl"))
+        self.assertTrue(hits, "pulled session re-homed into the cwd name")
+        # and the resume picker finds it there
+        p = run_sessium(self.env(self.b), "status", cwd=str(cwd))
+        self.assertIn("in-sync: 1", p.stdout)
+
+    def test_pull_adopt_home_guard(self):
+        self.local_file(self.a, "aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
+        self.assertEqual(run_sessium(self.env(self.a), "push").returncode, 0)
+        p = run_sessium(self.env(self.b), "pull", "--adopt",
+                        cwd=os.path.expanduser("~"))
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("cd into your repo", p.stderr)
+
+    def test_resume_home_guard(self):
+        self._foreign_session(self.a)
+        p = run_sessium(self.env(self.a), "resume", "sss",
+                        cwd=os.path.expanduser("~"))
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("cd into the repo", p.stderr)

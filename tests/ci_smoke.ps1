@@ -75,6 +75,40 @@ function Write-Exact([string]$Path, [string]$Text) {
     [System.IO.File]::WriteAllText($Path, $Text, $utf8)
 }
 
+# the Drive object for a session id, in either name form: pushes write
+# <sid>-<rawmd5>.jsonl.gz; legacy <sid>.jsonl objects stay readable forever
+function Get-DriveObject([string]$Dir, [string]$Sid) {
+    if (-not (Test-Path -LiteralPath $Dir)) { return $null }
+    foreach ($pattern in @("$Sid-*.jsonl.gz", "$Sid.jsonl")) {
+        $hits = @(Get-ChildItem -LiteralPath $Dir -File -Filter $pattern -ErrorAction SilentlyContinue)
+        if ($hits.Count -gt 0) { return $hits[0] }
+    }
+    return $null
+}
+
+# the transcript text behind a Drive object, gzip or plain — what a pull
+# would land locally
+function Read-DriveRaw([string]$Dir, [string]$Sid) {
+    $obj = Get-DriveObject $Dir $Sid
+    if ($null -eq $obj) { throw "no Drive object for $Sid in $Dir" }
+    $bytes = [System.IO.File]::ReadAllBytes($obj.FullName)
+    if ($bytes.Length -ge 2 -and $bytes[0] -eq 0x1f -and $bytes[1] -eq 0x8b) {
+        Add-Type -AssemblyName System.IO.Compression
+        $ms = New-Object System.IO.MemoryStream(, $bytes)
+        $gz = New-Object System.IO.Compression.GzipStream($ms, [System.IO.Compression.CompressionMode]::Decompress)
+        $out = New-Object System.IO.MemoryStream
+        try { $gz.CopyTo($out) } finally { $gz.Dispose(); $ms.Dispose(); $out.Dispose() }
+        return [System.Text.Encoding]::UTF8.GetString($out.ToArray())
+    }
+    return [System.Text.Encoding]::UTF8.GetString($bytes)
+}
+
+function Run-SessiumAt([string]$Dir, [string[]]$CliArgs) {
+    # resume/pull --adopt key off the CURRENT directory — pin it
+    Push-Location $Dir
+    try { return (Run-Sessium $CliArgs) } finally { Pop-Location }
+}
+
 $sessionA = Join-Path $claudeA "projects\$proj\aaa.jsonl"
 Write-Exact $sessionA $sessionText
 
@@ -123,8 +157,10 @@ Assert-True ($r.text -match "new-here") "status classifies new-here"
 # 2. A push
 $r = Run-Sessium @("push")
 Assert-True ($r.code -eq 0) "push exits 0"
-$driveFile = Join-Path $drive "backup\projects\$proj\aaa.jsonl"
-Assert-True (Test-Path $driveFile) "session landed on the fake Drive"
+$driveDir = Join-Path $drive "backup\projects\$proj"
+$driveObj = Get-DriveObject $driveDir "aaa"
+Assert-True ($null -ne $driveObj) "session landed on the fake Drive"
+Assert-True ($driveObj.Name -like "aaa-*.jsonl.gz") "the Drive object is gzip-named <sid>-<rawmd5>.jsonl.gz"
 Assert-True ($r.text -match "pushed: 1") "push reports 1"
 
 # 3. B pulls
@@ -143,7 +179,7 @@ Use-Machine "A"
 Add-Content -LiteralPath $sessionA -Value "A's extra line" -Encoding utf8
 $r = Run-Sessium @("sync")
 Assert-True ($r.text -match "pushed: 1") "A sync pushes the edit"
-Assert-True ((Get-Content $driveFile -Raw).Contains("A's extra line")) "edit reached Drive"
+Assert-True ((Read-DriveRaw $driveDir "aaa").Contains("A's extra line")) "edit reached Drive (gunzipped)"
 
 Use-Machine "B"
 $r = Run-Sessium @("sync")

@@ -707,17 +707,16 @@ function Read-Transcript([string]$Path) {
     return $result
 }
 
-<# Fetch a remote transcript to a temp file (rclone cat), caller unlinks.
-   Returns the temp path, or $null when the fetch fails. #>
-function Get-RemoteTranscript($Cfg, [string]$Project, [string]$Sid, [string]$App) {
+<# Fetch a remote transcript to a temp file as RAW bytes (the wire object
+   may be gzip'd — sniffed and decompressed here). Returns the temp path, or
+   $null when the fetch fails. Caller unlinks. #>
+function Get-RemoteTranscript($Cfg, $Row) {
     # real ids are 32+ hex chars; the smoke's fake ones can be shorter
-    $keep = if ($Sid.Length -gt 8) { $Sid.Substring(0, 8) } else { $Sid }
+    $keep = "$($Row.id)"
+    if ($keep.Length -gt 8) { $keep = $keep.Substring(0, 8) }
     $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("sessium-" + $keep + ".jsonl")
     try {
-        # $null = : discard output so nothing extra joins this function's
-        # return stream beside the temp path
-        $null = Invoke-CopyWithRetry -RcloneArgs @("cat", (ConvertTo-DriveUrl $Cfg "$(Get-RemoteBase $App)/$Project/$Sid.jsonl")) `
-            -ToFile $tmp
+        Invoke-FetchRemoteRaw $Cfg $Row $tmp
         return $tmp
     } catch {
         if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force }
@@ -793,15 +792,22 @@ function Get-RemoteSessions($Cfg, [string]$App) {
     $entries = @($text | ConvertFrom-Json)
     foreach ($e in $entries) {
         if ($e.IsDir) { continue }
-        if ($e.Path -notmatch '^([^/]+)/([^/]+)\.jsonl$') { continue }
+        if ($e.Path -notmatch '^([^/]+)/([^/]+)$') { continue }
         $proj = $Matches[1]
-        $sid = $Matches[2]
+        $parsed = ConvertFrom-RemoteObjectName $Matches[2]
+        if ($null -eq $parsed) { continue }   # junk / not a transcript
+        # .jsonl.gz: the RAW md5 rides in the name (compressed streams differ
+        # per implementation, so the hash of the wire bytes means nothing).
+        # Legacy .jsonl: plaintext — the lsjson hash IS the raw md5.
+        $md5 = $parsed.md5
+        if (-not $parsed.gz) { $md5 = (Get-JsonProp (Get-JsonProp $e "Hashes") "MD5") }
         if (-not $map.ContainsKey($proj)) { $map[$proj] = New-Object System.Collections.Generic.List[object] }
         $map[$proj].Add(@{
-            id = $sid
+            id = $parsed.sid
+            name = $Matches[2]                # the ACTUAL object filename
             size = [long]$e.Size
             mtime = ConvertFrom-RcloneTime $e.ModTime
-            md5 = (Get-JsonProp (Get-JsonProp $e "Hashes") "MD5")
+            md5 = $md5
         })
     }
     # object[], not List[object]: pwsh 7.4 throws "Argument types do not
@@ -815,6 +821,29 @@ function Get-RemoteSessions($Cfg, [string]$App) {
 }
 
 # ------------------------------------------------------- classification
+
+<# One remote row per session id. When two objects share an id - a
+   superseded object whose cleanup deletefile failed (a stale .jsonl or an
+   older .jsonl.gz) - prefer the copy the ledger recorded, else the newest.
+   The stale object is invisible to classification and self-heals on the
+   next successful push (which retries the supersede). #>
+function Select-OneRemoteRow($Hits, $Entry) {
+    if (@($Hits).Count -eq 1) { return @($Hits)[0] }
+    if ($Entry) {
+        $want = "$($Entry.remote_md5)"
+        if ($want) {
+            foreach ($h in $Hits) { if ("$($h.md5)" -eq $want) { return $h } }
+        }
+    }
+    $best = $null
+    foreach ($h in $Hits) {
+        if ($null -eq $best) { $best = $h; continue }
+        if ($null -ne $h.mtime -and ($null -eq $best.mtime -or $h.mtime -gt $best.mtime)) {
+            $best = $h
+        }
+    }
+    return $best
+}
 
 <# The SPEC section 4 state machine. Compare the CURRENT md5s against the
    ledger record. Never line-merges, never deletes: one side missing with a
@@ -866,10 +895,14 @@ function Get-Classification([string]$App, $LocalMap, $RemoteMap, $Ledger) {
         $ids = @(($locals + $remotes) | ForEach-Object { $_.id } | Sort-Object -Unique)
         foreach ($sid in $ids) {
             $local = $null; foreach ($l in $locals) { if ($l.id -eq $sid) { $local = $l; break } }
-            $remote = $null; foreach ($r in $remotes) { if ($r.id -eq $sid) { $remote = $r; break } }
             $entry = $null
             $key = Get-LedgerKey $proj $sid $App
             if ($Ledger.sessions.ContainsKey($key)) { $entry = $Ledger.sessions[$key] }
+            $remote = $null
+            $remoteHits = @($remotes | Where-Object { $_.id -eq $sid })
+            if ($remoteHits.Count -gt 0) {
+                $remote = Select-OneRemoteRow $remoteHits $entry
+            }
             $rows.Add((Get-ClassificationRow $App $proj $sid $local $remote $entry))
         }
     }
@@ -944,24 +977,182 @@ function Get-RemoteBase([string]$App) {
     return "projects"
 }
 
+# ------------------------------------------------ gzip transport (SPEC §8)
+
+<# Drive object name for a transcript: <sid>-<rawmd5>.jsonl.gz. The
+   UNCOMPRESSED md5 rides in the name, so classification stays in the raw
+   domain - deterministic no matter which gzip implementation compressed
+   the bytes (PowerShell/.NET's and Python's compressed streams differ;
+   nothing ever compares them). #>
+function ConvertTo-RemoteObjectName([string]$Sid, [string]$RawMd5) {
+    return "$Sid-$RawMd5.jsonl.gz"
+}
+
+<# (sid, rawMd5, gz) for a Drive object name, or $null. For .jsonl.gz: strip
+   the suffix, split on the LAST '-' - the trailing 32 hex chars are the
+   embedded raw md5 (sids are dashed uuids, md5s contain no dashes, so this
+   is unambiguous). Legacy .jsonl: gz=$false - the lsjson hash of a
+   plaintext object IS the raw md5. #>
+function ConvertFrom-RemoteObjectName([string]$Name) {
+    if ($Name.EndsWith(".jsonl.gz")) {
+        $stem = $Name.Substring(0, $Name.Length - ".jsonl.gz".Length)
+        $idx = $stem.LastIndexOf("-")
+        if ($idx -lt 1) { return $null }
+        $sid = $stem.Substring(0, $idx)
+        $md5 = $stem.Substring($idx + 1)
+        if (-not $sid) { return $null }
+        if ($md5.Length -ne 32 -or $md5 -notmatch '^[0-9a-fA-F]{32}$') { return $null }
+        return @{ sid = $sid; md5 = $md5.ToLowerInvariant(); gz = $true }
+    }
+    if ($Name.EndsWith(".jsonl")) {
+        $sid = $Name.Substring(0, $Name.Length - ".jsonl".Length)
+        if (-not $sid) { return $null }
+        return @{ sid = $sid; md5 = $null; gz = $false }
+    }
+    return $null
+}
+
+<# Drive URL of a session's ACTUAL object. Accepts both row shapes: a bare
+   remote row (top-level 'name', from Get-RemoteSessions) or a classified
+   row (name at row.remote.name - the real filename, gzip'd or legacy).
+   Every transfer targets what is really on Drive, not what a name pattern
+   guesses. #>
+function ConvertTo-RemoteObjectUrl($Cfg, $Row) {
+    $name = $Row.name
+    if (-not $name -and $Row.remote) { $name = $Row.remote.name }
+    $app = "claude"
+    if ($Row.app) { $app = "$($Row.app)" }
+    return (ConvertTo-DriveUrl $Cfg "$(Get-RemoteBase $app)/$($Row.project)/$name")
+}
+
+function Add-GzipAssembly {
+    # PS 5.1-safe: System.IO.Compression is a separate assembly there
+    if (-not ("System.IO.Compression.GzipStream" -as [type])) {
+        Add-Type -AssemblyName System.IO.Compression
+    }
+}
+
+function Compress-GzipTo([string]$Src, [string]$Dst) {
+    Add-GzipAssembly
+    $fin = [System.IO.File]::OpenRead($Src)
+    $fout = [System.IO.File]::Create($Dst)
+    try {
+        $gz = New-Object System.IO.Compression.GzipStream(
+            $fout, [System.IO.Compression.CompressionLevel]::Optimal)
+        try { $fin.CopyTo($gz) } finally { $gz.Dispose() }
+    } finally {
+        $fin.Dispose(); $fout.Dispose()
+    }
+}
+
+function Expand-GzipTo([string]$Src, [string]$Dst) {
+    Add-GzipAssembly
+    $fin = [System.IO.File]::OpenRead($Src)
+    $fout = [System.IO.File]::Create($Dst)
+    try {
+        $gz = New-Object System.IO.Compression.GzipStream(
+            $fin, [System.IO.Compression.CompressionMode]::Decompress)
+        try { $gz.CopyTo($fout) } finally { $gz.Dispose() }
+    } finally {
+        $fin.Dispose(); $fout.Dispose()
+    }
+}
+
+function Test-GzipMagic([string]$Path) {
+    # gzip streams start 1f 8b
+    try {
+        $fs = [System.IO.File]::OpenRead($Path)
+        try {
+            $b0 = $fs.ReadByte(); $b1 = $fs.ReadByte()
+            return ($b0 -eq 0x1f -and $b1 -eq 0x8b)
+        } finally { $fs.Dispose() }
+    } catch { return $false }
+}
+
 function Get-LocalSessionPath([string]$Project, [string]$Sid, [string]$App, $Mtime) {
     if ($App -eq "codex") { return (Get-CodexLocalPath $Sid $Mtime) }
     return (Join-Path (Join-Path (Get-LocalRoot $App) $Project) "$Sid.jsonl")
 }
 
-function Copy-Up([string]$LocalPath, [string]$RemoteUrl) {
-    $size = 0
-    if (Test-Path -LiteralPath $LocalPath) { $size = (Get-Item -LiteralPath $LocalPath).Length }
-    Invoke-CopyWithRetry -RcloneArgs @("copyto", $LocalPath, $RemoteUrl) -SizeBytes $size
+<# Push one transcript. The object on Drive becomes <sid>-<rawmd5>.jsonl.gz
+   (raw md5 computed here, before compressing); the copy timeout scales with
+   the COMPRESSED size - the wire carries ~5-10x fewer bytes than the raw
+   transcript. Afterwards the superseded object (an older .jsonl.gz or a
+   legacy .jsonl) is removed - only after the replacement is confirmed on
+   Drive. Same overwrite profile as the copyto it replaces: the ledger
+   recorded those bytes, and conflict paths save a revert copy first. #>
+function Invoke-UploadSession($Cfg, $Row, [string]$LocalPath) {
+    $rawMd5 = Get-FileMd5 $LocalPath
+    $newName = ConvertTo-RemoteObjectName $Row.id $rawMd5
+    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) (
+        "sessium-up-" + [System.IO.Path]::GetRandomFileName() + ".jsonl.gz")
+    try {
+        Compress-GzipTo $LocalPath $tmp
+        $upRow = @{ app = "$($Row.app)"; project = "$($Row.project)"; name = $newName }
+        $size = (Get-Item -LiteralPath $tmp).Length
+        Invoke-CopyWithRetry -RcloneArgs @("copyto", $tmp, (ConvertTo-RemoteObjectUrl $Cfg $upRow)) -SizeBytes $size
+    } finally {
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    }
+    $oldName = ""
+    if ($Row.remote) { $oldName = "$($Row.remote.name)" }
+    if ($oldName -and $oldName -ne $newName) {
+        try {
+            $null = Invoke-Rclone -RcloneArgs @("deletefile", (ConvertTo-RemoteObjectUrl $Cfg $Row)) -TimeoutSec 60
+        } catch {
+            # harmless: the stale object is invisible to classification
+            # (Select-OneRemoteRow prefers the ledger's copy) and the next
+            # successful push retries the cleanup
+            Write-Warn2 "  [!]  could not remove superseded object ${oldName}: $($_.Exception.Message)"
+        }
+    }
 }
 
-function Copy-Down([string]$RemoteUrl, [string]$LocalPath) {
+<# Pull one transcript down to LocalPath as RAW bytes: the wire object may
+   be gzip'd (magic-sniffed, then decompressed) or legacy plaintext.
+   Verifies md5(raw bytes) against the object's recorded raw md5 - the
+   name-embedded hash for .jsonl.gz, the lsjson hash for legacy objects.
+   A mismatch is a transfer failure, same class as a failed copyto. #>
+function Invoke-FetchRemoteRaw($Cfg, $Row, [string]$LocalPath) {
     $dir = Split-Path -Parent $LocalPath
-    if (-not (Test-Path -LiteralPath $dir)) {
+    if ($dir -and -not (Test-Path -LiteralPath $dir)) {
         New-Item -ItemType Directory -Path $dir -Force | Out-Null
     }
-    # size unknown without an extra lsjson round-trip - base timeout + retries
-    Invoke-CopyWithRetry -RcloneArgs @("copyto", $RemoteUrl, $LocalPath)
+    $keep = "$($Row.id)"
+    if ($keep.Length -gt 8) { $keep = $keep.Substring(0, 8) }
+    $wire = Join-Path ([System.IO.Path]::GetTempPath()) (
+        "sessium-" + $keep + "-" + [System.IO.Path]::GetRandomFileName())
+    try {
+        $size = 0
+        if ($Row.remote) { $size = [long]$Row.remote.size }
+        Invoke-CopyWithRetry -RcloneArgs @("copyto", (ConvertTo-RemoteObjectUrl $Cfg $Row), $wire) -SizeBytes $size
+        $actual = $wire
+        if (Test-GzipMagic $wire) {
+            $raw = "$wire.raw"
+            try {
+                Expand-GzipTo $wire $raw
+            } catch {
+                Remove-Item -LiteralPath $raw -Force -ErrorAction SilentlyContinue
+                throw (New-Object System.Exception (
+                    "corrupt gzip object $($Row.project)/$($Row.id): $($_.Exception.Message)"))
+            }
+            Remove-Item -LiteralPath $wire -Force
+            $actual = $raw
+        }
+        $want = ""
+        if ($Row.remote) { $want = "$($Row.remote.md5)" }
+        if ($want) {
+            $got = Get-FileMd5 $actual
+            if ("$got" -ne "$want") {
+                throw (New-Object System.Exception (
+                    "integrity check failed for $($Row.project)/$($Row.id) — raw md5 $got != expected $want"))
+            }
+        }
+        Move-Item -LiteralPath $actual -Destination $LocalPath -Force
+    } finally {
+        Remove-Item -LiteralPath $wire -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath "$wire.raw" -Force -ErrorAction SilentlyContinue
+    }
 }
 
 <# Unique revert-copy path: <local-root>/revert/<sid>.revert-<yyyyMMdd-HHmmss>.jsonl,
@@ -989,10 +1180,11 @@ function Save-LocalRevert([string]$Project, [string]$Sid, [string]$Src, [string]
     return $dst
 }
 
-# A losing REMOTE copy is downloaded into revert/ before anything overwrites it.
-function Save-RemoteRevert($Cfg, [string]$Project, [string]$Sid, [string]$App) {
-    $dst = Get-RevertPath $Project $Sid $App
-    Copy-Down (ConvertTo-DriveUrl $Cfg "$(Get-RemoteBase $App)/$Project/$Sid.jsonl") $dst
+# A losing REMOTE copy is downloaded into revert/ as RAW plaintext (revert
+# copies are never gzip) before anything overwrites it on Drive.
+function Save-RemoteRevert($Cfg, $Row) {
+    $dst = Get-RevertPath $Row.project $Row.id $Row.app
+    Invoke-FetchRemoteRaw $Cfg $Row $dst
     Write-Info "         remote copy kept as $(Split-Path -Leaf $dst)"
     return $dst
 }
@@ -1075,7 +1267,6 @@ function Describe-Conflict($Row) {
 function Invoke-ApplyConflict($Cfg, $Row, [string]$Choice, $Ledger) {
     $app = "$($Row.app)"
     $localPath = $Row.local.path
-    $remoteUrl = ConvertTo-DriveUrl $Cfg "$(Get-RemoteBase $app)/$($Row.project)/$($Row.id).jsonl"
 
     if ($Choice -eq "skip") {
         Write-Warn2 "  skipped (still conflicted)"
@@ -1084,12 +1275,10 @@ function Invoke-ApplyConflict($Cfg, $Row, [string]$Choice, $Ledger) {
 
     if ($Choice -eq "local") {
         if ($Row.remote) {
-            $kept = Save-RemoteRevert $Cfg $Row.project $Row.id $app
+            $kept = Save-RemoteRevert $Cfg $Row
             Save-HistorySnapshot $Row.project $Row.id $kept $app | Out-Null
-            Copy-Up $localPath $remoteUrl
-        } else {
-            Copy-Up $localPath $remoteUrl
         }
+        Invoke-UploadSession $Cfg $Row $localPath
         Set-LedgerEntry $Ledger $Row.project $Row.id $Row.local_md5 $Row.local_md5 $app
         Write-Info "  ->  local wins, uploaded"
         return "resolved"
@@ -1101,7 +1290,7 @@ function Invoke-ApplyConflict($Cfg, $Row, [string]$Choice, $Ledger) {
             Save-HistorySnapshot $Row.project $Row.id $saved $app | Out-Null
         }
         $tmpLocal = Get-LocalSessionPath $Row.project $Row.id $app $Row.remote.mtime
-        Copy-Down $remoteUrl $tmpLocal
+        Invoke-FetchRemoteRaw $Cfg $Row $tmpLocal
         Set-LedgerEntry $Ledger $Row.project $Row.id $Row.remote_md5 $Row.remote_md5 $app
         Write-Info "  ->  remote wins, downloaded"
         return "resolved"
@@ -1112,10 +1301,10 @@ function Invoke-ApplyConflict($Cfg, $Row, [string]$Choice, $Ledger) {
                 ($Row.local.mtime -ge $Row.remote.mtime)
     if ($useLocal) {
         if ($Row.remote) {
-            $kept = Save-RemoteRevert $Cfg $Row.project $Row.id $app
+            $kept = Save-RemoteRevert $Cfg $Row
             Save-HistorySnapshot $Row.project $Row.id $kept $app | Out-Null
         }
-        Copy-Up $localPath $remoteUrl
+        Invoke-UploadSession $Cfg $Row $localPath
         Set-LedgerEntry $Ledger $Row.project $Row.id $Row.local_md5 $Row.local_md5 $app
         Write-Info ("  ->  local wins (newer: {0}), uploaded" -f (Format-Time $Row.local.mtime))
     } else {
@@ -1123,7 +1312,7 @@ function Invoke-ApplyConflict($Cfg, $Row, [string]$Choice, $Ledger) {
             $saved = Save-LocalRevert $Row.project $Row.id $localPath $app
             Save-HistorySnapshot $Row.project $Row.id $saved $app | Out-Null
         }
-        Copy-Down $remoteUrl (Get-LocalSessionPath $Row.project $Row.id $app $Row.remote.mtime)
+        Invoke-FetchRemoteRaw $Cfg $Row (Get-LocalSessionPath $Row.project $Row.id $app $Row.remote.mtime)
         Set-LedgerEntry $Ledger $Row.project $Row.id $Row.remote_md5 $Row.remote_md5 $app
         Write-Info ("  ->  remote wins (newer: {0}), downloaded" -f (Format-Time $Row.remote.mtime))
     }
@@ -1158,7 +1347,9 @@ function Invoke-ListSessions([string]$Project, [switch]$Titles, [switch]$Json, [
             if ($remoteMap.ContainsKey($proj)) {
                 foreach ($r in $remoteMap[$proj]) {
                     if ($seen.ContainsKey($r.id)) { continue }
-                    $items.Add(@{ app = $app; proj = $proj; id = $r.id; size = $r.size; mtime = $r.mtime; path = $null; where = "remote" })
+                    # rrow: the remote row itself (object name/md5/size) — the
+                    # gzip-aware fetch needs it to target the ACTUAL object
+                    $items.Add(@{ app = $app; proj = $proj; id = $r.id; size = $r.size; mtime = $r.mtime; path = $null; where = "remote"; rrow = $r })
                 }
             }
         }
@@ -1208,8 +1399,9 @@ function Invoke-ListSessions([string]$Project, [switch]$Titles, [switch]$Json, [
                 if ($it.app -eq "codex") { $title = (Get-CodexTitle $it.path) }
                 else { $title = (Get-SessionTitle $it.path) }
             }
-            if (-not $title -and $it.where -eq "remote") {
-                $tmp = Get-RemoteTranscript $cfg $it.proj $it.id $it.app
+            if (-not $title -and $it.where -eq "remote" -and $it.rrow) {
+                $tmp = Get-RemoteTranscript $cfg @{
+                    app = $it.app; project = $it.proj; id = $it.id; remote = $it.rrow }
                 if ($tmp) {
                     if ($it.app -eq "codex") { $title = (Get-CodexTitle $tmp) }
                     else { $title = (Get-SessionTitle $tmp) }
@@ -1408,6 +1600,7 @@ function Invoke-DeepCheck($Cfg, [string]$App) {
     Write-Info ""
     Write-Info "deep check (--full):"
     $apps = Get-SelectedApps $App
+    $ledger = (Get-Ledger).sessions
     $remoteKeys = @{}; $remoteMd5s = @{}
     foreach ($app in $apps) {
         $remoteMap = @{}
@@ -1415,8 +1608,21 @@ function Invoke-DeepCheck($Cfg, [string]$App) {
             Write-Fail "deep check: cannot list Drive: $($_.Exception.Message)"
         }
         foreach ($proj in $remoteMap.Keys) {
+            # group by id: a superseded object whose cleanup deletefile failed
+            # shares the sid with the live copy — dedupe to one row per id
+            # (ledger-recorded md5 wins, else newest) before comparing
+            $byId = @{}
             foreach ($s in @($remoteMap[$proj])) {
-                $k = Get-LedgerKey $proj $s.id $app
+                if (-not $byId.ContainsKey($s.id)) {
+                    $byId[$s.id] = New-Object System.Collections.Generic.List[object]
+                }
+                $byId[$s.id].Add($s)
+            }
+            foreach ($sid in $byId.Keys) {
+                $entry = $null
+                $k = Get-LedgerKey $proj $sid $app
+                if ($ledger.ContainsKey($k)) { $entry = $ledger[$k] }
+                $s = Select-OneRemoteRow @($byId[$sid].ToArray()) $entry
                 $remoteKeys[$k] = $true
                 $remoteMd5s[$k] = $s.md5
             }
@@ -1434,8 +1640,6 @@ function Invoke-DeepCheck($Cfg, [string]$App) {
             }
         }
     }
-
-    $ledger = (Get-Ledger).sessions
 
     # dead ledger entries — recorded, but the file is gone from both sides
     $dead = @($ledger.Keys | Where-Object { -not $localKeys.ContainsKey($_) -and -not $remoteKeys.ContainsKey($_) } | Sort-Object)
@@ -1667,7 +1871,7 @@ function Invoke-Push([string]$Project, [string]$App, [switch]$DryRun, [switch]$Q
         }
         Write-Info "  pushing $label"
         try {
-            Copy-Up $r.local.path (ConvertTo-DriveUrl $cfg "$(Get-RemoteBase $r.app)/$($r.project)/$($r.id).jsonl")
+            Invoke-UploadSession $cfg $r $r.local.path
             Set-LedgerEntry $ledger $r.project $r.id $r.local_md5 $r.local_md5 $r.app
             $pushed++; $dirty = $true
         } catch {
@@ -1681,7 +1885,7 @@ function Invoke-Push([string]$Project, [string]$App, [switch]$DryRun, [switch]$Q
     }
 }
 
-function Invoke-Pull([string]$Project, [string]$App, [switch]$DryRun, [switch]$Quiet) {
+function Invoke-Pull([string]$Project, [string]$App, [switch]$DryRun, [switch]$Quiet, [switch]$Adopt) {
     if ($Quiet) { $script:Quiet = $true }
     Invoke-WithTransferLock $DryRun {
     $cfg = Get-SessiumConfig
@@ -1697,6 +1901,9 @@ function Invoke-Pull([string]$Project, [string]$App, [switch]$DryRun, [switch]$Q
 
     $pulled = 0; $skipped = 0; $failures = 0; $dirty = $false
     $inSync = 0
+    # the cross-machine flow (SPEC §7): after pulling, re-home every pulled
+    # claude project into this machine's name for the current directory
+    $pulledProjects = @{}
     foreach ($r in $rows) {
         if ($r.state -eq "in-sync") {
             $inSync++
@@ -1717,15 +1924,17 @@ function Invoke-Pull([string]$Project, [string]$App, [switch]$DryRun, [switch]$Q
         if ($DryRun) {
             Write-Info ("would pull {0} ({1})" -f $label, (Get-HumanSize $r.remote.size))
             $pulled++
+            if ($Adopt -and $r.app -eq "claude") { $pulledProjects[$r.project] = $true }
             continue
         }
         Write-Info "  pulling $label"
         try {
             # codex: the mtime drives the synthesized rollout-<mtime>-<uuid> path
             $dest = Get-LocalSessionPath $r.project $r.id $r.app $r.remote.mtime
-            Copy-Down (ConvertTo-DriveUrl $cfg "$(Get-RemoteBase $r.app)/$($r.project)/$($r.id).jsonl") $dest
+            Invoke-FetchRemoteRaw $cfg $r $dest
             Set-LedgerEntry $ledger $r.project $r.id $r.remote_md5 $r.remote_md5 $r.app
             $pulled++; $dirty = $true
+            if ($Adopt -and $r.app -eq "claude") { $pulledProjects[$r.project] = $true }
         } catch {
             Write-Warn2 "  [!]  pull failed for ${label}: $($_.Exception.Message)"
             $failures++
@@ -1733,6 +1942,12 @@ function Invoke-Pull([string]$Project, [string]$App, [switch]$DryRun, [switch]$Q
     }
     if ($dirty) { Save-Ledger $ledger }
     Write-TransferSummary 0 $pulled $skipped $inSync $failures
+    if ($Adopt) {
+        $rc = Invoke-AdoptForResume $pulledProjects $DryRun
+        if ($rc -ne 0) { exit 1 }
+        if ($failures -gt 0) { exit 1 }
+        return
+    }
     if ($failures -gt 0) { exit 1 }
     }
 }
@@ -1766,7 +1981,6 @@ function Invoke-Sync([string]$Project, [string]$Only, [string]$App, [switch]$Int
     $inSync = 0; $dirty = $false
     foreach ($r in $rows) {
         $label = "{0}/{1}" -f $r.project, (Get-ShortId $r.id)
-        $rUrl = ConvertTo-DriveUrl $cfg "$(Get-RemoteBase $r.app)/$($r.project)/$($r.id).jsonl"
         switch ($r.state) {
             "in-sync" {
                 $inSync++
@@ -1783,7 +1997,7 @@ function Invoke-Sync([string]$Project, [string]$Only, [string]$App, [switch]$Int
                 }
                 Write-Info "  pushing $label"
                 try {
-                    Copy-Up $r.local.path $rUrl
+                    Invoke-UploadSession $cfg $r $r.local.path
                     Set-LedgerEntry $ledger $r.project $r.id $r.local_md5 $r.local_md5 $r.app
                     $pushed++; $dirty = $true
                 } catch {
@@ -1800,7 +2014,7 @@ function Invoke-Sync([string]$Project, [string]$Only, [string]$App, [switch]$Int
                 Write-Info "  pulling $label"
                 try {
                     $dest = Get-LocalSessionPath $r.project $r.id $r.app $r.remote.mtime
-                    Copy-Down $rUrl $dest
+                    Invoke-FetchRemoteRaw $cfg $r $dest
                     Set-LedgerEntry $ledger $r.project $r.id $r.remote_md5 $r.remote_md5 $r.app
                     $pulled++; $dirty = $true
                 } catch {
@@ -1816,7 +2030,7 @@ function Invoke-Sync([string]$Project, [string]$Only, [string]$App, [switch]$Int
                 }
                 Write-Info "  pushing (new) $label"
                 try {
-                    Copy-Up $r.local.path $rUrl
+                    Invoke-UploadSession $cfg $r $r.local.path
                     Set-LedgerEntry $ledger $r.project $r.id $r.local_md5 $r.local_md5 $r.app
                     $pushed++; $dirty = $true
                 } catch {
@@ -1833,7 +2047,7 @@ function Invoke-Sync([string]$Project, [string]$Only, [string]$App, [switch]$Int
                 Write-Info "  pulling (new) $label"
                 try {
                     $dest = Get-LocalSessionPath $r.project $r.id $r.app $r.remote.mtime
-                    Copy-Down $rUrl $dest
+                    Invoke-FetchRemoteRaw $cfg $r $dest
                     Set-LedgerEntry $ledger $r.project $r.id $r.remote_md5 $r.remote_md5 $r.app
                     $pulled++; $dirty = $true
                 } catch {
@@ -1882,7 +2096,7 @@ function Show-DiffRow($Row) {
         Write-Info "  local  : (absent)"
     }
     if ($Row.remote) {
-        $tmp = Get-RemoteTranscript (Get-SessiumConfig) $Row.project $Row.id $Row.app
+        $tmp = Get-RemoteTranscript (Get-SessiumConfig) $Row
         if ($tmp) {
             $t = Read-Transcript $tmp
             Remove-Item -LiteralPath $tmp -Force
@@ -1925,7 +2139,7 @@ function Invoke-Diff([string]$Prefix, [string]$Project, [string]$App, [switch]$J
                 Write-Warn2 "  [!]  --messages needs both copies present (pull first if the remote side is missing)"
             } else {
                 $localMsgs = Get-TranscriptMessages $row.local.path
-                $tmp = Get-RemoteTranscript $cfg $row.project $row.id $row.app
+                $tmp = Get-RemoteTranscript $cfg $row
                 $remoteMsgs = @()
                 if ($tmp) { $remoteMsgs = Get-TranscriptMessages $tmp }
                 $preview = Get-MessageDivergence $localMsgs $remoteMsgs
@@ -1956,7 +2170,7 @@ function Invoke-Diff([string]$Prefix, [string]$Project, [string]$App, [switch]$J
                 messages = 0
                 last = ""
             }
-            $tmp2 = Get-RemoteTranscript $cfg $row.project $row.id $row.app
+            $tmp2 = Get-RemoteTranscript $cfg $row
             if ($tmp2) {
                 $t = Read-Transcript $tmp2
                 Remove-Item -LiteralPath $tmp2 -Force
@@ -2297,6 +2511,121 @@ function Invoke-Adopt([string]$Source, [string]$RepoPath, [switch]$DryRun) {
     return 0
 }
 
+# --------------------------------------------------- cross-machine resume
+
+<# True when the current directory is the user's home - adopting there
+   would create a junk folder like 'C--Users-me'. Windows paths compare
+   case-insensitively. #>
+function Test-AtHomeDir {
+    $cwd = (Get-Location).Path
+    $homeDir = ""
+    try { $homeDir = [Environment]::GetFolderPath("UserProfile") } catch { }
+    if (-not $homeDir -and $env:USERPROFILE) { $homeDir = $env:USERPROFILE }
+    if (-not $homeDir) { return $false }
+    return ($cwd.TrimEnd('\', '/').ToLowerInvariant() -eq
+            $homeDir.TrimEnd('\', '/').ToLowerInvariant())
+}
+
+<# The second half of cross-machine resume (pull --adopt, resume with no
+   id): re-home every munged project folder in $Projects into this machine's
+   name for the CURRENT directory, so claude's native --resume picker lists
+   those sessions. Whole folders, deliberately - the user gets all their
+   sessions for that repo, not just one. Codex is never passed in (codex
+   resumes from anywhere). #>
+function Invoke-AdoptForResume($Projects, [bool]$DryRun) {
+    if (Test-AtHomeDir) {
+        Write-Warn2 "  [!]  current directory is your home folder — cd into your repo first; adoption skipped (it would create a junk folder like '$(ConvertTo-Munge (Get-Location).Path)')"
+        return 1
+    }
+    $rc = 0
+    $cwd = (Get-Location).Path
+    foreach ($src in (@($Projects.Keys) | Sort-Object)) {
+        if ((Invoke-Adopt $src $cwd -DryRun:$DryRun) -ne 0) { $rc = 1 }
+    }
+    return $rc
+}
+
+<# Pick up work on this machine, whatever machine the sessions came from.
+   With an id: adopt that session's project folder into this machine's
+   munged name (if needed) and print the exact resume command. With no id:
+   find local sessions whose recorded repo matches the current repo by
+   basename (the lossy-munge-proof signal) and adopt every folder that
+   matches, then let claude's native picker take over. #>
+function Invoke-Resume([string]$Prefix, [string]$Project, [string]$App,
+                       [switch]$Go, [switch]$DryRun) {
+    $cfg = Get-SessiumConfig
+    $cwd = (Get-Location).Path
+    $target = ConvertTo-Munge $cwd
+
+    if ($Prefix) {
+        $ledger = Get-Ledger
+        $col = Get-CollectRows $cfg $App $ledger $false
+        $rows = $col.rows
+        if (-not $col.reachable) {
+            Write-Warn2 "  [!]  cannot reach Drive right now — searching locally only"
+        }
+        if ($Project) { $rows = @($rows | Where-Object { $_.project -eq $Project }) }
+        $row = Find-OneSession $Prefix $rows
+
+        if (-not $row.local) {
+            Write-Fail "$($row.project)/$($row.id) is not on this machine — run 'sessium pull' first"
+        }
+        if ($row.app -eq "codex") {
+            Write-Info "codex resumes from anywhere — no adoption needed:"
+            Write-Info "cd $cwd; codex resume $($row.id)"
+            if ($Go -and -not $DryRun) {
+                Start-Process -FilePath "powershell" -WorkingDirectory $cwd `
+                    -ArgumentList "-NoExit", "-Command", "codex resume $($row.id)"
+            }
+            return 0
+        }
+        if ($row.project -ne $target) {
+            if (Test-AtHomeDir) {
+                Write-Warn2 "  [!]  current directory is your home folder — cd into the repo first; refusing to adopt into it"
+                return 1
+            }
+            $rc = Invoke-Adopt $row.project $cwd -DryRun:$DryRun
+            if ($rc -ne 0) { return $rc }
+        }
+        Write-Info "cd $cwd; claude --resume $($row.id)"
+        if ($Go -and -not $DryRun) {
+            Start-Process -FilePath "powershell" -WorkingDirectory $cwd `
+                -ArgumentList "-NoExit", "-Command", "claude --resume $($row.id)"
+        }
+        return 0
+    }
+
+    # no id: match this repo by basename across every local claude project
+    # folder that is NOT this machine's own name for it
+    $col = Get-CollectRows $cfg $App (Get-Ledger) $false
+    if (-not $col.reachable) {
+        Write-Warn2 "  [!]  cannot reach Drive right now — matching local sessions only"
+    }
+    $base = Split-Path -Leaf $cwd
+    $found = @{}
+    foreach ($r in $col.rows) {
+        if ("$($r.app)" -ne "claude" -or -not $r.local -or
+                $r.project -eq $target -or $found.ContainsKey($r.project)) { continue }
+        $recorded = Get-SessionCwd $r.local.path
+        if (-not $recorded) { continue }
+        $recordedBase = ($recorded -split '[\\/]')[-1]
+        if ($recordedBase -ieq $base) { $found[$r.project] = $recorded }
+    }
+    if ($found.Count -eq 0) {
+        Write-Info "no sessions from other machines match this repo ('$base' by basename)."
+        Write-Info "try: sessium list   or   sessium resume <id-prefix>"
+        return 1
+    }
+    Write-Info ("sessions recorded in a repo named '{0}' (from {1} other-machine folder(s)):" -f $base, $found.Count)
+    foreach ($src in (@($found.Keys) | Sort-Object)) {
+        Write-Info "  $src"
+        if ("$($found[$src])") { Write-Info "    recorded path there: $($found[$src])" }
+    }
+    $rc = Invoke-AdoptForResume $matches $DryRun
+    if ($rc -eq 0) { Write-Info "next: claude --resume" }
+    return $rc
+}
+
 # ---------------------------------------------------------------- batch 3
 
 function Invoke-Version {
@@ -2323,8 +2652,10 @@ function Get-SessionCwd([string]$Path) {
 
 <# Print (or with -Go, spawn) the resume command for a session. The repo
    path comes from the transcript's own cwd stamps, so this works across
-   machines despite the lossy munging. -Adopt rehomes the sessions first
-   when the repo is not at this machine's matching path. #>
+   machines despite the lossy munging. -Adopt re-homes the session's whole
+   project folder into THIS machine's name for the CURRENT directory first
+   (the old behaviour adopted into the transcript's recorded cwd, which is
+   always the pushing machine's folder name - a silent no-op). #>
 function Invoke-Open([string]$Prefix, [string]$Project, [string]$App, [switch]$Go,
                      [switch]$Adopt, [switch]$DryRun) {
     $cfg = Get-SessiumConfig
@@ -2352,14 +2683,24 @@ function Invoke-Open([string]$Prefix, [string]$Project, [string]$App, [switch]$G
         $cwd = $row.project.Replace("-", "\")
         Write-Warn2 "  [!]  transcript has no cwd stamp — guessing $cwd"
     }
-    if ($Adopt -and -not (Test-Path -LiteralPath $cwd)) {
-        Write-Info "repo path $cwd does not exist here — adopting sessions first"
-        if ($DryRun) {
-            Write-Info "dry-run: would run adopt for $($row.project) -> $cwd"
-            return
+    if ($Adopt -and $row.app -ne "codex") {
+        # adopt into THIS machine's name for the CURRENT directory — only
+        # needed when the session's folder isn't already ours
+        $here = ConvertTo-Munge (Get-Location).Path
+        if ($row.project -ne $here) {
+            if (Test-AtHomeDir) {
+                Write-Warn2 "  [!]  current directory is your home folder — cd into the repo first; refusing to adopt into it"
+                return 1
+            }
+            Write-Info "session lives under $($row.project) — adopting it into $here first"
+            $rc = Invoke-Adopt $row.project (Get-Location).Path -DryRun:$DryRun
+            if ($rc -ne 0) { return $rc }
         }
-        Invoke-Adopt $row.project $cwd
-        return
+    }
+    if (-not (Test-Path -LiteralPath $cwd)) {
+        # the recorded repo doesn't exist on this machine — resume from here
+        Write-Warn2 "  [!]  recorded repo $cwd does not exist here — resuming from the current directory instead"
+        $cwd = (Get-Location).Path
     }
     $binary = "claude"; $goArgs = "claude --resume $($row.id)"
     if ($row.app -eq "codex") { $binary = "codex"; $goArgs = "codex resume $($row.id)" }
@@ -3093,7 +3434,13 @@ usage: sessium <command> [args]
                                            on every session end
   version                                  print the version
   push [--dry-run] [--quiet] [--project <m>]   upload new/changed sessions
-  pull [--dry-run] [--quiet] [--project <m>]   download new/changed sessions
+  pull [--dry-run] [--quiet] [--project <m>] [--adopt]
+                                           download new/changed sessions;
+                                           --adopt re-homes pulled sessions
+                                           into this machine's name for the
+                                           current directory (the one-step
+                                           new-computer flow: cd into your
+                                           repo first)
   sync [--interactive] [--dry-run] [--quiet] [--project <m>] [--only memory|skills]
                                            push AND pull; decides conflicts
   diff <id> [--messages] [--json]          local vs remote vs last-synced
@@ -3107,6 +3454,12 @@ usage: sessium <command> [args]
   checkout <id> <seq> [--dry-run]          restore a history snapshot (see 'log <id>')
   gc [--keep N] [--dry-run]                prune revert/ + history/ beyond N per session
   open <id> [--go] [--adopt] [--dry-run]   print (or run) the claude/codex resume command
+  resume [<id>] [--go] [--dry-run] [--app <a>]
+                                           pick work up on this machine: adopt
+                                           the session's folder into this
+                                           machine's name and print the resume
+                                           command; with no id, match this repo
+                                           by name across other machines' folders
   adopt <munged-folder> <repo-path> [--dry-run]
                                            rehome sessions to this machine's path
   export [<id>] [--all] [--html] [--out DIR] [--project <m>]
@@ -3119,8 +3472,8 @@ session ids: a prefix is enough ('sessium diff 9f8e'). Munged project names
 always start with '-' (e.g. -C--Users-me-repo) - fine after --project.
 
 --app claude|codex|all on the session commands (list, status, check, push,
-pull, sync, diff, resolve, revert, checkout, gc, open, log): which CLI's
-sessions this run touches - Claude Code, Codex CLI, or both (default).
+pull, sync, diff, resolve, revert, checkout, gc, open, resume, log): which
+CLI's sessions this run touches - Claude Code, Codex CLI, or both (default).
 export and search read Claude Code transcripts only for now.
 
 --debug/--verbose prints every rclone call. Exit codes: 0 ok (skips are not failures),
@@ -3209,7 +3562,7 @@ function Invoke-Main([string[]]$CliArgs) {
         }
         "hook"     { return (Invoke-Hook -Off:$opt.off -Print:$opt.print) }
         "push"     { Invoke-Push $opt.project -App $opt.app -DryRun:$opt.dryrun -Quiet:$opt.quiet; return 0 }
-        "pull"     { Invoke-Pull $opt.project -App $opt.app -DryRun:$opt.dryrun -Quiet:$opt.quiet; return 0 }
+        "pull"     { Invoke-Pull $opt.project -App $opt.app -DryRun:$opt.dryrun -Quiet:$opt.quiet -Adopt:$opt.adopt; return 0 }
         "sync"     { Invoke-Sync $opt.project $opt.only -App $opt.app -Interactive:$opt.interactive -DryRun:$opt.dryrun -Quiet:$opt.quiet; return 0 }
         "version"  { return (Invoke-Version) }
         "log" {
@@ -3220,6 +3573,11 @@ function Invoke-Main([string[]]$CliArgs) {
         "open" {
             if ($positional.Count -lt 1) { Write-Fail "usage: sessium open <id> [--go] [--adopt]  (prefix ok)" }
             return (Invoke-Open $positional[0] $opt.project -App $opt.app -Go:$opt.go -Adopt:$opt.adopt -DryRun:$opt.dryrun)
+        }
+        "resume" {
+            $prefix = ""
+            if ($positional.Count -gt 0) { $prefix = $positional[0] }
+            return (Invoke-Resume $prefix $opt.project -App $opt.app -Go:$opt.go -DryRun:$opt.dryrun)
         }
         "diff" {
             if ($positional.Count -lt 1) { Write-Fail "usage: sessium diff <id> [--messages] [--json]  (prefix ok)" }

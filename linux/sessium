@@ -37,6 +37,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+import zlib
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -762,16 +763,20 @@ def parse_remote_name(name: str):
             return None
         return sid, md5.lower(), True
     if name.endswith(".jsonl"):
-        return name[:-len(".jsonl")], None, False
+        sid = name[:-len(".jsonl")]
+        return (sid, None, False) if sid else None
     return None
 
 
 def remote_object_url(cfg: dict, row: dict) -> str:
-    """Drive URL of a session's ACTUAL object. Remote rows carry 'name' —
-    the real filename (gzip'd or legacy) — so every download targets what
-    is really on Drive, not what a name pattern guesses."""
+    """Drive URL of a session's ACTUAL object. Accepts both row shapes: a
+    bare remote row (top-level 'name', from remote_sessions) or a classified
+    row (name at row['remote']['name'] — the real filename, gzip'd or
+    legacy). Every transfer targets what is really on Drive, not what a
+    name pattern guesses."""
+    name = row.get("name") or (row.get("remote") or {}).get("name")
     return drive_url(cfg, f"{remote_base(row.get('app', 'claude'))}"
-                          f"/{row['project']}/{row['name']}")
+                          f"/{row['project']}/{name}")
 
 
 def gzip_to(src: Path, dst: Path) -> None:
@@ -931,7 +936,12 @@ def fetch_remote_raw(cfg: dict, row: dict, dst: Path) -> None:
                       size_bytes=remote.get("size") or None)
         if is_gzip(wire):
             raw = wire.with_name(wire.name + ".raw")
-            gunzip_to(wire, raw)
+            try:
+                gunzip_to(wire, raw)
+            except (OSError, EOFError, zlib.error) as exc:
+                # valid magic, corrupt body — fail like any transfer failure
+                raise RcloneError(
+                    f"corrupt gzip object {row['project']}/{row['id']}: {exc}")
             wire.unlink()
             wire = raw
         got = md5_of(wire)

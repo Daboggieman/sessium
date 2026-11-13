@@ -13,7 +13,10 @@ from test_sessium import (
     Batch6Tests,
     CodexTests,
     CommandTests,
+    GzipTransportTests,
+    GzipUnitTests,
     Phase3Tests,
+    ResumeTests,
     SyncTests,
     UnitTests,
 )
@@ -22,6 +25,7 @@ if __name__ == "__main__":
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
     suite.addTests(loader.loadTestsFromTestCase(UnitTests))
+    suite.addTests(loader.loadTestsFromTestCase(GzipUnitTests))
     suite.addTests(loader.loadTestsFromTestCase(CommandTests))
     suite.addTests(loader.loadTestsFromTestCase(SyncTests))
     suite.addTests(loader.loadTestsFromTestCase(Phase3Tests))
@@ -30,5 +34,7 @@ if __name__ == "__main__":
     suite.addTests(loader.loadTestsFromTestCase(Batch5Tests))
     suite.addTests(loader.loadTestsFromTestCase(Batch6Tests))
     suite.addTests(loader.loadTestsFromTestCase(CodexTests))
+    suite.addTests(loader.loadTestsFromTestCase(GzipTransportTests))
+    suite.addTests(loader.loadTestsFromTestCase(ResumeTests))
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     sys.exit(0 if result.wasSuccessful() else 1)
