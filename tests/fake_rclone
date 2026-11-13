@@ -8,8 +8,9 @@ directory on disk (FAKE_DRIVE_ROOT) that mirrors the Drive folder layout:
 
 Supported: version, lsd <remote>:, lsf <remote>:<path>, lsjson [--recursive]
 [--hash] <remote>:<path>, copyto <src> <dst>, copy <src-dir> <dst-dir>
-[--update], cat <remote>:<path>, config file, config create <name> <type>
-<key=val...> (logged to $FAKE_DRIVE_ROOT/rclone-config.log). Everything else
+[--update], cat <remote>:<path>, deletefile <remote>:<path>, config file,
+config create <name> <type> <key=val...> (logged to
+$FAKE_DRIVE_ROOT/rclone-config.log). Everything else
 exits 1 — deliberately, so tests catch sessium calling something new before
 the stub learns it.
 """
@@ -175,6 +176,13 @@ def main() -> None:
                 continue
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(f.read_bytes())
+        return
+    if args[0] == "deletefile":
+        target = resolve_arg(args[1])
+        if not target.is_file():
+            print(f"file not found: {target}", file=sys.stderr)
+            sys.exit(3)
+        target.unlink()
         return
     print(f"fake_rclone: unsupported command: {' '.join(args)}", file=sys.stderr)
     sys.exit(1)

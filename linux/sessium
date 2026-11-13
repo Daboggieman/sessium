@@ -23,6 +23,7 @@ Phase 3 commands: diff, resolve, revert, adopt.
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
 import html as html_
 import json
@@ -611,7 +612,10 @@ def session_title(path: Path, max_lines: int = 200) -> str:
 
 def remote_sessions(cfg: dict, app: str = "claude") -> dict:
     """munged project name -> list of session dicts, read straight off Drive.
-    Claude lives under projects/, codex under codex/projects/."""
+    Claude lives under projects/, codex under codex/projects/. Objects are
+    gzip'd transcripts named <sid>-<rawmd5>.jsonl.gz (raw md5 embedded in the
+    name); legacy plaintext <sid>.jsonl objects are read forever — their
+    lsjson hash IS the raw md5."""
     prefix = "codex/projects" if app == "codex" else "projects"
     try:
         proc = rclone("lsjson", "--recursive", "--hash", drive_url(cfg, prefix))
@@ -627,16 +631,21 @@ def remote_sessions(cfg: dict, app: str = "claude") -> dict:
         if entry.get("IsDir"):
             continue
         path = entry.get("Path", "")
-        if not path.endswith(".jsonl") or "/" not in path:
+        if "/" not in path:
             continue
         project, filename = path.split("/", 1)
         if "/" in filename:
             continue  # transcripts live at the top level of each project
+        parsed = parse_remote_name(filename)
+        if parsed is None:
+            continue  # not a session transcript (junk, other suffixes)
+        sid, raw_md5, gz = parsed
         result.setdefault(project, []).append({
-            "id": filename[:-len(".jsonl")],
+            "id": sid,
+            "name": filename,
             "size": entry.get("Size", 0),
             "mtime": parse_rclone_time(entry.get("ModTime", "")),
-            "md5": (entry.get("Hashes") or {}).get("MD5", ""),
+            "md5": raw_md5 if gz else (entry.get("Hashes") or {}).get("MD5", ""),
         })
     for sessions in result.values():
         sessions.sort(key=lambda s: s["id"])
@@ -680,6 +689,24 @@ def classify_row(project: str, sid: str, local, remote, entry,
     }
 
 
+def one_remote_row(sessions: list, entry=None):
+    """One remote row per session id. When two objects share an id — a
+    superseded object whose cleanup deletefile failed (a stale .jsonl or
+    an older .jsonl.gz) — prefer the copy the ledger recorded, else the
+    newest. The stale object is invisible to classification and self-heals
+    on the next successful push (which retries the supersede)."""
+    if len(sessions) == 1:
+        return sessions[0]
+    if entry:
+        want = entry.get("remote_md5")
+        if want:
+            for s in sessions:
+                if s["md5"] == want:
+                    return s
+    return max(sessions, key=lambda s: (s["mtime"] is not None,
+                                        s["mtime"] or 0))
+
+
 def classify_ledger(local_map: dict, remote_map: dict, ledger: dict,
                     app: str = "claude") -> list:
     """One row per (project, session) present on either side, classified
@@ -689,7 +716,11 @@ def classify_ledger(local_map: dict, remote_map: dict, ledger: dict,
     rows = []
     for project in sorted(set(local_map) | set(remote_map)):
         here = {s["id"]: s for s in local_map.get(project, [])}
-        there = {s["id"]: s for s in remote_map.get(project, [])}
+        groups: dict = {}
+        for s in remote_map.get(project, []):
+            groups.setdefault(s["id"], []).append(s)
+        there = {sid: one_remote_row(group, sessions.get(ledger_key(project, sid, app)))
+                 for sid, group in groups.items()}
         for sid in sorted(set(here) | set(there)):
             entry = sessions.get(ledger_key(project, sid, app))
             rows.append(classify_row(project, sid, here.get(sid),
@@ -701,13 +732,65 @@ def classify_ledger(local_map: dict, remote_map: dict, ledger: dict,
 # transfers — the only code that moves session bytes
 # ---------------------------------------------------------------------------
 
-def session_remote_url(cfg: dict, project: str, sid: str,
-                       app: str = "claude") -> str:
-    """Drive path of one transcript. Claude: projects/<munged>/<sid>.jsonl;
-    codex: codex/projects/<munged>/<sid>.jsonl (never mixed in one tree —
-    the file layouts differ and one bad write could strand both)."""
-    base = "codex/projects" if app == "codex" else "projects"
-    return drive_url(cfg, f"{base}/{project}/{sid}.jsonl")
+def remote_base(app: str) -> str:
+    """Drive folder holding one app's transcripts. Claude: projects/;
+    codex: codex/projects/ (never mixed in one tree — the file layouts
+    differ and one bad write could strand both)."""
+    return "codex/projects" if app == "codex" else "projects"
+
+
+def remote_object_name(sid: str, raw_md5: str) -> str:
+    """Drive object name for a transcript: <sid>-<rawmd5>.jsonl.gz. The
+    UNCOMPRESSED md5 rides in the name, so classification stays in the raw
+    domain — deterministic no matter which gzip implementation compressed
+    the bytes (Python's and .NET's compressed streams differ; nothing ever
+    compares them)."""
+    return f"{sid}-{raw_md5}.jsonl.gz"
+
+
+def parse_remote_name(name: str):
+    """(sid, raw_md5, gz) for a Drive object name, else None. For .jsonl.gz:
+    strip the suffix, split on the LAST '-' — the trailing 32 hex chars are
+    the embedded raw md5 (sids are dashed uuids, md5s contain no dashes, so
+    this is unambiguous). Legacy .jsonl: (sid, None, False) — the lsjson
+    hash of a plaintext object IS the raw md5."""
+    if name.endswith(".jsonl.gz"):
+        stem = name[:-len(".jsonl.gz")]
+        sid, sep, md5 = stem.rpartition("-")
+        if not sep or not sid or len(md5) != 32 \
+                or any(c not in "0123456789abcdefABCDEF" for c in md5):
+            return None
+        return sid, md5.lower(), True
+    if name.endswith(".jsonl"):
+        return name[:-len(".jsonl")], None, False
+    return None
+
+
+def remote_object_url(cfg: dict, row: dict) -> str:
+    """Drive URL of a session's ACTUAL object. Remote rows carry 'name' —
+    the real filename (gzip'd or legacy) — so every download targets what
+    is really on Drive, not what a name pattern guesses."""
+    return drive_url(cfg, f"{remote_base(row.get('app', 'claude'))}"
+                          f"/{row['project']}/{row['name']}")
+
+
+def gzip_to(src: Path, dst: Path) -> None:
+    with open(src, "rb") as fin, gzip.open(dst, "wb") as fout:
+        shutil.copyfileobj(fin, fout)
+
+
+def gunzip_to(src: Path, dst: Path) -> None:
+    with gzip.open(src, "rb") as fin, open(dst, "wb") as fout:
+        shutil.copyfileobj(fin, fout)
+
+
+def is_gzip(path: Path) -> bool:
+    """Magic sniff: gzip streams start 1f 8b."""
+    try:
+        with open(path, "rb") as handle:
+            return handle.read(2) == b"\x1f\x8b"
+    except OSError:
+        return False
 
 
 def local_root(app: str) -> Path:
@@ -833,31 +916,80 @@ def session_cwd(path: Path, max_lines: int = 50) -> str:
     return ""
 
 
-def fetch_remote_transcript(cfg: dict, project: str, sid: str,
-                            app: str = "claude") -> Path:
-    """Download a transcript for inspection; caller removes the temp file."""
-    fd, name = tempfile.mkstemp(prefix=f"sessium-{sid[:8]}-")
+def fetch_remote_raw(cfg: dict, row: dict, dst: Path) -> None:
+    """Pull one transcript down to dst as RAW bytes: the wire object may be
+    gzip'd (magic-sniffed, then decompressed) or legacy plaintext. Verifies
+    md5(raw bytes) against the object's recorded raw md5 — the name-embedded
+    hash for .jsonl.gz, the lsjson hash for legacy objects. A mismatch is a
+    transfer failure, same class as a failed copyto."""
+    remote = row["remote"]
+    fd, name = tempfile.mkstemp(prefix=f"sessium-{row['id'][:8]}-")
+    os.close(fd)
+    wire = Path(name)
+    try:
+        copy_retrying(["copyto", remote_object_url(cfg, row), str(wire)],
+                      size_bytes=remote.get("size") or None)
+        if is_gzip(wire):
+            raw = wire.with_name(wire.name + ".raw")
+            gunzip_to(wire, raw)
+            wire.unlink()
+            wire = raw
+        got = md5_of(wire)
+        want = remote.get("md5") or ""
+        if want and got != want:
+            raise RcloneError(
+                f"integrity check failed for {row['project']}/{row['id']} — "
+                f"raw md5 {got} != expected {want}")
+        shutil.move(str(wire), dst)          # cross-device safe (EXDEV)
+    finally:
+        wire.unlink(missing_ok=True)
+
+
+def fetch_remote_transcript(cfg: dict, row: dict) -> Path:
+    """Download a transcript (raw bytes) for inspection; caller removes
+    the temp file."""
+    fd, name = tempfile.mkstemp(prefix=f"sessium-{row['id'][:8]}-")
     os.close(fd)
     path = Path(name)
-    copy_retrying(["cat", session_remote_url(cfg, project, sid, app)],
-                  to_file=str(path))
+    fetch_remote_raw(cfg, row, path)
     return path
 
 
-def upload_session(cfg: dict, project: str, sid: str, local_path: str,
-                   app: str = "claude") -> None:
-    size = os.path.getsize(local_path)
-    copy_retrying(["copyto", local_path,
-                   session_remote_url(cfg, project, sid, app)],
-                  size_bytes=size)
+def upload_session(cfg: dict, row: dict, local_path: str) -> None:
+    """Push one transcript. The object on Drive becomes
+    <sid>-<rawmd5>.jsonl.gz (raw md5 computed here, before compressing);
+    the copy timeout scales with the COMPRESSED size — the wire carries
+    ~5-10x fewer bytes than the raw transcript. Afterwards the superseded
+    object (an older .jsonl.gz or a legacy .jsonl) is removed — only after
+    the replacement is confirmed on Drive. Same overwrite profile as the
+    copyto it replaces: the ledger recorded those bytes, and conflict
+    paths save a revert copy before ever overwriting."""
+    raw_md5 = md5_of(local_path)
+    new_name = remote_object_name(row["id"], raw_md5)
+    fd, name = tempfile.mkstemp(prefix="sessium-up-", suffix=".jsonl.gz")
+    os.close(fd)
+    tmp = Path(name)
+    try:
+        gzip_to(Path(local_path), tmp)
+        copy_retrying(["copyto", str(tmp), remote_object_url(
+                           cfg, {**row, "name": new_name})],
+                      size_bytes=tmp.stat().st_size)
+    finally:
+        tmp.unlink(missing_ok=True)
+    old_name = (row.get("remote") or {}).get("name")
+    if old_name and old_name != new_name:
+        try:
+            rclone("deletefile", remote_object_url(cfg, row), timeout=60)
+        except RcloneError as exc:
+            # harmless: the stale object is invisible to classification
+            # (one_remote_row prefers the ledger's copy) and the next
+            # successful push retries the cleanup
+            warn(f"could not remove superseded object {old_name}: {exc}")
 
 
-def download_session(cfg: dict, project: str, sid: str, local_path: str,
-                     app: str = "claude") -> None:
+def download_session(cfg: dict, row: dict, local_path: str) -> None:
     Path(local_path).parent.mkdir(parents=True, exist_ok=True)
-    # size unknown without an extra lsjson round-trip — base timeout + retries
-    copy_retrying(["copyto", session_remote_url(cfg, project, sid, app),
-                   local_path])
+    fetch_remote_raw(cfg, row, Path(local_path))
 
 
 def revert_path(project: str, sid: str, app: str = "claude") -> Path:
@@ -883,13 +1015,12 @@ def save_local_revert(project: str, sid: str, src: Path,
     return dst
 
 
-def save_remote_revert(cfg: dict, project: str, sid: str,
-                       app: str = "claude") -> Path:
-    """Preserve a losing REMOTE copy: download it into revert/ before the
-    upload overwrites it on Drive."""
-    dst = revert_path(project, sid, app)
-    copy_retrying(["copyto", session_remote_url(cfg, project, sid, app),
-                   str(dst)])
+def save_remote_revert(cfg: dict, row: dict) -> Path:
+    """Preserve a losing REMOTE copy: download it into revert/ (raw bytes —
+    revert copies are always plaintext, never gzip) before the upload
+    overwrites it on Drive."""
+    dst = revert_path(row["project"], row["id"], row["app"])
+    fetch_remote_raw(cfg, row, dst)
     return dst
 
 
@@ -1168,6 +1299,7 @@ def deep_check(cfg: dict, args) -> int:
     say("")
     say("deep check (--full):")
     apps = selected_apps(args)
+    ledger = load_ledger().get("sessions", {})
     remote_keys, remote_md5s = set(), {}
     for app in apps:
         try:
@@ -1176,8 +1308,12 @@ def deep_check(cfg: dict, args) -> int:
             fail(f"deep check: cannot list Drive: {exc}")
             return 1
         for project, sessions in remote_map.items():
+            groups: dict = {}
             for sess in sessions:
-                key = ledger_key(project, sess["id"], app)
+                groups.setdefault(sess["id"], []).append(sess)
+            for sid, group in groups.items():
+                key = ledger_key(project, sid, app)
+                sess = one_remote_row(group, ledger.get(key))
                 remote_keys.add(key)
                 remote_md5s[key] = sess["md5"]
 
@@ -1189,8 +1325,6 @@ def deep_check(cfg: dict, args) -> int:
                 local_keys.add(key)
                 local_md5s[key] = sess["md5"]
     live = local_keys | remote_keys
-
-    ledger = load_ledger().get("sessions", {})
 
     # 7. dead ledger entries — recorded, but the file is gone from both sides
     dead = sorted(set(ledger) - live)
@@ -1279,8 +1413,7 @@ def cmd_push(args) -> int:
                 pushed += 1
                 continue
             try:
-                upload_session(cfg, row["project"], row["id"],
-                               row["local"]["path"], row["app"])
+                upload_session(cfg, row, row["local"]["path"])
                 record_sync(ledger, row["project"], row["id"],
                             row["local"]["md5"], row["local"]["md5"],
                             row["app"])
@@ -1316,6 +1449,7 @@ def cmd_pull(args) -> int:
 
         pulled = conflicts = failures = 0
         ledger_dirty = False
+        pulled_projects: dict = {}
         for row in rows:
             label = f"{row['project']}/{short_id(row['id'])}"
             if row["state"] == "conflict":
@@ -1330,15 +1464,18 @@ def cmd_pull(args) -> int:
             if args.dry_run:
                 say(f"would pull {label} ({human_size(row['remote']['size'])})")
                 pulled += 1
+                if args.adopt and row["app"] == "claude":
+                    pulled_projects.setdefault(row["project"], True)
                 continue
             try:
-                download_session(cfg, row["project"], row["id"], str(path),
-                                 row["app"])
+                download_session(cfg, row, str(path))
                 record_sync(ledger, row["project"], row["id"],
                             row["remote"]["md5"], row["remote"]["md5"],
                             row["app"])
                 ledger_dirty = True
                 pulled += 1
+                if args.adopt and row["app"] == "claude":
+                    pulled_projects.setdefault(row["project"], True)
                 ok(f"pulled {label} ({human_size(row['remote']['size'])})")
             except RcloneError as exc:
                 warn(f"pull failed {label}: {exc}")
@@ -1351,6 +1488,9 @@ def cmd_pull(args) -> int:
         in_sync = sum(1 for r in rows if r["state"] == "in-sync")
         say(("dry-run: " if args.dry_run else "")
             + transfer_summary(0, pulled, conflicts, in_sync, failures))
+        if args.adopt:
+            rc = adopt_for_resume(cfg, pulled_projects, args.dry_run)
+            return rc or (1 if failures else 0)
         return 1 if failures else 0
 
 
@@ -1411,15 +1551,15 @@ def apply_conflict(cfg: dict, row: dict, choice: str, ledger: dict) -> str:
     app = row["app"]
     local, remote = row["local"], row["remote"]
     if choice == "local":
-        kept = save_remote_revert(cfg, project, sid, app)
+        kept = save_remote_revert(cfg, row)
         snapshot_history(project, sid, kept, app)
-        upload_session(cfg, project, sid, local["path"], app)
+        upload_session(cfg, row, local["path"])
         record_sync(ledger, project, sid, local["md5"], local["md5"], app)
         return "local wins"
     if choice == "remote":
         saved = save_local_revert(project, sid, Path(local["path"]), app)
         snapshot_history(project, sid, saved, app)
-        download_session(cfg, project, sid, local["path"], app)
+        download_session(cfg, row, local["path"])
         record_sync(ledger, project, sid, remote["md5"], remote["md5"], app)
         return f"remote wins (local kept as {saved.name})"
     # 'auto' / 'both' — newest wins, tie goes to local
@@ -1427,12 +1567,12 @@ def apply_conflict(cfg: dict, row: dict, choice: str, ledger: dict) -> str:
     if rt is not None and (lt is None or rt > lt):
         saved = save_local_revert(project, sid, Path(local["path"]), app)
         snapshot_history(project, sid, saved, app)
-        download_session(cfg, project, sid, local["path"], app)
+        download_session(cfg, row, local["path"])
         record_sync(ledger, project, sid, remote["md5"], remote["md5"], app)
         return f"remote wins (newer; local kept as {saved.name})"
-    kept = save_remote_revert(cfg, project, sid, app)
+    kept = save_remote_revert(cfg, row)
     snapshot_history(project, sid, kept, app)
-    upload_session(cfg, project, sid, local["path"], app)
+    upload_session(cfg, row, local["path"])
     record_sync(ledger, project, sid, local["md5"], local["md5"], app)
     return "local wins (newer)"
 
@@ -1537,8 +1677,7 @@ def cmd_sync(args) -> int:
                             f"({human_size(row['local']['size'])})")
                         pushed += 1
                         continue
-                    upload_session(cfg, row["project"], row["id"],
-                                   row["local"]["path"], row["app"])
+                    upload_session(cfg, row, row["local"]["path"])
                     record_sync(ledger, row["project"], row["id"],
                                 row["local"]["md5"], row["local"]["md5"],
                                 row["app"])
@@ -1554,8 +1693,7 @@ def cmd_sync(args) -> int:
                             f"({human_size(row['remote']['size'])})")
                         pulled += 1
                         continue
-                    download_session(cfg, row["project"], row["id"], str(path),
-                                     row["app"])
+                    download_session(cfg, row, str(path))
                     record_sync(ledger, row["project"], row["id"],
                                 row["remote"]["md5"], row["remote"]["md5"],
                                 row["app"])
@@ -1653,7 +1791,7 @@ def cmd_diff(args) -> int:
             elif side == "local":
                 infos[side] = inspect_transcript(Path(sess["path"]))
             else:
-                tmp_remote = fetch_remote_transcript(cfg, project, sid, app)
+                tmp_remote = fetch_remote_transcript(cfg, row)
                 infos[side] = inspect_transcript(tmp_remote)
 
         preview = None
@@ -1982,6 +2120,98 @@ def cmd_adopt(args) -> int:
     return do_adopt(args.source,
                     os.path.abspath(os.path.expanduser(args.repo_path)),
                     args.dry_run)
+
+
+def adopt_for_resume(cfg: dict, projects: dict, dry_run: bool) -> int:
+    """The second half of cross-machine resume (`pull --adopt`, `resume`
+    with no id): re-home every munged project folder in `projects` into
+    this machine's name for the CURRENT directory, so claude's native
+    --resume picker lists those sessions. Whole folders, deliberately —
+    the user gets all their sessions for that repo, not just one. Codex
+    is never passed in (codex resumes from anywhere)."""
+    cwd = os.getcwd()
+    if Path(cwd) == Path.home() or cwd == os.path.expanduser("~").rstrip("/"):
+        warn("current directory is your home folder — cd into your repo "
+             "first; adoption skipped (it would create a junk folder like "
+             f"'{munge(cwd)}')")
+        return 1
+    rc = 0
+    for src in sorted(projects):
+        if do_adopt(src, cwd, dry_run) != 0:
+            rc = 1
+    return rc
+
+
+def cmd_resume(args) -> int:
+    """Pick up work on this machine, whatever machine the sessions came
+    from. With an id: adopt that session's project folder into this
+    machine's munged name (if needed) and print the exact resume command.
+    With no id: find local sessions whose recorded repo matches the
+    current repo by basename (the lossy-munge-proof signal) and adopt
+    every folder that matches, then let claude's native picker take over."""
+    cfg = load_config()
+    cwd = os.getcwd()
+    target = munge(cwd)
+
+    if args.session:
+        row = find_one_session(args.session, cfg, args)
+        if row is None:
+            return 1
+        if not row["local"]:
+            fail(f"{row['project']}/{row['id']} is not on this machine — "
+                 "run 'sessium pull' first")
+            return 1
+        if row["app"] == "codex":
+            say(f"codex resumes from anywhere — no adoption needed:")
+            say(f"cd {cwd} && codex resume {row['id']}")
+            if args.go:
+                return subprocess.run(
+                    ["codex", "resume", row["id"]], cwd=cwd).returncode
+            return 0
+        if row["project"] != target:
+            if Path(cwd) == Path.home():
+                warn("current directory is your home folder — cd into the "
+                     "repo first; refusing to adopt into it")
+                return 1
+            rc = do_adopt(row["project"], cwd, args.dry_run)
+            if rc != 0:
+                return rc
+        resume = f"cd {cwd} && claude --resume {row['id']}"
+        if args.go and not args.dry_run:
+            return subprocess.run(["claude", "--resume", row["id"]],
+                                  cwd=cwd).returncode
+        say(resume)
+        return 0
+
+    # no id: match this repo by basename across every local claude project
+    # folder that is NOT this machine's own name for it
+    rows, reachable = collect_rows(cfg, args)
+    if not reachable:
+        warn("cannot reach Drive right now — matching local sessions only")
+    base = Path(cwd).name
+    matches: dict = {}
+    for row in rows:
+        if row["app"] != "claude" or not row["local"] \
+                or row["project"] == target or row["project"] in matches:
+            continue
+        recorded = session_cwd(Path(row["local"]["path"]))
+        if recorded and recorded.rstrip("/").rsplit("/", 1)[-1] == base:
+            matches[row["project"]] = recorded
+    if not matches:
+        say(f"no sessions from other machines match this repo "
+            f"({base!r} by basename).")
+        say("try: sessium list   or   sessium resume <id-prefix>")
+        return 1
+    say(f"sessions recorded in a repo named {base!r} "
+        f"(from {len(matches)} other-machine folder(s)):")
+    for src, recorded in sorted(matches.items()):
+        say(f"  {src}")
+        if recorded:
+            say(f"    recorded path there: {recorded}")
+    rc = adopt_for_resume(cfg, matches, args.dry_run)
+    if rc == 0:
+        say("next: claude --resume")
+    return rc
 
 
 CRYPT_NAME = "sessium-crypt"
@@ -2384,11 +2614,28 @@ def cmd_open(args) -> int:
         cwd = ("/" + proj[1:].replace("-", "/")) if proj.startswith("-") \
             else proj.replace("-", "/")
         warn(f"transcript has no cwd stamp — guessing {cwd}")
-    if args.adopt and not Path(cwd).is_dir():
-        say(f"repo path {cwd} does not exist here — adopting sessions first")
-        rc = do_adopt(row["project"], cwd, args.dry_run)
-        if rc != 0:
-            return rc
+    if args.adopt and row["app"] != "codex":
+        # adopt into THIS machine's name for the CURRENT directory — the
+        # transcript's recorded cwd is the pushing machine's path (always
+        # different from this machine's folder name, so adopting there was
+        # a silent no-op). Only needed when the session's folder isn't
+        # already ours.
+        here = munge(os.getcwd())
+        if row["project"] != here:
+            if Path(os.getcwd()) == Path.home():
+                warn("current directory is your home folder — cd into the "
+                     "repo first; refusing to adopt into it")
+                return 1
+            say(f"session lives under {row['project']} — adopting it into "
+                f"{here} first")
+            rc = do_adopt(row["project"], os.getcwd(), args.dry_run)
+            if rc != 0:
+                return rc
+    if not Path(cwd).is_dir():
+        # the recorded repo doesn't exist on this machine — resume from here
+        warn(f"recorded repo {cwd} does not exist here — resuming from the "
+             "current directory instead")
+        cwd = os.getcwd()
     binary = "codex" if row["app"] == "codex" else "claude"
     flag = "" if row["app"] == "codex" else "--"
     resume = f"cd {cwd} && {binary} {flag}resume {row['id']}"
@@ -2664,6 +2911,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="print actions, change nothing")
     p_pull.add_argument("--quiet", action="store_true",
                         help="chatter off (for hooks and cron); errors still print")
+    p_pull.add_argument("--adopt", action="store_true",
+                        help="after pulling, re-home pulled sessions into this "
+                             "machine's name for the current directory — the "
+                             "one-step new-computer flow (cd into your repo first)")
     add_app_arg(p_pull)
     p_pull.set_defaults(func=cmd_pull)
 
@@ -2711,6 +2962,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_adopt.add_argument("--dry-run", action="store_true",
                          help="print actions, change nothing")
     p_adopt.set_defaults(func=cmd_adopt)
+
+    p_resume = sub.add_parser(
+        "resume", help="pick up work on this machine — adopt other machines' "
+                       "session folders and print the resume command")
+    p_resume.add_argument("session", metavar="ID", nargs="?", default=None,
+                          help="session id (prefix ok); omit to auto-match "
+                               "this repo by name")
+    p_resume.add_argument("--go", action="store_true",
+                          help="launch the resumed CLI, not just print it")
+    p_resume.add_argument("--dry-run", action="store_true",
+                          help="print actions, change nothing")
+    add_app_arg(p_resume)
+    p_resume.set_defaults(func=cmd_resume)
 
     p_setup = sub.add_parser("setup", help="run the platform installer (rclone + OAuth)")
     p_setup.add_argument("--check-only", action="store_true",
