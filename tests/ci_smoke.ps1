@@ -136,7 +136,12 @@ function Use-Machine([string]$Which) {
 Write-Exact (Join-Path $tmp "config.json") '{"rclone_remote":"fake","drive_folder":"backup"}'
 Use-Machine "A"
 $env:SESSIUM_CONFIG = Join-Path $tmp "config.json"
-$env:SESSIUM_RCLONE_BIN = Join-Path $repo "tests\fake_rclone.cmd"
+# the fake rclone: a .cmd shim on Windows, the Python script directly elsewhere
+if ($IsWindows) {
+    $env:SESSIUM_RCLONE_BIN = Join-Path $repo "tests\fake_rclone.cmd"
+} else {
+    $env:SESSIUM_RCLONE_BIN = Join-Path $repo "tests/fake_rclone"
+}
 $env:FAKE_DRIVE_ROOT = $drive
 
 Write-Host "== roundtrip: A pushes, B pulls =="
@@ -255,7 +260,7 @@ Assert-True ($null -ne $json.remote -and $null -ne $json.ledger) "diff --json ha
 Add-Content -LiteralPath $sessionA -Value "A dry-run edit" -Encoding utf8
 $r = Run-Sessium @("push", "--dry-run")
 Assert-True ($r.text -match "would push") "push --dry-run prints intent"
-Assert-True (-not (Get-Content $driveFile -Raw).Contains("A dry-run edit")) "dry-run touched nothing"
+Assert-True (-not (Read-DriveRaw $driveDir "aaa").Contains("A dry-run edit")) "dry-run touched nothing"
 
 # real push clears the pending change, then --quiet is silent when in-sync
 $null = Run-Sessium @("push")
@@ -618,17 +623,18 @@ $r = Run-Sessium @("push")
 Assert-True ($r.code -eq 0) "push survives one transient copyto failure"
 Assert-True ($r.text -match "retry 1/2") "the retry is announced"
 Assert-True ($r.text -match "pushed: 1") "push completes after the retry"
-Assert-True ([System.IO.File]::ReadAllText((Join-Path $drive "projects\$proj\aaa.jsonl")) -ceq [System.IO.File]::ReadAllText($sessionA)) "the retried push landed the right bytes"
+Assert-True ((Read-DriveRaw (Join-Path $drive "projects\$proj") "aaa") -ceq [System.IO.File]::ReadAllText($sessionA)) "the retried push landed the right bytes"
 
 # when every attempt fails, the push reports FAILED and nothing lands
 $env:SESSIUM_FAKE_FAIL_FIRST = "6,99"
-Remove-Item -LiteralPath (Join-Path $drive "projects\$proj\aaa.jsonl") -Force
+$obj = Get-DriveObject (Join-Path $drive "projects\$proj") "aaa"
+Remove-Item -LiteralPath $obj.FullName -Force
 $r = Run-Sessium @("push")
 Assert-True ($r.code -eq 1) "push fails after retries are exhausted"
 Assert-True ($r.text -match "retry 1/2") "first retry ran"
 Assert-True ($r.text -match "retry 2/2") "second retry ran"
 Assert-True ($r.text -match "FAILED: 1") "the exhausted transfer is reported as FAILED"
-Assert-True (-not (Test-Path -LiteralPath (Join-Path $drive "projects\$proj\aaa.jsonl"))) "no partial upload landed"
+Assert-True ($null -eq (Get-DriveObject (Join-Path $drive "projects\$proj") "aaa")) "no partial upload landed"
 
 # a permanent failure (rc=2, not found) fails on the first attempt - no retry
 $env:SESSIUM_FAKE_FAIL_FIRST = "2,99"
@@ -649,7 +655,7 @@ Write-Host "== codex: two-app sync =="
 
 $codexProj = "-home-codex-proj"
 $codexId = "0198aaaa-bbbb-7ccc-8ddd-eeeeeeeeeeee"
-$codexDrive = Join-Path $drive "codex\projects\$codexProj\$codexId.jsonl"
+$codexDriveDir = Join-Path $drive "codex\projects\$codexProj"
 function New-RolloutText([string]$UserText, [string]$AssistantText) {
     $meta = '{"type":"session_meta","payload":{"session_id":"' + $codexId + '","cwd":"/home/codex/proj"}}'
     $u = '{"type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"' + $UserText + '"}]}}'
@@ -685,7 +691,9 @@ Assert-True ($json.rows[0].app -eq "codex" -and $json.rows[0].state -eq "new-her
 $r = Run-Sessium @("push", "--app", "codex")
 Assert-True ($r.code -eq 0) "codex push exits 0"
 Assert-True ($r.text -match "pushed: 1") "codex push reports 1"
-Assert-True (Test-Path $codexDrive) "codex rollout landed in codex/projects/ on Drive"
+$codexObj = Get-DriveObject $codexDriveDir $codexId
+Assert-True ($null -ne $codexObj) "codex rollout landed in codex/projects/ on Drive"
+Assert-True ($codexObj.Name -like "$codexId-*.jsonl.gz") "codex object is gzip-named too"
 $stateA = Get-Content (Join-Path $tmp "machine-a\state.json") -Raw
 Assert-True ($stateA -match "codex/$codexProj/$codexId") "codex ledger key is codex/<proj>/<id>"
 
@@ -722,11 +730,12 @@ Assert-True (Test-Path (Join-Path $codexA ".sessium\projects\$codexProj\revert")
 $rollCount = @(Get-ChildItem -LiteralPath (Join-Path $codexA "sessions") -File -Filter "*.jsonl" -Recurse).Count
 Assert-True ($rollCount -eq 1) "codex sessions/ holds exactly one rollout (no quarantine pollution)"
 
-# open: cwd from session_meta, codex resume line
+# open: cwd from session_meta, codex resume line (the recorded repo doesn't
+# exist on this machine, so the line falls back to the current directory)
 $r = Run-Sessium @("open", "0198aaaa", "--app", "codex")
 Assert-True ($r.code -eq 0) "codex open exits 0"
 Assert-True ($r.text -match "codex resume $codexId") "open prints 'codex resume <id>'"
-Assert-True ($r.text -match "cd /home/codex/proj") "open takes the cwd from session_meta"
+Assert-True ($r.text -match "does not exist here") "open falls back to the current dir when the recorded repo is gone"
 
 # sync --only x --app codex is a hard error (memory/skills are Claude folders)
 $r = Run-Sessium @("sync", "--only", "memory", "--app", "codex")
@@ -740,6 +749,90 @@ Assert-True ($r.text -match "Claude Code transcripts only") "export explains the
 $r = Run-Sessium @("search", "rocket", "--app", "codex")
 Assert-True ($r.code -eq 1) "search --app codex exits 1"
 Assert-True ($r.text -match "Claude Code transcripts only") "search explains the v1 limit"
+
+# --- gzip transport + cross-machine resume (Batch 7) ---------------------------
+# Legacy plaintext Drive objects stay readable; a changed push migrates them
+# to <sid>-<rawmd5>.jsonl.gz and removes the superseded object; a corrupt
+# object fails the pull loudly; resume/pull --adopt re-home other machines'
+# sessions into this machine's name for the CURRENT directory.
+
+Write-Host "== gzip transport + resume =="
+
+$projDir = Join-Path $drive "projects\$proj"
+
+# a legacy plaintext object (pre-gzip push) + matching local copy: in-sync
+Write-Exact (Join-Path $claudeA "projects\$proj\legacy.jsonl") $sessionText
+Write-Exact (Join-Path $projDir "legacy.jsonl") $sessionText
+Use-Machine "A"
+$r = Run-Sessium @("sync", "--project", $proj)
+Assert-True ($r.text -match "in-sync: 1") "legacy plaintext object classifies in-sync"
+
+# edit + sync: the push migrates to a .gz name and removes the legacy object
+Write-Exact (Join-Path $claudeA "projects\$proj\legacy.jsonl") ($sessionText + "migrated`n")
+$null = Run-Sessium @("sync", "--project", $proj)
+Assert-True (-not (Test-Path -LiteralPath (Join-Path $projDir "legacy.jsonl"))) "superseded legacy object removed after the push"
+$migrated = @(Get-ChildItem -LiteralPath $projDir -File -Filter "legacy-*.jsonl.gz")
+Assert-True ($migrated.Count -eq 1) "changed push migrated the legacy object to a .gz name"
+Assert-True ((Read-DriveRaw $projDir "legacy").Contains("migrated")) "the migrated object carries the new content"
+
+# corrupt wire bytes under a .gz name fail the pull loudly (md5 verify)
+Write-Exact $migrated[0].FullName "definitely not a gzip stream"
+Use-Machine "B"
+$r = Run-Sessium @("pull", "--project", $proj)
+Assert-True ($r.text -match "integrity check failed") "corrupt .gz fails the pull loudly"
+Assert-True (-not (Test-Path -LiteralPath (Join-Path $claudeB "projects\$proj\legacy.jsonl"))) "nothing landed locally from a corrupt pull"
+# remove the corrupt object so the next section starts clean
+$migrated = @(Get-ChildItem -LiteralPath $projDir -File -Filter "legacy-*.jsonl.gz")
+Remove-Item -LiteralPath $migrated[0].FullName -Force
+
+# resume <id>: adopts the foreign folder into the cwd's munged name
+Use-Machine "A"
+$oldDir = Join-Path $claudeA "projects\-home-oldmachine-proj"
+New-Item -ItemType Directory -Path $oldDir -Force | Out-Null
+Write-Exact (Join-Path $oldDir "oldie.jsonl") (
+    '{"type":"user","cwd":"/home/test/proj","message":{"content":"hello"}}' + "`n")
+$resumeDir = Join-Path $tmp "resume-repo"
+New-Item -ItemType Directory -Path $resumeDir -Force | Out-Null
+$r = Run-SessiumAt $resumeDir @("resume", "oldie")
+Assert-True ($r.code -eq 0) "resume <id> exits 0"
+Assert-True ($r.text -match "adopted -home-oldmachine-proj") "resume adopts the foreign folder into the cwd name"
+$adopted = @(Get-ChildItem -LiteralPath (Join-Path $claudeA "projects") -Recurse -Filter "oldie.jsonl" |
+    Where-Object { $_.FullName -like "*resume-repo*" })
+Assert-True ($adopted.Count -eq 1) "resume re-homed the session under the cwd's folder name"
+Assert-True ($r.text -match "claude --resume oldie") "resume prints the claude resume command"
+
+# open --adopt: the same re-home, from open (the old code adopted into the
+# transcript's own recorded cwd — a silent no-op). A second session in the
+# same foreign folder: the first adoption never moved it (adopt copies).
+Write-Exact (Join-Path $oldDir "newer.jsonl") (
+    '{"type":"user","cwd":"/home/test/proj","message":{"content":"hello"}}' + "`n")
+$r = Run-SessiumAt $resumeDir @("open", "newer", "--adopt")
+Assert-True ($r.code -eq 0) "open --adopt exits 0"
+Assert-True ($r.text -match "adopting it into") "open --adopt adopts into the cwd name (not the recorded cwd)"
+
+# pull --adopt: the one-step new-computer flow
+Use-Machine "A"
+Write-Exact (Join-Path $claudeA "projects\$proj\fresh.jsonl") $sessionText
+$null = Run-Sessium @("push", "--project", $proj)
+Use-Machine "B"
+$freshDir = Join-Path $tmp "fresh-clone"
+New-Item -ItemType Directory -Path $freshDir -Force | Out-Null
+$r = Run-SessiumAt $freshDir @("pull", "--adopt", "--project", $proj)
+Assert-True ($r.code -eq 0) "pull --adopt exits 0"
+Assert-True ($r.text -match "pulled: 1") "pull --adopt pulled the session"
+$rehome = @(Get-ChildItem -LiteralPath (Join-Path $claudeB "projects") -Recurse -Filter "fresh.jsonl" |
+    Where-Object { $_.FullName -like "*fresh-clone*" })
+Assert-True ($rehome.Count -eq 1) "the pulled session was re-homed under the cwd's name"
+
+# the home-directory guard: adoption from $HOME is refused (junk folders)
+$homeDir = $env:USERPROFILE
+if (-not $homeDir) { $homeDir = $env:HOME }
+Push-Location $homeDir
+try {
+    $r = Run-Sessium @("pull", "--adopt", "--project", $proj)
+    Assert-True ($r.code -eq 1) "pull --adopt from the home folder exits 1"
+    Assert-True ($r.text -match "cd into your repo") "the home guard explains itself"
+} finally { Pop-Location }
 
 Write-Host ""
 

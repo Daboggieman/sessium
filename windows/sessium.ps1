@@ -967,7 +967,9 @@ function Format-State([string]$State) {
    codex globs sessions/**/*.jsonl and would see quarantined copies as
    duplicate sessions; SPEC §6). #>
 function Get-LocalRoot([string]$App) {
-    if ($App -eq "codex") { return (Join-Path (Get-AppHome "codex") ".sessium\projects") }
+    # forward slashes: valid for every .NET/PowerShell file API on Windows
+    # too, and what lets the smoke mirror run this engine on Linux as-is
+    if ($App -eq "codex") { return (Join-Path (Get-AppHome "codex") ".sessium/projects") }
     return (Join-Path (Get-ClaudeDir) "projects")
 }
 
@@ -1016,13 +1018,14 @@ function ConvertFrom-RemoteObjectName([string]$Name) {
    remote row (top-level 'name', from Get-RemoteSessions) or a classified
    row (name at row.remote.name - the real filename, gzip'd or legacy).
    Every transfer targets what is really on Drive, not what a name pattern
-   guesses. #>
+   guesses. Indexer access, not dot: StrictMode 2 throws on a missing
+   hashtable property, and classified rows carry no top-level 'name'. #>
 function ConvertTo-RemoteObjectUrl($Cfg, $Row) {
-    $name = $Row.name
-    if (-not $name -and $Row.remote) { $name = $Row.remote.name }
-    $app = "claude"
-    if ($Row.app) { $app = "$($Row.app)" }
-    return (ConvertTo-DriveUrl $Cfg "$(Get-RemoteBase $app)/$($Row.project)/$name")
+    $name = $Row["name"]
+    if (-not $name -and $Row["remote"]) { $name = $Row["remote"]["name"] }
+    $app = $Row["app"]
+    if (-not $app) { $app = "claude" }
+    return (ConvertTo-DriveUrl $Cfg "$(Get-RemoteBase $app)/$($Row['project'])/$name")
 }
 
 function Add-GzipAssembly {
