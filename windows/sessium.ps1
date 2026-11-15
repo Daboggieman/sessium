@@ -397,14 +397,6 @@ function Invoke-Rclone {
     return $outTask.Result
 }
 
-function Invoke-RcloneLines {
-    param([Parameter(ValueFromRemainingArguments = $true)][string[]]$RcloneArgs,
-          [int]$TimeoutSec = 120)
-    $text = Invoke-Rclone -RcloneArgs $RcloneArgs -TimeoutSec $TimeoutSec
-    if (-not $text) { return @() }
-    return @($text -split "`r?`n" | Where-Object { $_ -ne "" })
-}
-
 # ---------------------------------------------------------------- ledger
 
 $script:LedgerVersion = 1
