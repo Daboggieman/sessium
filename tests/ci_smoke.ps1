@@ -819,7 +819,9 @@ $freshDir = Join-Path $tmp "fresh-clone"
 New-Item -ItemType Directory -Path $freshDir -Force | Out-Null
 $r = Run-SessiumAt $freshDir @("pull", "--adopt", "--project", $proj)
 Assert-True ($r.code -eq 0) "pull --adopt exits 0"
-Assert-True ($r.text -match "pulled: 1") "pull --adopt pulled the session"
+# legacy rides along: removing the corrupt object gave machine A's ledger a
+# dead-remote entry, and A's push above re-uploaded it — B pulls both
+Assert-True ($r.text -match "pulled: 2") "pull --adopt pulled the sessions"
 $rehome = @(Get-ChildItem -LiteralPath (Join-Path $claudeB "projects") -Recurse -Filter "fresh.jsonl" |
     Where-Object { $_.FullName -like "*fresh-clone*" })
 Assert-True ($rehome.Count -eq 1) "the pulled session was re-homed under the cwd's name"

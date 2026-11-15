@@ -279,6 +279,66 @@ ledger, same md5 classification, one new flag.
   overwrites an `$App` parameter (found via the deep check auditing only
   "codex" after `check --full`; the step-6 loop var is now `$which`).
 
+### Batch 9 — gzip transport + cross-machine resume *(user-requested 2026-11-12)* 🪟 Linux ✅ Windows ✅
+
+Two real-world failures drove this batch: large pushes still timed out on
+slow uplinks (sessions are JSONL text — the fix is compressing the wire),
+and pulled sessions were useless on another machine (Drive folders are
+named for the pushing machine's absolute path, which `claude --resume`
+never matches elsewhere; `open --adopt` turned out to be a latent no-op —
+it re-homed into the transcript's own recorded cwd, which is always the
+source folder name).
+
+- **Gzip transport (both engines)**: uploads compress the raw transcript
+  to a temp `.jsonl.gz` and push it as `<sid>-<rawmd5>.jsonl.gz` — the
+  md5 of the UNCOMPRESSED content rides in the name, so classification
+  stays in the raw domain and is deterministic across Python/.NET gzip
+  implementations. Upload timeouts scale with the compressed size;
+  downloads magic-sniff (`1f 8b`), decompress, and verify
+  `md5(raw) ==` the name-embedded md5 — mismatch or a corrupt stream is a
+  loud transfer failure. Legacy `<sid>.jsonl` objects stay readable
+  forever (their lsjson hash IS the raw md5) and migrate organically on
+  the next changed push, which also removes the superseded object
+  (`deletefile` — the ONE remote deletion sessium ever does, only after
+  the replacement is confirmed on Drive). If that cleanup fails, two
+  objects share an id; the ledger's recorded md5 breaks the tie, else
+  newest mtime (`one_remote_row`/`Select-OneRemoteRow`), and the next
+  push self-heals. Revert/history/export/local files stay plaintext;
+  the ledger schema is unchanged (md5s were always raw).
+- **Cross-machine resume**: new `sessium resume [<id-prefix>] [--go]
+  [--dry-run]` — with an id: adopt the session's folder into the CURRENT
+  directory's munged name (when it isn't already) and print `cd <dir> &&
+  claude --resume <full-id>`; codex needs no adoption. With no id: match
+  local sessions by recorded-repo BASENAME against the current directory's
+  basename (the lossy-munge-proof signal), adopt every matching folder,
+  hand over to claude's native picker. `pull --adopt` runs the same
+  adoption after the pull loop — the one-step new-computer flow. `open
+  --adopt` got the same semantics (the old target was a silent no-op).
+  Adoption from $HOME is refused everywhere (junk-folder guard).
+- **Tests**: Linux suite 107 → 140 (naming/parse unit tests, gz roundtrip,
+  legacy in-sync + migrate + supersede-removal, corrupt-gz loud failure
+  both shapes, deep-check on .gz rows, stale-object invisibility +
+  cleanup-retry, resume with/without id, pull --adopt, home guards,
+  `open --adopt`'s new semantics); fake rclone learned `deletefile`.
+  Smoke gained gzip-name + gunzip-content assertions, a legacy-migrate
+  section, corrupt-pull, resume/open --adopt, `pull --adopt` and the home
+  guard; the fake schtasks/rclone stubs and home-dir picks are now
+  `$IsWindows`-branched, so the smoke runs as-is under pwsh on Linux too.
+- 🪟 **Windows parity done** (2026-11-14) — `windows/sessium.ps1` carries
+  the same engine: `ConvertTo/From-RemoteObjectName` (LastIndexOf('-')
+  parse), `ConvertTo-RemoteObjectUrl` (dual row shapes — **indexer access,
+  not dot**: StrictMode 2 throws on a missing hashtable property, and
+  classified rows carry no top-level `name`), GzipStream helpers via
+  `Add-Type -AssemblyName System.IO.Compression` (PS 5.1-safe),
+  `Select-OneRemoteRow` dedupe in `Get-Classification` + `Invoke-DeepCheck`
+  (ledger fetched before the remote loop), row-based
+  `Invoke-UploadSession`/`Invoke-FetchRemoteRaw`/`Get-RemoteTranscript`/
+  `Save-RemoteRevert`, `Invoke-Resume`/`Invoke-AdoptForResume`/
+  `Test-AtHomeDir`, `Invoke-Pull -Adopt`, `Invoke-Open`'s fixed `--adopt`,
+  dispatcher + usage. Engine backslash literals made platform-neutral
+  where the mirror needs it (`.sessium/projects` — .NET accepts forward
+  slashes on Windows).
+
 ---
 
 ## 3. Decisions log (feature-era)
@@ -362,3 +422,23 @@ ledger, same md5 classification, one new flag.
   on codex sessions are edited as valid rollouts in tests. Export/search
   stay Claude-only for v1 (different transcript formats; defer, don't
   half-parse).
+- 2026-11-12 — **Gzip at the sessium layer, not rclone's compress backend**:
+  the raw md5 rides in the OBJECT NAME (`<sid>-<rawmd5>.jsonl.gz`), so
+  classification never sees compressed bytes and stays deterministic across
+  Python/.NET gzip implementations; legacy objects stay readable forever
+  and migrate organically on the next changed push. The one new remote
+  deletion (supersede cleanup) happens only after the replacement is
+  confirmed on Drive, and a failed cleanup self-heals (the ledger's
+  recorded md5 wins the dedupe).
+- 2026-11-12 — **Cross-machine resume adopts WHOLE folders into the current
+  directory's name**: the transcript's recorded cwd is the pushing
+  machine's path (adopting there was `open --adopt`'s silent no-op), and
+  the lossy munging is not invertible — the basename of the recorded repo
+  vs the basename of the current dir is the lossy-munge-proof signal.
+  Adoption from $HOME is refused everywhere (junk-folder guard).
+- 2026-11-14 — **PowerShell StrictMode 2 + hashtables: dot access throws on
+  a missing key**. The row-shape duality (bare remote rows carry `name`;
+  classified rows carry it at `remote.name`) needs indexer access
+  (`$Row["name"]`) in the dual-shape URL builder — dot access raised
+  "The property 'name' cannot be found" under Set-StrictMode. Found on the
+  Linux mirror the moment the Windows engine's fetch path first ran.

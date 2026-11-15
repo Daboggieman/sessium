@@ -304,7 +304,7 @@ def record_sync(ledger: dict, project: str, sid: str,
 
 
 def record_bootstrap(ledger: dict, rows: list) -> int:
-    """PLAN §2 bootstrap rule: matching copies with no ledger record are
+    """SPEC §4 bootstrap rule: matching copies with no ledger record are
     recorded as in-sync — no prompts, no day-one mass conflict. Only the
     write commands (push/pull/sync) record; status stays read-only."""
     n = 0
@@ -655,7 +655,7 @@ def remote_sessions(cfg: dict, app: str = "claude") -> dict:
 
 def classify_row(project: str, sid: str, local, remote, entry,
                  app: str = "claude") -> dict:
-    """Classify one (project, session) against its ledger record (PLAN §2)."""
+    """Classify one (project, session) against its ledger record (SPEC §4)."""
     if entry:
         l_match = bool(local) and entry.get("local_md5") == local["md5"]
         r_match = bool(remote) and entry.get("remote_md5") == remote["md5"]

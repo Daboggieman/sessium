@@ -6,9 +6,10 @@ Back up your conversations to Google Drive and replay any session on another
 machine's agent, anytime — push, pull, diff, search and resolve sessions
 the way you would code with git.
 
-> **Status:** Linux CLI complete (Phases 1–4 + all feature batches; 107 hermetic
+> **Status:** Linux CLI complete (Phases 1–4 + all feature batches; 140 hermetic
 > tests, CI on Linux & Windows). Windows PowerShell twin ships in parallel —
-> see `SPEC.md` for the cross-platform contract, `docs/BUILD.md` for progress.
+> see `SPEC.md` for the cross-platform contract, `docs/BUILD.md` for progress,
+> and **[docs/MANUAL.md](docs/MANUAL.md)** for the full user manual.
 
 ## Quick start (each machine)
 
@@ -76,12 +77,20 @@ shows the unit files without installing.
 
 ## Transfers that survive a bad network
 
+Session transcripts are **gzip-compressed on the wire** (typically 5–10×
+smaller — sessions are JSONL text), stored on Drive as
+`<session-id>-<rawmd5>.jsonl.gz` with the md5 of the *uncompressed* content
+in the name, so integrity is verified on every download. Legacy plaintext
+objects from before the change stay readable forever and migrate on their
+next push. Everything sessium writes locally is plaintext; gzip exists only
+on the wire.
+
 File transfers (`push`/`pull`/`sync`/`sync --only`) retry on their own: a
 timed-out or retry-class rclone failure (rc 5/6/8) is re-attempted twice with a
 short backoff, because `copyto` overwrites whole files and is safe to repeat.
-The per-transfer timeout scales with the file size — `max(300 s, 10 s/MB)` —
-so a big transcript on a slow uplink gets the time it needs instead of dying
-at 300 s. Two knobs, rarely needed:
+The per-transfer timeout scales with the transferred size — `max(300 s,
+10 s/MB)` — so a big transcript on a slow uplink gets the time it needs
+instead of dying at 300 s. Two knobs, rarely needed:
 
 ```bash
 SESSIUM_COPY_TIMEOUT=600 sessium push       # fixed timeout override (seconds)
@@ -114,6 +123,24 @@ until you delete them by hand).
 
 ## Recovering on another computer
 
+The one-step flow (new machine, or a machine where the repo sits at a
+different path):
+
+```bash
+git clone <your-repo> && cd <your-repo>
+sessium pull --adopt      # download sessions AND re-home them to this machine
+claude --resume           # the picker now lists them
+```
+
+`pull --adopt` re-homes every pulled session folder into the current
+directory's name, so `claude --resume` finds them. Forgot the session id?
+`sessium resume` (no id) matches this repo by name across other machines'
+folders and adopts them; `sessium resume <id-prefix>` prints (or with
+`--go` runs) the exact resume command for one session. Codex needs none of
+this — `codex resume <id>` works from anywhere.
+
+Longer path, by hand:
+
 1. `bash setup-ubuntu.sh` (installs rclone, same Drive sign-in).
 2. Get your code: `git clone` the repos — ideally to the SAME absolute paths as
    the original machine, then everything lines up with zero extra steps.
@@ -124,6 +151,9 @@ until you delete them by hand).
    sessions under the new path so `claude --resume` finds them.
 5. `cd` into the repo and `claude --resume` — pick the session, continue.
    (Shortcut: `sessium open <id> --go`.)
+
+The full walkthrough, including "I just lost my laptop", is in
+[docs/MANUAL.md](docs/MANUAL.md).
 
 ## Conflict semantics
 
@@ -169,7 +199,6 @@ Output goes to `./sessium-export` (override with `--out DIR`).
   fake two-machine Drive, nothing touches your real `~/.claude`)
 - `setup-ubuntu.sh` / `setup-windows.ps1` — one-command interactive installers
 - `SPEC.md` — the cross-platform contract (Drive layout, ledger schema, rules)
+- `docs/MANUAL.md` — the user manual: every command, every workflow
 - `docs/BUILD.md` — the build tracker and where we are in it
 - `CONTRIBUTING.md` — ground rules and the dev loop
-- `archive/` — the retired `push.sh` / `pull.sh` / `restore-session.sh`,
-  kept for reference

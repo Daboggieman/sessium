@@ -9,17 +9,38 @@ wins and one of them gets fixed.
 
 ```
 <remote>:<folder>/
-  projects/<munged-path>/<session-id>.jsonl     ← conversations
-  projects/<munged-path>/<session-id>/...       ← session data folders
-  projects/<munged-path>/memory/...             ← persistent memory
-  codex/projects/<munged-path>/<session-id>.jsonl ← Codex CLI rollouts
+  projects/<munged-path>/<sid>-<rawmd5>.jsonl.gz  ← conversations (gzip; raw md5 in the name)
+  projects/<munged-path>/<sid>.jsonl              ← legacy objects, still readable forever
+  projects/<munged-path>/<sid>/...                ← session data folders
+  projects/<munged-path>/memory/...               ← persistent memory
+  codex/projects/<munged-path>/<sid>-<rawmd5>.jsonl.gz ← Codex CLI rollouts
+  codex/projects/<munged-path>/<sid>.jsonl             ← legacy rollouts, readable forever
   config/settings.json, config/skills/, config/file-history/
   config/installed_plugins.json                 ← plugin registry only
 ```
 
 Default `<remote>` is `gdrive`, default `<folder>` is `claude-backup`;
 both come from `~/.config/sessium/config.json` (or the platform fallbacks —
-see §5). sessium never deletes from the remote.
+see §5). sessium never deletes from the remote — with exactly one
+exception (§8): after a replacement object is confirmed on Drive, the
+superseded object under the same session id is removed.
+
+**Object naming.** A pushed transcript lands as
+`<sid>-<rawmd5>.jsonl.gz`, where `<rawmd5>` is the md5 of the
+UNCOMPRESSED transcript, computed before compressing and embedded in the
+name. This keeps classification in the raw domain: Python's and .NET's
+gzip streams differ byte-for-byte, so a hash of the wire bytes could
+never be compared across platforms — the raw md5 can. Parse rule (both
+versions): strip `.jsonl.gz`, split on the LAST `-`; the trailing 32 hex
+chars are the md5 (session ids are dashed uuids, md5s contain no dashes,
+so this is unambiguous). Legacy plaintext `<sid>.jsonl` objects —
+everything pushed before the gzip change — stay readable forever: for
+them the lsjson-reported hash IS the raw md5, and they migrate
+organically (the next push of a changed session writes the `.gz` name and
+removes the legacy object). If a supersede-cleanup ever fails, two
+objects share one id; the ledger's recorded md5 breaks the tie, else the
+newest mtime — the stale object is invisible to classification and
+self-heals on the next push.
 
 Codex CLI sessions live in their own `codex/` tree, never mixed into
 `projects/` — the rollout format differs from Claude transcripts and one
@@ -70,6 +91,10 @@ Path: `~/.local/state/sessium/state.json` (Linux) /
 classification uses md5s only. An unreadable ledger is a loud warning plus a
 fresh start; the bootstrap rule (§4) re-records matching sessions, so losing
 it must never cause data loss or mass conflicts.
+
+The md5s stored here are ALWAYS raw (uncompressed) — for `.jsonl.gz`
+objects that is the name-embedded hash, for legacy objects the lsjson
+hash (see §1/§8). The gzip transport changed nothing in this schema.
 
 Codex sessions are namespaced in the same ledger as
 `codex/<munged>/<session-id>`; Claude keys keep the original
@@ -133,7 +158,7 @@ Env overrides (both versions honor the same names where the OS allows):
 | `SESSIUM_COPY_TIMEOUT` | fixed transfer timeout, seconds | size-scaled, see §8 |
 | `SESSIUM_RETRY_DELAY_SCALE` | multiplier on retry backoff (test knob) | `1.0` |
 
-## 6. Conflict semantics (decided 2026-11-03, PLAN §3)
+## 6. Conflict semantics (decided 2026-11-03)
 
 Transcripts are never line-merged.
 
@@ -158,23 +183,55 @@ Transcripts are never line-merged.
 (phase 2) · `diff`, `resolve`, `revert`, `adopt` (phase 3) · `version`,
 `log` (no id: alias for `list`; with an id: history snapshots), `open`
 (phase 3.5) · `search`, `seek`, `checkout`, `gc` (Batch 4) · `schedule`,
-`hook`, `setup --encrypted` (Batch 5) · `export`, `onboard` (Batch 6).
+`hook`, `setup --encrypted` (Batch 5) · `export`, `onboard` (Batch 6) ·
+`resume`, `pull --adopt`, gzip transport (Batch 9).
 All tree-walking commands take `--project <munged>`. Every session-facing
 command takes `--app claude|codex|all` (default `all`): `status`, `list`,
 `log`, `push`, `pull`, `sync`, `diff`, `resolve`, `revert`, `checkout`,
-`gc`, `open`, `export`, `search`. v1 limits: `export` and `search` parse
+`gc`, `open`, `resume`, `export`, `search`. v1 limits: `export` and `search` parse
 Claude transcripts only — with `--app codex` they fail with a clear
 message — and `sync --only memory|skills` syncs Claude Code folders, so
 `--app codex` there is a hard error. `adopt`, `setup`, `version`,
 `schedule`, `hook`, `onboard`, and `seek` take no `--app`. `--json`
 (SPEC §9) on `list`, `status`, `diff`, `search`; `--dry-run` on `push`,
-`pull`, `sync`, `revert`, `adopt`, `open`, `checkout`, `gc`; `sync`
+`pull`, `sync`, `revert`, `adopt`, `open`, `resume`, `checkout`, `gc`; `sync`
 additionally `--interactive` and `--only memory|skills` (ledger-less
 two-way fast lane, per-file newest-wins, never deletes). `--quiet` on
 `push`/`pull`/`sync` silences chatter (hooks/cron); errors still print.
 `--debug` (alias `--verbose`) prints every rclone call and is accepted
 on either side of the subcommand. Exit codes: `0` success (skips are
 not failures), `1` real failures, `130` interrupted.
+
+**Cross-machine resume (Batch 9).** Drive folders are named by the pushing
+machine's absolute repo path, so `claude --resume` on another machine
+lists nothing — its picker only reads folders named for THIS machine.
+Two commands bridge that:
+
+- `sessium resume [<id-prefix>] [--go] [--dry-run]` — with an id: the
+  session must exist locally (else "run 'sessium pull' first"); its
+  project folder is adopted (§ below) into the CURRENT directory's munged
+  name when it isn't already, and the exact command is printed
+  (`cd <dir> && claude --resume <full-id>`; codex needs no adoption —
+  `codex resume <id>` works from anywhere). With no id: local sessions
+  whose recorded repo basename matches the current directory's basename
+  (the lossy-munge-proof signal) are listed and their whole folders
+  adopted; then "next: claude --resume" — the native picker takes over.
+  Adoption from the home directory is refused everywhere (it would create
+  a junk folder named for $HOME).
+- `sessium pull --adopt` — after the pull loop, every pulled claude
+  project is adopted into the current directory's munged name. The
+  one-step new-computer flow: `git clone … && cd repo && sessium pull
+  --adopt && claude --resume`. Codex rows are skipped (no adoption
+  needed).
+
+Adopting the WHOLE folder is deliberate: the user gets all their sessions
+for that repo in the picker, not just one. `open --adopt` shares the same
+semantics — it adopts into the current directory's munged name (only when
+the session's folder isn't already this machine's name for it), NOT into
+the transcript's recorded cwd (which is always the pushing machine's
+folder name — adopting there was a silent no-op). The printed resume line
+uses the transcript's recorded cwd when that repo exists on this machine,
+else the current directory.
 
 **Encoding contract:** every `.ps1` file in the repo ships as UTF-8 **with
 BOM**. Windows PowerShell 5.1 reads a BOM-less script in the ANSI codepage,
@@ -216,7 +273,37 @@ All Drive I/O goes through rclone; the only commands used are
 `mkdir`, `deletefile`, `rmdir`, `about`, `authorize`, `config file`,
 `config create` (setup --encrypted). Uploads and downloads are `copyto` of
 exact paths (rclone creates missing parent folders). After a successful
-transfer, both ledger md5s are set to the transferred copy's md5.
+transfer, both ledger md5s are set to the transferred copy's md5 (raw —
+see §3).
+
+**Gzip transport (Batch 9).** Session transcripts are gzip'd on the wire:
+
+- **Upload:** md5 of the raw transcript is computed first (it goes in the
+  object name), the transcript is compressed to a temp `.jsonl.gz`, and
+  the temp is `copyto`'d to `<sid>-<rawmd5>.jsonl.gz`. The transfer
+  timeout scales with the COMPRESSED size — the wire carries ~5–10× fewer
+  bytes than the raw transcript, which is the whole point (large pushes
+  were timing out). The temp is always removed.
+- **Supersede:** after the replacement object is confirmed on Drive, the
+  session's previous object under a DIFFERENT name (a stale `.jsonl.gz`
+  or a legacy `.jsonl`) is removed with `deletefile`. This is the ONE
+  deletion sessium ever performs on the remote, and it happens only after
+  the new bytes are up. Failure is a warning, not an error: the stale
+  object is invisible to classification (the ledger's recorded md5 wins
+  the dedupe, else newest mtime — §1) and the next successful push
+  retries the cleanup.
+- **Download:** the remote object is `copyto`'d to a temp file, then
+  magic-sniffed (`1f 8b`): gzip'd → decompressed; legacy plaintext →
+  used as-is (byte-identical to the old behaviour). The decompressed
+  bytes are verified: `md5(raw) ==` the object's recorded raw md5
+  (name-embedded for `.jsonl.gz`, lsjson hash for legacy). A mismatch —
+  or a corrupt gzip stream that has the magic but won't decompress — is
+  a transfer failure (retries apply, then FAILED; nothing lands locally).
+  The download timeout scales with the object's true wire size.
+- **Raw is the local currency:** everything sessium writes locally —
+  transcripts, revert copies, history snapshots, exports — is plaintext
+  `.jsonl`. Gzip exists only on the wire. `sync --only memory|skills`
+  is untouched (small config files, raw forever).
 
 **Timeouts and retries** (both versions; metadata calls like `lsjson`/`lsd`
 keep the short fixed timeout and never retry):

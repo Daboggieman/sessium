@@ -1,15 +1,15 @@
 .\" Manual page for sessium.
 .\" View with:  man docs/sessium.1
-.TH SESSIUM 1 "2026-11-04" "sessium 0.1.0" "User Commands"
+.TH SESSIUM 1 "2026-11-14" "sessium 0.1.0" "User Commands"
 .SH NAME
-sessium \- git-like version control for Claude Code sessions, with Google Drive as the remote
+sessium \- git-like version control for Claude Code and Codex CLI sessions, with Google Drive as the remote
 .SH SYNOPSIS
 .B sessium
 .I command
 .RI [ args ]
 .SH DESCRIPTION
 .B sessium
-backs up Claude Code conversations to Google Drive (via
+backs up Claude Code and Codex CLI conversations to Google Drive (via
 .BR rclone (1))
 and restores them on any machine. Your
 .I ~/.claude/projects
@@ -26,22 +26,29 @@ name is its absolute path with every "/" replaced by "\-" (leading slash
 included), e.g. \fI/home/me/repo\fR → \fI\-home\-me\-repo\fR. Windows munges
 every separator and the drive colon the same way.
 .PP
+Session transcripts are gzip-compressed on the wire, stored on Drive as
+.IB <sid> \- <rawmd5> .jsonl.gz
+(the md5 of the uncompressed content rides in the name and every download
+is verified against it). Legacy plaintext objects stay readable forever.
+Everything written locally is plaintext; gzip exists only on the wire.
+.PP
 File transfers retry twice with a short backoff on timeouts and rclone's
 transient errors (exit codes 5, 6, 8), and each transfer's timeout scales
-with the file size (max 300 s, 10 s/MB) — see ENVIRONMENT for overrides.
+with the transferred size (max 300 s, 10 s/MB) — see ENVIRONMENT for
+overrides.
 .SH COMMANDS
 .TP
-.BR list " [\-\-titles] [\-\-project " \fImunged\fR "]"
+.BR list " [\-\-titles] [\-\-json] [\-\-app " \fIapp\fR "] [\-\-project " \fImunged\fR "]"
 List every session found locally or on Drive, newest first. With
 .B \-\-titles
 shows each session's first real user message. Alias:
 .BR log .
 .TP
-.BR status " [\-\-project " \fImunged\fR "]"
+.BR status " [\-\-json] [\-\-app " \fIapp\fR "] [\-\-project " \fImunged\fR "]"
 Classify every session against the ledger and Drive: in-sync, push, pull,
 CONFLICT, new-here, new-there. Read-only; never touches anything.
 .TP
-.BR check " [\-\-full]"
+.BR check " [\-\-full] [\-\-app " \fIapp\fR "]"
 Six-step self-test: rclone present, remote reachable, folder exists, local
 claude dir, ledger, session counts. With
 .BR \-\-full ,
@@ -49,40 +56,96 @@ additionally audits the ledger — dead entries and Drive orphans — and
 spot-verifies a sample of in-sync sessions (local bytes vs the Drive hash).
 Read-only; never touches anything.
 .TP
-.BR setup " [\-\-check\-only]"
-Run setup\-ubuntu.sh (interactive rclone install + Drive OAuth).
+.BR setup " [\-\-check\-only] [\-\-encrypted]"
+Run the platform setup script (interactive rclone install + Drive OAuth).
+.B \-\-encrypted
+wraps the Drive folder in an rclone crypt remote, generates a strong
+password (printed exactly once) and re-points the config at it.
 .TP
-.BR push " [\-\-project " \fImunged\fR "]"
+.BR push " [\-\-dry\-run] [\-\-quiet] [\-\-app " \fIapp\fR "] [\-\-project " \fImunged\fR "]"
 Upload new and locally-changed sessions. Conflicts are
 .B skipped
 with a warning — sync or resolve decides them. Never deletes from Drive.
 .TP
-.BR pull " [\-\-project " \fImunged\fR "]"
+.BR pull " [\-\-dry\-run] [\-\-quiet] [\-\-adopt] [\-\-app " \fIapp\fR "] [\-\-project " \fImunged\fR "]"
 Download new and remotely-changed sessions. Skips conflicts like push.
+With
+.BR \-\-adopt ,
+every pulled session folder is afterwards re-homed under this machine's
+name for the current directory — the one-step new-computer flow:
+`git clone ... && cd repo && sessium pull --adopt && claude --resume`.
+Refused when run from the home directory.
 .TP
-.BR sync " [\-\-interactive] [\-\-project " \fImunged\fR "]"
+.BR sync " [\-\-interactive] [\-\-dry\-run] [\-\-quiet] [\-\-app " \fIapp\fR "] [\-\-project " \fImunged\fR "] [\-\-only " \fImemory\fB|\fIskills\fR "]"
 Push and pull what changed in one pass, and
 .B decide conflicts:
 on a terminal it prompts
 .BR [L]ocal / [R]emote / [B]oth " "(newest " wins ") / [S]kip ;
 without one (cron, pipes) the newest copy wins automatically. The losing
-copy is never deleted — it becomes a revert file.
+copy is never deleted — it becomes a revert file AND a history snapshot.
+.B \-\-only " " \fImemory\fB|\fIskills
+two-way syncs the small memory/skills folders without the ledger
+(per-file newest-wins, never deletes).
 .TP
-.BR diff " <id> [\-\-project " \fImunged\fR "]"
+.BR diff " <id> [\-\-messages] [\-\-json] [\-\-app " \fIapp\fR "] [\-\-project " \fImunged\fR "]"
 Show one session side by side: local vs remote size, mtime, message count,
-last snippet, and the ledger's record.
+last snippet, and the ledger's record. With
+.BR \-\-messages ,
+show the conversation divergence past the common message prefix.
 .TP
-.BR resolve " <id> [\-\-interactive]"
+.BR resolve " <id> [\-\-interactive] [\-\-app " \fIapp\fR "]"
 Manually decide a conflicted session (same prompt as sync). Non-conflicted
 sessions are a no-op.
 .TP
-.B revert " <id>"
+.BR revert " <id> [\-\-dry\-run] [\-\-app " \fIapp\fR "]"
 List the session's revert copies (kept when conflicts were resolved) and
 swap the chosen one back in; the copy it replaces is itself kept. Afterwards
 .B sessium sync
 pushes the restored copy.
 .TP
-.BR adopt " <munged-folder> <repo-path>"
+.BR checkout " <id> <seq> [\-\-dry\-run] [\-\-app " \fIapp\fR "]"
+Restore a history snapshot (see
+.BR "log <id>" ).
+.TP
+.BR log " [<id>] [\-\-titles] [\-\-json] [\-\-app " \fIapp\fR "]"
+Without an id: alias for
+.BR list .
+With an id: list the session's content-addressed history snapshots.
+.TP
+.BR search " <query> [\-\-semantic] [\-\-json] [\-\-limit N] [\-\-app " \fIapp\fR "] [\-\-project " \fImunged\fR "]"
+Search sessions: title matches outrank body matches. With
+.B \-\-semantic
+(and seeker configured) queries a self-hosted seeker engine for semantic
+matching instead of literal text.
+.TP
+.BR seek " [\-\-name " \fIname\fR "]"
+Register the local projects tree as a seeker engine source.
+.TP
+.BR open " <id> [\-\-go] [\-\-adopt] [\-\-dry\-run] [\-\-app " \fIapp\fR "]"
+Print (or with
+.B \-\-go
+run) the
+.B cd + claude \-\-resume
+command for a session. The recorded repo path is used when it exists on
+this machine, else the current directory. With
+.BR \-\-adopt ,
+re-home the session's folder into this machine's name for the CURRENT
+directory first (the recorded cwd is the pushing machine's path — adopting
+there was a silent no-op). Codex sessions print
+.B codex resume <id>
+instead (no adoption needed).
+.TP
+.BR resume " [<id>] [\-\-go] [\-\-dry\-run] [\-\-app " \fIapp\fR "] [\-\-project " \fImunged\fR "]"
+Pick work up on this machine, whatever machine the sessions came from.
+With an id: the session must exist locally (else "run 'sessium pull'
+first"); its project folder is adopted into the current directory's munged
+name when needed, and the exact resume command is printed.
+With no id: local sessions whose recorded repo basename matches the
+current directory's basename are listed and their whole folders adopted,
+then claude's native picker takes over. Refused when run from the home
+directory. Codex needs no adoption — the command is just printed.
+.TP
+.BR adopt " <munged-folder> <repo-path> [\-\-dry\-run]"
 Rehome sessions pulled for a different machine path so
 .B claude \-\-resume
 finds them here: copies transcripts and data folders (never the machine-local
@@ -91,20 +154,39 @@ differing ones are kept
 .B both
 (yours untouched).
 .TP
-.B open " <id>"
-Resume helper: resolve the session's project path and print the
-.B cd + claude \-\-resume
-command line to bring that conversation back up here.
+.BR export " [<id>] [\-\-all] [\-\-html] [\-\-out " \fIdir\fR "] [\-\-app " \fIapp\fR "]"
+Write sessions out as Markdown, or with
+.B \-\-html
+as a static HTML viewer (one page per session plus
+.IR index.html ).
+Claude transcripts only for now.
 .TP
-.BR search " <query> [\-\-project " \fImunged\fR "] [\-\-limit N] [\-\-semantic]"
-Search sessions: title matches outrank body matches. With
-.B \-\-semantic
-(and seeker configured) queries a self-hosted seeker engine for semantic
-matching instead of literal text.
+.BR schedule " [\-\-interval " \fImin\fR "] [\-\-print] [\-\-off]"
+Manage a scheduled background task running
+.B sessium sync
+every 30 minutes (systemd user timer on Linux, Task Scheduler on Windows).
+.TP
+.BR hook " [\-\-print] [\-\-off]"
+Manage a Claude Code Stop hook running
+.B sessium push \-\-quiet
+after every session turn. Only sessium's entries in settings.json are ever
+touched.
+.TP
+.BR gc " [\-\-keep N] [\-\-dry\-run] [\-\-app " \fIapp\fR "]"
+Prune revert/history copies beyond the N newest per session (default 10).
+The canonical transcript is never touched.
+.TP
+.B onboard
+First-run report: what's set up (rclone, encryption, Drive, local repo,
+ledger, timer, hook) and suggested next steps.
 .TP
 .B version
 Print the version.
 .SH OPTIONS
+.TP
+.B \-\-app " " \fIclaude\fB|\fIcodex\fB|\fIall\fR (default all)
+Which CLI's sessions the command touches. Claude and codex trees are never
+mixed; the ledger keys are namespaced (codex/<munged>/<id>).
 .TP
 .B \-\-project " " \fImunged\fR
 Restrict a command to one project. Munged names start with "\-", which is
@@ -114,11 +196,14 @@ handled correctly in both space and equals forms.
 Machine-readable output (list, status, diff, search). Schema in SPEC.md §9.
 .TP
 .B \-\-dry\-run
-Print exactly what the command would do — push, pull, sync, revert, adopt —
-and change nothing.
+Print exactly what the command would do — push, pull, sync, revert, adopt,
+open, resume, checkout, gc — and change nothing.
 .TP
 .B \-\-interactive
 Force the conflict prompt even when no terminal is attached.
+.TP
+.B \-\-quiet
+Silence chatter (hooks/cron); errors and conflicts still print.
 .TP
 .BR \-\-debug " or " \-\-verbose
 Print every rclone invocation. Accepted on either side of the subcommand.
@@ -130,6 +215,9 @@ Print every rclone invocation. Accepted on either side of the subcommand.
 .B SESSIUM_CLAUDE_DIR
 Claude data root (default ~/.claude).
 .TP
+.B SESSIUM_CODEX_HOME
+Codex CLI data root (default ~/.codex).
+.TP
 .B SESSIUM_CONFIG
 Config file path (default ~/.config/sessium/config.json).
 .TP
@@ -138,6 +226,9 @@ Ledger path (default ~/.local/state/sessium/state.json).
 .TP
 .B SESSIUM_RCLONE_BIN
 rclone binary (default "rclone" on PATH).
+.TP
+.B SESSIUM_SYSTEMD_DIR
+User unit directory for `schedule` (default ~/.config/systemd/user).
 .TP
 .B SESSIUM_COPY_TIMEOUT
 Fixed transfer timeout in seconds, overriding the size-scaled default of
@@ -157,9 +248,12 @@ The ledger — per-machine, never synced.
 .TP
 .I ~/.claude/projects/<munged>/revert/
 Machine-local revert copies; never synced.
+.TP
+.I ~/.claude/projects/<munged>/<id>/history/
+Content-addressed snapshots of every overwritten copy; never synced.
 .SH EXIT STATUS
 0 on success — skips are not failures. 1 on real failures. 130 when
 interrupted.
 .SH SEE ALSO
-rclone(1), claude(1). Project docs: README.md, SPEC.md, PLAN.md,
-docs/BUILD.md in the repository.
+rclone(1), claude(1), codex(1). Project docs: docs/MANUAL.md (the user
+manual), README.md, SPEC.md, docs/BUILD.md in the repository.
