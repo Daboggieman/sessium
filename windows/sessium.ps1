@@ -1943,7 +1943,7 @@ function Invoke-Pull([string]$Project, [string]$App, [switch]$DryRun, [switch]$Q
         # sync pulled them) are adoption candidates too — otherwise the
         # second machine's `pull --adopt` adopts nothing the second time.
         # Codex never adopts (it resumes from anywhere).
-        $target = Get-Munge (Get-Location).Path
+        $target = ConvertTo-Munge (Get-Location).Path
         foreach ($r in $rows) {
             if ($r.app -eq "claude" -and $r.project -ne $target -and $r.local) {
                 $pulledProjects[$r.project] = $true
