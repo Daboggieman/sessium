@@ -50,11 +50,6 @@ not in PLAN.md or README.md.
 - `setup-windows.ps1`: same flow for Windows.
 - `install.sh` / `uninstall.sh` (Linux): copy one file to `~/.local/bin`.
 
-### Archive
-
-- `push.sh`, `pull.sh`, `restore-session.sh` → `archive/`, headed "RETIRED —
-  use sessium X". Kept for reference only.
-
 ---
 
 ## 2. Work order (approved 2026-11-04) — batches, dependency-ordered
