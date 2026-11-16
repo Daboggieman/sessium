@@ -11,7 +11,7 @@
 #   3. runs `rclone authorize drive` (browser sign-in) and captures/validates the token
 #   4. writes the remote into rclone's config file
 #   5. auto-tests the result: reach Drive, create folder, upload/read/delete round-trip
-#   6. updates ~/sessium/config.sh so push.sh/pull.sh use your choices
+#   6. updates ~/sessium/config.sh so sessium sync uses your choices
 set -euo pipefail
 
 ok()   { printf '[OK]  %s\n' "$*"; }
@@ -120,7 +120,7 @@ if REMOTE_EXISTS "$REMOTE"; then
   case "$yn" in
     y|Y) RECONFIGURE=1 ;;
     *)   ok "keeping existing remote — running tests only"; run_tests "$REMOTE" "$FOLDER"
-         echo "Next step: $HOME/sessium/push.sh"; exit 0 ;;
+         echo "Next step: sessium sync"; exit 0 ;;
   esac
 fi
 
@@ -178,5 +178,5 @@ if [ -f "$DS_CONFIG" ]; then
   ok "updated $DS_CONFIG (remote=$REMOTE folder=$FOLDER)"
 fi
 echo ""
-echo "Setup complete. Next step: $HOME/sessium/push.sh"
+echo "Setup complete. Next step: sessium sync"
 echo "Re-verify anytime with:    bash $0 --check-only"
