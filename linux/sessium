@@ -1447,7 +1447,10 @@ def cmd_push(args) -> int:
 
 def cmd_pull(args) -> int:
     """Download new/changed sessions from Drive. Local copies that changed on
-    their own are left alone — conflicts are skipped (use sync/resolve)."""
+    their own are left alone — conflicts are skipped (use sync/resolve).
+    --adopt re-homes every claude project that has a local copy under a
+    foreign folder name (pulled this run or already local), not just pulled
+    ones."""
     cfg = load_config()
     with transfer_lock(args.dry_run):
         try:
@@ -1499,6 +1502,15 @@ def cmd_pull(args) -> int:
         say(("dry-run: " if args.dry_run else "")
             + transfer_summary(0, pulled, conflicts, in_sync, failures))
         if args.adopt:
+            # Sessions already local under a foreign folder name (an earlier
+            # sync pulled them) are adoption candidates too — otherwise the
+            # second machine's `pull --adopt` adopts nothing the second time.
+            # Codex never adopts (it resumes from anywhere).
+            target = munge(os.getcwd())
+            for row in rows:
+                if (row["app"] == "claude" and row["project"] != target
+                        and row["local"]):
+                    pulled_projects.setdefault(row["project"], True)
             rc = adopt_for_resume(cfg, pulled_projects, args.dry_run)
             return rc or (1 if failures else 0)
         return 1 if failures else 0

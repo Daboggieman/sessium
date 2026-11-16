@@ -1896,8 +1896,9 @@ function Invoke-Pull([string]$Project, [string]$App, [switch]$DryRun, [switch]$Q
 
     $pulled = 0; $skipped = 0; $failures = 0; $dirty = $false
     $inSync = 0
-    # the cross-machine flow (SPEC §7): after pulling, re-home every pulled
-    # claude project into this machine's name for the current directory
+    # the cross-machine flow (SPEC §7): after pulling, re-home every claude
+    # project with a local copy under a foreign folder name — pulled this
+    # run or already local — into this machine's name for the current dir
     $pulledProjects = @{}
     foreach ($r in $rows) {
         if ($r.state -eq "in-sync") {
@@ -1938,6 +1939,16 @@ function Invoke-Pull([string]$Project, [string]$App, [switch]$DryRun, [switch]$Q
     if ($dirty) { Save-Ledger $ledger }
     Write-TransferSummary 0 $pulled $skipped $inSync $failures
     if ($Adopt) {
+        # Sessions already local under a foreign folder name (an earlier
+        # sync pulled them) are adoption candidates too — otherwise the
+        # second machine's `pull --adopt` adopts nothing the second time.
+        # Codex never adopts (it resumes from anywhere).
+        $target = Get-Munge (Get-Location).Path
+        foreach ($r in $rows) {
+            if ($r.app -eq "claude" -and $r.project -ne $target -and $r.local) {
+                $pulledProjects[$r.project] = $true
+            }
+        }
         $rc = Invoke-AdoptForResume $pulledProjects $DryRun
         if ($rc -ne 0) { exit 1 }
         if ($failures -gt 0) { exit 1 }

@@ -232,10 +232,11 @@ sessium pull --adopt         # download AND re-home to this machine's name
 claude --resume              # the picker now lists them
 ```
 
-`pull --adopt` re-homes every pulled session folder into the current
-directory's munged name. Run it from the repo directory, not your home
-folder — adoption from $HOME is refused on purpose (it would create a junk
-folder named for your home path).
+`pull --adopt` re-homes every claude session folder that lives locally
+under another machine's name — pulled this run *or already there from an
+earlier sync* — into the current directory's munged name. Run it from the
+repo directory, not your home folder — adoption from $HOME is refused on
+purpose (it would create a junk folder named for your home path).
 
 ### `sessium resume` — pick up one session, or this repo's sessions
 

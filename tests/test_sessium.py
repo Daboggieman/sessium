@@ -1959,6 +1959,22 @@ class ResumeTests(SyncBase):
         p = run_sessium(self.env(self.b), "status", cwd=str(cwd))
         self.assertIn("in-sync: 1", p.stdout)
 
+    def test_pull_adopt_adopts_insync_foreign_projects(self):
+        # second-machine-again: an earlier pull left the session local under
+        # the foreign folder name; a later `pull --adopt` (in-sync, nothing
+        # to pull) must still re-home it
+        self.local_file(self.a, "aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
+        self.assertEqual(run_sessium(self.env(self.a), "push").returncode, 0)
+        self.assertEqual(run_sessium(self.env(self.b), "pull").returncode, 0)
+        cwd = self.tmp / "fresh-clone"
+        cwd.mkdir()
+        p = run_sessium(self.env(self.b), "pull", "--adopt", cwd=str(cwd))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("pulled: 0", p.stdout)
+        hits = list(
+            (self.b["claude"] / "projects").glob("-tmp-*fresh-clone/aaa.jsonl"))
+        self.assertTrue(hits, "in-sync session re-homed into the cwd name")
+
     def test_pull_adopt_home_guard(self):
         self.local_file(self.a, "aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
         self.assertEqual(run_sessium(self.env(self.a), "push").returncode, 0)
