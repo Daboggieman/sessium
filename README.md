@@ -6,11 +6,6 @@ Back up your conversations to Google Drive and replay any session on another
 machine's agent, anytime — push, pull, diff, search and resolve sessions
 the way you would code with git.
 
-> **Status:** Linux CLI complete (Phases 1–4 + all feature batches; 140 hermetic
-> tests, CI on Linux & Windows). Windows PowerShell twin ships in parallel —
-> see `SPEC.md` for the cross-platform contract, `docs/BUILD.md` for progress,
-> and **[docs/MANUAL.md](docs/MANUAL.md)** for the full user manual.
-
 ## Quick start (each machine)
 
 One line, then sign in:
