@@ -123,27 +123,33 @@ different path):
 
 ```bash
 git clone <your-repo> && cd <your-repo>
-sessium pull --adopt      # download sessions AND re-home them to this machine
+sessium pull --adopt      # download sessions AND adopt everything not on this PC
 claude --resume           # the picker now lists them
 ```
 
-`pull --adopt` re-homes every pulled session folder into the current
-directory's name, so `claude --resume` finds them. Forgot the session id?
-`sessium resume` (no id) matches this repo by name across other machines'
-folders and adopts them; `sessium resume <id-prefix>` prints (or with
-`--go` runs) the exact resume command for one session. Codex needs none of
-this — `codex resume <id>` works from anywhere.
+`pull --adopt` re-homes every claude session folder that is not on this PC
+into this machine's equivalent of the repo its transcripts record — the
+`cwd` stamps decide, not where you happen to stand: a recorded path that
+exists here is used as-is; otherwise the foreign home prefix maps onto this
+machine's home (`/home/recoding/proj` → `~/proj`). Works from any
+directory. Forgot the session id? `sessium resume` (no id) matches this
+repo by name across other machines' folders and adopts them;
+`sessium resume <id-prefix>` prints (or with `--go` runs) the exact resume
+command for one session. Codex needs none of this — `codex resume <id>`
+works from anywhere.
 
 Longer path, by hand:
 
 1. `bash setup-ubuntu.sh` (installs rclone, same Drive sign-in).
 2. Get your code: `git clone` the repos — ideally to the SAME absolute paths as
    the original machine, then everything lines up with zero extra steps.
-3. `sessium pull` — sessions come down to `~/.claude/projects/…`.
-4. If repo paths match the original machine: done.
-   If they differ: `sessium adopt <old-munged-folder> /new/repo/path`
-   (e.g. `sessium adopt -home-recoding-crosswise ~/crosswise`) — copies the
-   sessions under the new path so `claude --resume` finds them.
+3. `sessium pull --adopt` — sessions come down to `~/.claude/projects/…`
+   and every folder not already here is re-homed to this machine's
+   equivalent of its recorded repo path automatically.
+4. If a repo ended up at an unusual path: `sessium adopt <old-munged-folder>
+   /new/repo/path` (e.g. `sessium adopt -home-recoding-crosswise
+   ~/crosswise`) — copies the sessions under the new path so
+   `claude --resume` finds them.
 5. `cd` into the repo and `claude --resume` — pick the session, continue.
    (Shortcut: `sessium open <id> --go`.)
 

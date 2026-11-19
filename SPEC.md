@@ -216,13 +216,22 @@ Two commands bridge that:
   whose recorded repo basename matches the current directory's basename
   (the lossy-munge-proof signal) are listed and their whole folders
   adopted; then "next: claude --resume" — the native picker takes over.
-  Adoption from the home directory is refused everywhere (it would create
-  a junk folder named for $HOME).
-- `sessium pull --adopt` — after the pull loop, every pulled claude
-  project is adopted into the current directory's munged name. The
-  one-step new-computer flow: `git clone … && cd repo && sessium pull
-  --adopt && claude --resume`. Codex rows are skipped (no adoption
-  needed).
+  Adoption from the home directory is refused for `resume` and `open
+  --adopt` (it would create a junk folder named for $HOME).
+- `sessium pull --adopt` — after the pull loop, adopt-all: EVERY claude
+  project the Drive knows about is adopted into this machine's equivalent
+  of the repo its transcripts record (the `cwd` stamps), never the current
+  directory: a recorded path that exists on this machine is used as-is;
+  otherwise the foreign home prefix (`/home/<u>`, `/Users/<u>`,
+  `X:\Users\<u>`) maps onto this machine's home, so `/home/recoding/proj`
+  lands on `<home>/proj` — prepared for the day the repo is cloned there.
+  Works from any directory, `$HOME` included (destinations never derive
+  from the cwd). The one-step new-computer flow is just `sessium pull
+  --adopt && claude --resume`. Folders already at this machine's name are
+  no-ops; a folder whose transcripts record no repo path is left as is.
+  Codex rows are skipped (no adoption needed). Implemented on the Windows
+  port 2026-11-18; linux/sessium still runs the older cwd-based rule until
+  ported.
 
 Adopting the WHOLE folder is deliberate: the user gets all their sessions
 for that repo in the picker, not just one. `open --adopt` shares the same

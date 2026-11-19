@@ -781,7 +781,15 @@ function Get-RemoteSessions($Cfg, [string]$App) {
         throw
     }
     if (-not $text) { return $map }
-    $entries = @($text | ConvertFrom-Json)
+    # 5.1 pitfall: piping a top-level JSON ARRAY into ConvertFrom-Json emits
+    # the array as ONE nested object (pwsh unrolls it). Capture first, then
+    # re-collect: @($parsed) unrolls exactly one level on both 5.1 and pwsh —
+    # otherwise every lsjson entry arrives wrapped and $e.IsDir member-
+    # enumerates to @(True, False) -> truthy -> every entry skipped as a
+    # directory -> an empty remote map -> "pulled: 0" forever (found on a
+    # real 5.1 box 2026-11-18).
+    $parsed = $text | ConvertFrom-Json
+    $entries = @($parsed)
     foreach ($e in $entries) {
         if ($e.IsDir) { continue }
         if ($e.Path -notmatch '^([^/]+)/([^/]+)$') { continue }
@@ -1774,7 +1782,12 @@ function Invoke-SyncOnly([string]$What, [bool]$DryRun) {
         $entries = @()
         try {
             $text = Invoke-Rclone -RcloneArgs @("lsjson", "--recursive", (ConvertTo-DriveUrl $cfg "projects"))
-            if ($text) { $entries = @($text | ConvertFrom-Json) }
+            if ($text) {
+                # capture-then-collect: 5.1 wraps a top-level JSON array in one
+                # nested object (see Get-RemoteSessions)
+                $parsed = $text | ConvertFrom-Json
+                $entries = @($parsed)
+            }
         } catch {
             # fresh remote: no projects/ folder yet == empty, not unreachable
             if ("$($_.Exception.Message)" -notmatch "directory not found") {
@@ -1896,10 +1909,6 @@ function Invoke-Pull([string]$Project, [string]$App, [switch]$DryRun, [switch]$Q
 
     $pulled = 0; $skipped = 0; $failures = 0; $dirty = $false
     $inSync = 0
-    # the cross-machine flow (SPEC §7): after pulling, re-home every claude
-    # project with a local copy under a foreign folder name — pulled this
-    # run or already local — into this machine's name for the current dir
-    $pulledProjects = @{}
     foreach ($r in $rows) {
         if ($r.state -eq "in-sync") {
             $inSync++
@@ -1920,7 +1929,6 @@ function Invoke-Pull([string]$Project, [string]$App, [switch]$DryRun, [switch]$Q
         if ($DryRun) {
             Write-Info ("would pull {0} ({1})" -f $label, (Get-HumanSize $r.remote.size))
             $pulled++
-            if ($Adopt -and $r.app -eq "claude") { $pulledProjects[$r.project] = $true }
             continue
         }
         Write-Info "  pulling $label"
@@ -1930,7 +1938,6 @@ function Invoke-Pull([string]$Project, [string]$App, [switch]$DryRun, [switch]$Q
             Invoke-FetchRemoteRaw $cfg $r $dest
             Set-LedgerEntry $ledger $r.project $r.id $r.remote_md5 $r.remote_md5 $r.app
             $pulled++; $dirty = $true
-            if ($Adopt -and $r.app -eq "claude") { $pulledProjects[$r.project] = $true }
         } catch {
             Write-Warn2 "  [!]  pull failed for ${label}: $($_.Exception.Message)"
             $failures++
@@ -1939,17 +1946,11 @@ function Invoke-Pull([string]$Project, [string]$App, [switch]$DryRun, [switch]$Q
     if ($dirty) { Save-Ledger $ledger }
     Write-TransferSummary 0 $pulled $skipped $inSync $failures
     if ($Adopt) {
-        # Sessions already local under a foreign folder name (an earlier
-        # sync pulled them) are adoption candidates too — otherwise the
-        # second machine's `pull --adopt` adopts nothing the second time.
-        # Codex never adopts (it resumes from anywhere).
-        $target = ConvertTo-Munge (Get-Location).Path
-        foreach ($r in $rows) {
-            if ($r.app -eq "claude" -and $r.project -ne $target -and $r.local) {
-                $pulledProjects[$r.project] = $true
-            }
-        }
-        $rc = Invoke-AdoptForResume $pulledProjects $DryRun
+        # Adopt-all: every claude project the Drive knows about is re-homed
+        # to this machine's equivalent of the repo the transcripts themselves
+        # record — not the current directory. Works from any directory,
+        # including $HOME. Codex never adopts (it resumes from anywhere).
+        $rc = Invoke-AdoptAll $rows $DryRun
         if ($rc -ne 0) { exit 1 }
         if ($failures -gt 0) { exit 1 }
         return
@@ -2551,6 +2552,81 @@ function Invoke-AdoptForResume($Projects, [bool]$DryRun) {
     return $rc
 }
 
+<# Translate a repo path recorded by another machine into this machine's
+   equivalent. The same absolute path when it exists here (both machines
+   use the same layout); otherwise the foreign home prefix (/home/<u>,
+   /Users/<u>, X:\Users\<u>) swapped for this machine's home, so
+   /home/recoding/Kairo-v1 lands on C:\Users\<me>\Kairo-v1. "" when the
+   path is the home itself, untranslatable, or unrecorded. #>
+function Resolve-LocalRepoPath([string]$Recorded) {
+    if (-not $Recorded) { return "" }
+    if (Test-Path -LiteralPath $Recorded) {
+        # exists here, but refuse the home directory itself (junk guard)
+        $homeDir = ""
+        try { $homeDir = [Environment]::GetFolderPath("UserProfile") } catch { }
+        if ($homeDir -and ($Recorded.TrimEnd('\', '/').ToLowerInvariant() -eq
+                $homeDir.TrimEnd('\', '/').ToLowerInvariant())) { return "" }
+        return $Recorded
+    }
+    $rest = $null
+    if ($Recorded -match '^[\\/]+home[\\/]+[^\\/]+([\\/].+)$') { $rest = $Matches[1] }
+    elseif ($Recorded -match '^[A-Za-z]:[\\/]+Users[\\/]+[^\\/]+([\\/].+)$') { $rest = $Matches[1] }
+    elseif ($Recorded -match '^[\\/]+Users[\\/]+[^\\/]+([\\/].+)$') { $rest = $Matches[1] }
+    if (-not $rest) { return "" }
+    return (Join-Path $env:USERPROFILE $rest.TrimStart('\', '/'))
+}
+
+<# pull --adopt's adopt-all (SPEC §7, 2026-11-18 revision): for every claude
+   project folder the Drive knows about, read the repo path its transcripts
+   record (Get-SessionCwd), translate it onto this machine
+   (Resolve-LocalRepoPath), and re-home the whole folder there — so `cd
+   <repo>; claude --resume` works without sessium ever keying on the current
+   directory. Folders already at this machine's name are no-ops; repos not
+   on this machine are prepared at this machine's home + repo name for when
+   the repo is cloned there. Codex is never passed in (codex resumes from
+   anywhere). Returns 0 unless something failed. #>
+function Invoke-AdoptAll($Rows, [bool]$DryRun) {
+    $candidates = @{}
+    foreach ($r in $Rows) {
+        if ("$($r.app)" -eq "claude" -and ($r.remote -or $r.local)) {
+            $candidates[$r.project] = $true
+        }
+    }
+    $rc = 0
+    foreach ($src in (@($candidates.Keys) | Sort-Object)) {
+        $srcDir = Join-Path (Join-Path (Get-ClaudeDir) "projects") $src
+        if (-not (Test-Path -LiteralPath $srcDir)) {
+            # remote-only in dry-run (nothing downloaded) or a failed pull
+            if ($DryRun) {
+                Write-Info "would pull + adopt $src (destination read from its transcripts)"
+            } else {
+                Write-Warn2 "  [!]  $src has no local copy (its pull failed?) — pull again to adopt it"
+            }
+            continue
+        }
+        # the repo path the transcripts record, from the first file with one
+        $recorded = ""
+        foreach ($f in (Get-ChildItem -LiteralPath $srcDir -Filter *.jsonl -File | Sort-Object Name)) {
+            $recorded = Get-SessionCwd $f.FullName
+            if ($recorded) { break }
+        }
+        if (-not $recorded) {
+            Write-Warn2 "  [!]  ${src}: no repo path recorded in its transcripts — left as '$src'"
+            continue
+        }
+        $repoPath = Resolve-LocalRepoPath $recorded
+        if (-not $repoPath) {
+            Write-Warn2 "  [!]  ${src}: recorded repo '$recorded' has no equivalent here — left as '$src'"
+            continue
+        }
+        if ($DryRun -and -not (Test-Path -LiteralPath $repoPath)) {
+            Write-Info "note: repo '$repoPath' is not on this machine yet — sessions would be prepared there"
+        }
+        if ((Invoke-Adopt $src $repoPath -DryRun:$DryRun) -ne 0) { $rc = 1 }
+    }
+    return $rc
+}
+
 <# Pick up work on this machine, whatever machine the sessions came from.
    With an id: adopt that session's project folder into this machine's
    munged name (if needed) and print the exact resume command. With no id:
@@ -2627,7 +2703,7 @@ function Invoke-Resume([string]$Prefix, [string]$Project, [string]$App,
         Write-Info "  $src"
         if ("$($found[$src])") { Write-Info "    recorded path there: $($found[$src])" }
     }
-    $rc = Invoke-AdoptForResume $matches $DryRun
+    $rc = Invoke-AdoptForResume $found $DryRun
     if ($rc -eq 0) { Write-Info "next: claude --resume" }
     return $rc
 }
@@ -3442,11 +3518,12 @@ usage: sessium <command> [args]
   push [--dry-run] [--quiet] [--project <m>]   upload new/changed sessions
   pull [--dry-run] [--quiet] [--project <m>] [--adopt]
                                            download new/changed sessions;
-                                           --adopt re-homes pulled sessions
-                                           into this machine's name for the
-                                           current directory (the one-step
-                                           new-computer flow: cd into your
-                                           repo first)
+                                           --adopt adopts every claude
+                                           session not on this PC: each
+                                           folder re-homed to this machine's
+                                           equivalent of the repo its
+                                           transcripts record (works from
+                                           any directory)
   sync [--interactive] [--dry-run] [--quiet] [--project <m>] [--only memory|skills]
                                            push AND pull; decides conflicts
   diff <id> [--messages] [--json]          local vs remote vs last-synced

@@ -61,7 +61,7 @@ New-Item -ItemType Directory -Path (Join-Path $drive "backup\projects\$proj") -F
 # a two-turn transcript as jsonl (summary + meta + command + real user + assistant)
 $lines = @(
     '{"type":"summary","summary":"ignored summary line"}',
-    '{"type":"user","isMeta":true,"message":{"content":"meta text"}}',
+    '{"type":"user","isMeta":true,"cwd":"/home/test/proj","message":{"content":"meta text"}}',
     '{"type":"user","message":{"content":"<command-name>/clear</command-name>"}}',
     '{"type":"user","message":{"content":"hey, build me a spaceship"}}',
     '{"type":"assistant","message":{"content":"ok"}}'
@@ -104,7 +104,8 @@ function Read-DriveRaw([string]$Dir, [string]$Sid) {
 }
 
 function Run-SessiumAt([string]$Dir, [string[]]$CliArgs) {
-    # resume/pull --adopt key off the CURRENT directory — pin it
+    # resume/open --adopt key off the CURRENT directory — pin it.
+    # (pull --adopt no longer does: its destinations come from the transcripts.)
     Push-Location $Dir
     try { return (Run-Sessium $CliArgs) } finally { Pop-Location }
 }
@@ -753,8 +754,9 @@ Assert-True ($r.text -match "Claude Code transcripts only") "search explains the
 # --- gzip transport + cross-machine resume (Batch 7) ---------------------------
 # Legacy plaintext Drive objects stay readable; a changed push migrates them
 # to <sid>-<rawmd5>.jsonl.gz and removes the superseded object; a corrupt
-# object fails the pull loudly; resume/pull --adopt re-home other machines'
-# sessions into this machine's name for the CURRENT directory.
+# object fails the pull loudly; resume/open --adopt re-home other machines'
+# sessions into this machine's name for the CURRENT directory, while
+# pull --adopt translates each folder to the repo its transcripts record.
 
 Write-Host "== gzip transport + resume =="
 
@@ -810,7 +812,10 @@ $r = Run-SessiumAt $resumeDir @("open", "newer", "--adopt")
 Assert-True ($r.code -eq 0) "open --adopt exits 0"
 Assert-True ($r.text -match "adopting it into") "open --adopt adopts into the cwd name (not the recorded cwd)"
 
-# pull --adopt: the one-step new-computer flow
+# pull --adopt: adopt-all — each pulled session re-homed to this machine's
+# equivalent of the repo its transcripts record, regardless of the current
+# directory (the recorded /home/test/proj has no such dir here, so the
+# foreign home prefix maps onto this machine's home: <USERPROFILE>\proj)
 Use-Machine "A"
 Write-Exact (Join-Path $claudeA "projects\$proj\fresh.jsonl") $sessionText
 $null = Run-Sessium @("push", "--project", $proj)
@@ -822,18 +827,20 @@ Assert-True ($r.code -eq 0) "pull --adopt exits 0"
 # legacy rides along: removing the corrupt object gave machine A's ledger a
 # dead-remote entry, and A's push above re-uploaded it — B pulls both
 Assert-True ($r.text -match "pulled: 2") "pull --adopt pulled the sessions"
-$rehome = @(Get-ChildItem -LiteralPath (Join-Path $claudeB "projects") -Recurse -Filter "fresh.jsonl" |
-    Where-Object { $_.FullName -like "*fresh-clone*" })
-Assert-True ($rehome.Count -eq 1) "the pulled session was re-homed under the cwd's name"
+$leaf = Split-Path -Leaf $env:USERPROFILE
+$expectedDir = Join-Path (Join-Path $claudeB "projects") "C--Users-$leaf-proj"
+$rehome = @(Get-ChildItem -LiteralPath $expectedDir -Filter "fresh.jsonl" -ErrorAction SilentlyContinue)
+Assert-True ($rehome.Count -eq 1) "the pulled session was re-homed to this machine's equivalent of the recorded repo"
 
-# the home-directory guard: adoption from $HOME is refused (junk folders)
+# adoption no longer keys on the current directory: the same pull --adopt
+# from $HOME now succeeds and finds everything already adopted (no-op)
 $homeDir = $env:USERPROFILE
 if (-not $homeDir) { $homeDir = $env:HOME }
 Push-Location $homeDir
 try {
     $r = Run-Sessium @("pull", "--adopt", "--project", $proj)
-    Assert-True ($r.code -eq 1) "pull --adopt from the home folder exits 1"
-    Assert-True ($r.text -match "cd into your repo") "the home guard explains itself"
+    Assert-True ($r.code -eq 0) "pull --adopt works from any directory (cwd-independent)"
+    Assert-True ($r.text -match "already present") "the second run re-copies nothing"
 } finally { Pop-Location }
 
 Write-Host ""
