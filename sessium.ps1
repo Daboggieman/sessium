@@ -781,7 +781,15 @@ function Get-RemoteSessions($Cfg, [string]$App) {
         throw
     }
     if (-not $text) { return $map }
-    $entries = @($text | ConvertFrom-Json)
+    # 5.1 pitfall: piping a top-level JSON ARRAY into ConvertFrom-Json emits
+    # the array as ONE nested object (pwsh unrolls it). Capture first, then
+    # re-collect: @($parsed) unrolls exactly one level on both 5.1 and pwsh —
+    # otherwise every lsjson entry arrives wrapped and $e.IsDir member-
+    # enumerates to @(True, False) -> truthy -> every entry skipped as a
+    # directory -> an empty remote map -> "pulled: 0" forever (found on a
+    # real 5.1 box 2026-11-18).
+    $parsed = $text | ConvertFrom-Json
+    $entries = @($parsed)
     foreach ($e in $entries) {
         if ($e.IsDir) { continue }
         if ($e.Path -notmatch '^([^/]+)/([^/]+)$') { continue }
@@ -1746,8 +1754,9 @@ function Invoke-WithTransferLock([bool]$DryRun, [scriptblock]$Body) {
 
 <# Same shape as Linux's transfer_summary: both counts always shown (even 0),
    and "FAILED:" — the wording a user sees in a real failure paste. #>
-function Write-TransferSummary([int]$Pushed, [int]$Pulled, [int]$Skipped, [int]$InSync, [int]$Failures) {
+function Write-TransferSummary([int]$Pushed, [int]$Pulled, [int]$Skipped, [int]$InSync, [int]$Failures, [int]$Resolved = 0) {
     $parts = @("pushed: $Pushed", "pulled: $Pulled")
+    if ($Resolved -gt 0) { $parts += "resolved: $Resolved" }
     if ($Skipped -gt 0) { $parts += "conflicts skipped: $Skipped" }
     $parts += "in-sync: $InSync"
     if ($Failures -gt 0) { $parts += "FAILED: $Failures" }
@@ -1774,7 +1783,12 @@ function Invoke-SyncOnly([string]$What, [bool]$DryRun) {
         $entries = @()
         try {
             $text = Invoke-Rclone -RcloneArgs @("lsjson", "--recursive", (ConvertTo-DriveUrl $cfg "projects"))
-            if ($text) { $entries = @($text | ConvertFrom-Json) }
+            if ($text) {
+                # capture-then-collect: 5.1 wraps a top-level JSON array in one
+                # nested object (see Get-RemoteSessions)
+                $parsed = $text | ConvertFrom-Json
+                $entries = @($parsed)
+            }
         } catch {
             # fresh remote: no projects/ folder yet == empty, not unreachable
             if ("$($_.Exception.Message)" -notmatch "directory not found") {
@@ -1895,7 +1909,16 @@ function Invoke-Pull([string]$Project, [string]$App, [switch]$DryRun, [switch]$Q
     if ($Project) { $rows = @($rows | Where-Object { $_.project -eq $Project }) }
 
     $pulled = 0; $skipped = 0; $failures = 0; $dirty = $false
-    $inSync = 0
+    $inSync = 0; $resolved = 0
+    if ($Adopt -and -not $DryRun) {
+        # fresh-machine bring-up: make sure both app roots exist
+        foreach ($app in @("claude", "codex")) {
+            $h = Get-AppHome $app
+            if (-not (Test-Path -LiteralPath $h)) {
+                New-Item -ItemType Directory -Path $h -Force | Out-Null
+            }
+        }
+    }
     foreach ($r in $rows) {
         if ($r.state -eq "in-sync") {
             $inSync++
@@ -1907,8 +1930,21 @@ function Invoke-Pull([string]$Project, [string]$App, [switch]$DryRun, [switch]$Q
         }
         if ($r.state -eq "conflict") {
             $label = "{0}/{1}" -f $r.project, (Get-ShortId $r.id)
-            Write-Warn2 "  [!]  skipped CONFLICT $label — 'sessium sync' or 'sessium resolve' decides it"
-            $skipped++
+            if (-not $Adopt) {
+                Write-Warn2 "  [!]  skipped CONFLICT $label — 'sessium sync' or 'sessium resolve' decides it"
+                $skipped++
+                continue
+            }
+            # --adopt bring-up: newest wins automatically, the loser is
+            # preserved in revert/ + history/ (recoverable)
+            try {
+                Invoke-ApplyConflict $cfg $r "auto" $ledger | Out-Null
+                $resolved++; $dirty = $true
+                Write-Info "  [+] resolved CONFLICT $label (newest wins, loser kept in revert/)"
+            } catch {
+                Write-Warn2 "  [!]  resolve failed for ${label}: $($_.Exception.Message)"
+                $failures++
+            }
             continue
         }
         if ($r.state -ne "pull" -and $r.state -ne "new-there") { continue }
@@ -1917,6 +1953,11 @@ function Invoke-Pull([string]$Project, [string]$App, [switch]$DryRun, [switch]$Q
             Write-Info ("would pull {0} ({1})" -f $label, (Get-HumanSize $r.remote.size))
             $pulled++
             continue
+        }
+        if ($r.local) {
+            # the bytes being replaced were the last-synced version — once
+            # Drive moves on they exist nowhere else; keep them
+            Save-HistorySnapshot $r.project $r.id $r.local.path $r.app | Out-Null
         }
         Write-Info "  pulling $label"
         try {
@@ -1931,7 +1972,7 @@ function Invoke-Pull([string]$Project, [string]$App, [switch]$DryRun, [switch]$Q
         }
     }
     if ($dirty) { Save-Ledger $ledger }
-    Write-TransferSummary 0 $pulled $skipped $inSync $failures
+    Write-TransferSummary 0 $pulled $skipped $inSync $failures $resolved
     if ($Adopt) {
         # Adopt-all: every claude project the Drive knows about is re-homed
         # to this machine's equivalent of the repo the transcripts themselves

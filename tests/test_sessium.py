@@ -34,6 +34,16 @@ SESSION_WITH_TITLE = "\n".join([
     json.dumps({"type": "assistant", "message": {"content": "ok"}}),
 ]) + "\n"
 
+# adopt-all reads the repo path the transcript records (the `cwd` stamps);
+# mirrors the ci_smoke fixture (meta line carries the cwd)
+SESSION_WITH_CWD = "\n".join([
+    json.dumps({"type": "summary", "summary": "ignored summary line"}),
+    json.dumps({"type": "user", "isMeta": True, "cwd": "/home/test/proj",
+                "message": {"content": "meta text"}}),
+    json.dumps({"type": "user", "message": {"content": "hey, build me a spaceship"}}),
+    json.dumps({"type": "assistant", "message": {"content": "ok"}}),
+]) + "\n"
+
 SESSION_WITH_BLOCKS = "\n".join([
     json.dumps({"type": "user", "message": {"content": [
         {"type": "text", "text": "first block"},
@@ -414,6 +424,10 @@ class SyncBase(unittest.TestCase):
             "SESSIUM_RCLONE_BIN": str(FAKE_RCLONE),
             "SESSIUM_CONFIG": str(self.tmp / "config.json"),
             "FAKE_DRIVE_ROOT": str(self.drive),
+            # the engine's Path.home() pinned to the machine root: adopt-all
+            # maps foreign recorded repos onto this home (hermetic), and
+            # Path.home()/.claude == the machine's claude dir stays true
+            "HOME": str(machine["state"].parent),
         })
         return e
 
@@ -1943,18 +1957,26 @@ class ResumeTests(SyncBase):
         self.assertIn("no sessions from other machines", p.stdout)
         self.assertIn("sessium resume <id-prefix>", p.stdout)
 
-    def test_pull_adopt_rehomes_pulled_projects(self):
-        # the one-step new-computer flow: clone, cd in, pull --adopt
-        self.local_file(self.a, "aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
+    def _adopt_dest(self, machine):
+        """Where adopt-all puts a session recorded at /home/test/proj: the
+        engine's home (the fixture machine root) + the repo name."""
+        return machine["claude"] / "projects" / (
+            "-" + str(machine["state"].parent / "proj")[1:].replace(os.sep, "-"))
+
+    def test_pull_adopt_rehomes_to_recorded_repo(self):
+        # adopt-all: the destination comes from the transcript's recorded
+        # cwd, not the current directory — /home/test/proj doesn't exist
+        # here, so the home prefix maps onto this machine's home
+        self.local_file(self.a, "aaa").write_text(SESSION_WITH_CWD, encoding="utf-8")
         self.assertEqual(run_sessium(self.env(self.a), "push").returncode, 0)
-        cwd = self.tmp / "fresh-clone"
+        cwd = self.tmp / "unrelated-dir"
         cwd.mkdir()
         p = run_sessium(self.env(self.b), "pull", "--adopt", cwd=str(cwd))
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn("pulled: 1", p.stdout)
-        hits = list(
-            (self.b["claude"] / "projects").glob("-tmp-*fresh-clone/aaa.jsonl"))
-        self.assertTrue(hits, "pulled session re-homed into the cwd name")
+        dest = self._adopt_dest(self.b)
+        self.assertTrue((dest / "aaa.jsonl").is_file(),
+                        f"adopted to the recorded repo's equivalent ({dest})")
         # and the resume picker finds it there
         p = run_sessium(self.env(self.b), "status", cwd=str(cwd))
         self.assertIn("in-sync: 1", p.stdout)
@@ -1962,30 +1984,152 @@ class ResumeTests(SyncBase):
     def test_pull_adopt_adopts_insync_foreign_projects(self):
         # second-machine-again: an earlier pull left the session local under
         # the foreign folder name; a later `pull --adopt` (in-sync, nothing
-        # to pull) must still re-home it
-        self.local_file(self.a, "aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
-        self.assertEqual(run_sessium(self.env(self.a), "push").returncode, 0)
-        self.assertEqual(run_sessium(self.env(self.b), "pull").returncode, 0)
+        # to pull) still re-homes it to the recorded repo
+        (self.b["claude"] / "projects" / "-home-oldmachine-proj").mkdir(
+            parents=True, exist_ok=True)
+        (self.b["claude"] / "projects" / "-home-oldmachine-proj" / "sss.jsonl"
+         ).write_text(SESSION_WITH_CWD, encoding="utf-8")
+        (self.drive / "backup" / "projects" / "-home-oldmachine-proj").mkdir(
+            parents=True, exist_ok=True)
+        (self.drive / "backup" / "projects" / "-home-oldmachine-proj" / "sss.jsonl"
+         ).write_text(SESSION_WITH_CWD, encoding="utf-8")
         cwd = self.tmp / "fresh-clone"
         cwd.mkdir()
         p = run_sessium(self.env(self.b), "pull", "--adopt", cwd=str(cwd))
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn("pulled: 0", p.stdout)
-        hits = list(
-            (self.b["claude"] / "projects").glob("-tmp-*fresh-clone/aaa.jsonl"))
-        self.assertTrue(hits, "in-sync session re-homed into the cwd name")
+        dest = self._adopt_dest(self.b)
+        self.assertTrue((dest / "sss.jsonl").is_file(),
+                        "in-sync session re-homed to the recorded repo")
 
-    def test_pull_adopt_home_guard(self):
-        self.local_file(self.a, "aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
+    def test_pull_adopt_works_from_any_directory(self):
+        # adopt-all never derives destinations from the cwd — $HOME included
+        self.local_file(self.a, "aaa").write_text(SESSION_WITH_CWD, encoding="utf-8")
         self.assertEqual(run_sessium(self.env(self.a), "push").returncode, 0)
         p = run_sessium(self.env(self.b), "pull", "--adopt",
-                        cwd=os.path.expanduser("~"))
-        self.assertEqual(p.returncode, 1)
-        self.assertIn("cd into your repo", p.stderr)
+                        cwd=str(self.b["state"].parent))   # the engine's home
+        self.assertEqual(p.returncode, 0, p.stderr)
+        dest = self._adopt_dest(self.b)
+        self.assertTrue((dest / "aaa.jsonl").is_file(),
+                        "adopted despite running from the home dir")
+
+    def test_pull_adopt_leaves_unrecorded_folders(self):
+        # transcripts with no cwd stamp: no destination to derive — left as is
+        self.local_file(self.a, "aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
+        self.assertEqual(run_sessium(self.env(self.a), "push").returncode, 0)
+        p = run_sessium(self.env(self.b), "pull", "--adopt")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("no repo path recorded", p.stderr)
+        self.assertTrue(
+            (self.b["claude"] / "projects" / PROJ / "aaa.jsonl").is_file(),
+            "the pulled session stays under the foreign folder name")
+
+    def test_pull_adopt_creates_missing_app_roots(self):
+        # fresh-machine bring-up: --adopt makes sure both app roots exist
+        shutil.rmtree(self.b["claude"], ignore_errors=True)
+        shutil.rmtree(self.b["codex"], ignore_errors=True)
+        self.local_file(self.a, "aaa").write_text(SESSION_WITH_CWD, encoding="utf-8")
+        self.assertEqual(run_sessium(self.env(self.a), "push").returncode, 0)
+        p = run_sessium(self.env(self.b), "pull", "--adopt")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertTrue(self.b["claude"].is_dir(), "~/.claude created")
+        self.assertTrue(self.b["codex"].is_dir(), "~/.codex created")
+
+    def test_pull_adopt_auto_resolves_conflicts_newest_wins(self):
+        # --adopt bring-up: both copies changed -> newest wins automatically,
+        # the loser preserved in revert/ (rollback-able), ledger follows
+        sid = "aaa"
+        self.local_file(self.a, sid).write_text(SESSION_WITH_CWD, encoding="utf-8")
+        self.assertEqual(run_sessium(self.env(self.a), "push").returncode, 0)
+        self.assertEqual(run_sessium(self.env(self.b), "pull").returncode, 0)
+        # both sides change; make the remote copy newer via mtime
+        base = time.time() - 1000
+        newer = SESSION_WITH_CWD + json.dumps(
+            {"type": "user", "message": {"content": "remote edit"}}) + "\n"
+        older = SESSION_WITH_CWD + json.dumps(
+            {"type": "user", "message": {"content": "local edit"}}) + "\n"
+        self.local_file(self.a, sid).write_text(newer, encoding="utf-8")
+        self.assertEqual(run_sessium(self.env(self.a), "push").returncode, 0)
+        local_b = self.b["claude"] / "projects" / PROJ / f"{sid}.jsonl"
+        local_b.write_text(older, encoding="utf-8")
+        os.utime(local_b, (base, base))
+        p = run_sessium(self.env(self.b), "pull", "--adopt")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("resolved CONFLICT", p.stdout)
+        self.assertIn("remote wins", p.stdout)
+        self.assertIn("resolved: 1", p.stdout)
+        # the local file now holds Drive's newer copy; the old one is kept
+        self.assertEqual(local_b.read_text(encoding="utf-8"), newer)
+        reverts = list((self.b["claude"] / "projects" / PROJ / "revert")
+                       .glob(f"{sid}.revert-*.jsonl"))
+        self.assertTrue(reverts, "losing local copy quarantined in revert/")
+        self.assertEqual(reverts[0].read_text(encoding="utf-8"), older)
+
+    def test_pull_adopt_local_newer_wins_and_uploads(self):
+        # both changed but LOCAL is newer: local wins, Drive updated, the
+        # losing remote copy preserved in revert/
+        sid = "aaa"
+        self.local_file(self.a, sid).write_text(SESSION_WITH_CWD, encoding="utf-8")
+        self.assertEqual(run_sessium(self.env(self.a), "push").returncode, 0)
+        self.assertEqual(run_sessium(self.env(self.b), "pull").returncode, 0)
+        base = time.time() - 1000
+        older = SESSION_WITH_CWD + json.dumps(
+            {"type": "user", "message": {"content": "remote edit"}}) + "\n"
+        newer = SESSION_WITH_CWD + json.dumps(
+            {"type": "user", "message": {"content": "local edit"}}) + "\n"
+        self.local_file(self.a, sid).write_text(older, encoding="utf-8")
+        self.assertEqual(run_sessium(self.env(self.a), "push").returncode, 0)
+        local_b = self.b["claude"] / "projects" / PROJ / f"{sid}.jsonl"
+        local_b.write_text(newer, encoding="utf-8")
+        os.utime(local_b, (base + 5000, base + 5000))
+        p = run_sessium(self.env(self.b), "pull", "--adopt")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("local wins", p.stdout)
+        self.assertEqual(local_b.read_text(encoding="utf-8"), newer)
+        reverts = list((self.b["claude"] / "projects" / PROJ / "revert")
+                       .glob(f"{sid}.revert-*.jsonl"))
+        self.assertTrue(reverts, "losing remote copy kept in revert/")
+        self.assertEqual(reverts[0].read_text(encoding="utf-8"), older)
+        # the system follows up: Drive now holds B's newer copy
+        self.assertIn("local edit", self.drive_content(sid))
+
+    def test_pull_snapshots_replaced_bytes(self):
+        # a clean pull (remote changed, local untouched) still snapshots the
+        # replaced bytes into history/ — nothing is ever lost irrecoverably
+        sid = "aaa"
+        self.local_file(self.a, sid).write_text(SESSION_WITH_CWD, encoding="utf-8")
+        self.assertEqual(run_sessium(self.env(self.a), "push").returncode, 0)
+        self.assertEqual(run_sessium(self.env(self.b), "pull").returncode, 0)
+        grown = SESSION_WITH_CWD + json.dumps(
+            {"type": "user", "message": {"content": "grown on A"}}) + "\n"
+        self.local_file(self.a, sid).write_text(grown, encoding="utf-8")
+        self.assertEqual(run_sessium(self.env(self.a), "push").returncode, 0)
+        local_b = self.b["claude"] / "projects" / PROJ / f"{sid}.jsonl"
+        before = local_b.read_text(encoding="utf-8")
+        p = run_sessium(self.env(self.b), "pull")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(local_b.read_text(encoding="utf-8"), grown)
+        hist = list((self.b["claude"] / "projects" / PROJ / sid / "history")
+                    .glob("*.jsonl"))
+        self.assertTrue(hist, "replaced bytes snapshotted into history/")
+        self.assertEqual(hist[0].read_text(encoding="utf-8"), before)
+
+    def test_pull_adopt_dry_run_prints_destinations(self):
+        self.local_file(self.a, "aaa").write_text(SESSION_WITH_CWD, encoding="utf-8")
+        self.assertEqual(run_sessium(self.env(self.a), "push").returncode, 0)
+        self.assertEqual(run_sessium(self.env(self.b), "pull").returncode, 0)
+        grown = SESSION_WITH_CWD + json.dumps(
+            {"type": "user", "message": {"content": "grown"}}) + "\n"
+        self.local_file(self.a, "aaa").write_text(grown, encoding="utf-8")
+        self.assertEqual(run_sessium(self.env(self.a), "push").returncode, 0)
+        p = run_sessium(self.env(self.b), "pull", "--adopt", "--dry-run")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("would pull", p.stdout)
+        self.assertIn("sessions would be prepared there", p.stdout)
 
     def test_resume_home_guard(self):
         self._foreign_session(self.a)
         p = run_sessium(self.env(self.a), "resume", "sss",
-                        cwd=os.path.expanduser("~"))
+                        cwd=str(self.a["state"].parent))   # the engine's home
         self.assertEqual(p.returncode, 1)
         self.assertIn("cd into the repo", p.stderr)

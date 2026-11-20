@@ -1385,8 +1385,10 @@ def deep_check(cfg: dict, args) -> int:
 
 
 def transfer_summary(pushed: int, pulled: int, conflicts_skipped: int,
-                     in_sync: int, failures: int) -> str:
+                     in_sync: int, failures: int, resolved: int = 0) -> str:
     parts = [f"pushed: {pushed}", f"pulled: {pulled}"]
+    if resolved:
+        parts.append(f"resolved: {resolved}")
     if conflicts_skipped:
         parts.append(f"conflicts skipped: {conflicts_skipped}")
     parts.append(f"in-sync: {in_sync}")
@@ -1446,11 +1448,13 @@ def cmd_push(args) -> int:
 
 
 def cmd_pull(args) -> int:
-    """Download new/changed sessions from Drive. Local copies that changed on
-    their own are left alone — conflicts are skipped (use sync/resolve).
-    --adopt re-homes every claude project that has a local copy under a
-    foreign folder name (pulled this run or already local), not just pulled
-    ones."""
+    """Download new/changed sessions from Drive. Plain pull leaves local
+    copies that changed on their own alone (conflicts skipped — use
+    sync/resolve). --adopt is the whole-machine bring-up: every session
+    Drive knows about lands here (conflicts auto-resolved newest-wins with
+    the loser preserved in revert/ + history/), then every claude project is
+    adopted to its transcript-recorded repo path — no project filter, no
+    current-directory dependency."""
     cfg = load_config()
     with transfer_lock(args.dry_run):
         try:
@@ -1459,16 +1463,32 @@ def cmd_pull(args) -> int:
             fail(f"cannot reach Drive: {exc}")
             return 1
         ledger = load_ledger()
+        if args.adopt and not args.dry_run:
+            # a bring-up on a fresh machine: make sure both app roots exist
+            for app in ("claude", "codex"):
+                app_home(app).mkdir(parents=True, exist_ok=True)
 
-        pulled = conflicts = failures = 0
+        pulled = conflicts = failures = resolved = 0
         ledger_dirty = False
-        pulled_projects: dict = {}
         for row in rows:
             label = f"{row['project']}/{short_id(row['id'])}"
             if row["state"] == "conflict":
-                conflicts += 1
-                warn(f"skipped CONFLICT {label} — 'sessium sync' or 'sessium "
-                     "resolve' decides it")
+                if not args.adopt:
+                    conflicts += 1
+                    warn(f"skipped CONFLICT {label} — 'sessium sync' or "
+                         "'sessium resolve' decides it")
+                    continue
+                # --adopt bring-up: newest wins automatically, the loser is
+                # preserved in revert/ + history/ (recoverable)
+                try:
+                    verdict = apply_conflict(cfg, row, "auto", ledger)
+                except RcloneError as exc:
+                    failures += 1
+                    warn(f"resolve failed {label}: {exc}")
+                    continue
+                ledger_dirty = True
+                resolved += 1
+                ok(f"resolved CONFLICT {label}: {verdict}")
                 continue
             if row["state"] not in ("pull", "new-there"):
                 continue
@@ -1477,9 +1497,12 @@ def cmd_pull(args) -> int:
             if args.dry_run:
                 say(f"would pull {label} ({human_size(row['remote']['size'])})")
                 pulled += 1
-                if args.adopt and row["app"] == "claude":
-                    pulled_projects.setdefault(row["project"], True)
                 continue
+            if row["local"]:
+                # the bytes being replaced were the last-synced version —
+                # once Drive moves on they exist nowhere else; keep them
+                snapshot_history(row["project"], row["id"], Path(row["local"]["path"]),
+                                 row["app"])
             try:
                 download_session(cfg, row, str(path))
                 record_sync(ledger, row["project"], row["id"],
@@ -1487,8 +1510,6 @@ def cmd_pull(args) -> int:
                             row["app"])
                 ledger_dirty = True
                 pulled += 1
-                if args.adopt and row["app"] == "claude":
-                    pulled_projects.setdefault(row["project"], True)
                 ok(f"pulled {label} ({human_size(row['remote']['size'])})")
             except RcloneError as exc:
                 warn(f"pull failed {label}: {exc}")
@@ -1499,19 +1520,11 @@ def cmd_pull(args) -> int:
         if ledger_dirty:
             save_ledger(ledger)
         in_sync = sum(1 for r in rows if r["state"] == "in-sync")
-        say(("dry-run: " if args.dry_run else "")
-            + transfer_summary(0, pulled, conflicts, in_sync, failures))
+        summary = transfer_summary(0, pulled, conflicts, in_sync, failures,
+                                   resolved)
+        say(("dry-run: " if args.dry_run else "") + summary)
         if args.adopt:
-            # Sessions already local under a foreign folder name (an earlier
-            # sync pulled them) are adoption candidates too — otherwise the
-            # second machine's `pull --adopt` adopts nothing the second time.
-            # Codex never adopts (it resumes from anywhere).
-            target = munge(os.getcwd())
-            for row in rows:
-                if (row["app"] == "claude" and row["project"] != target
-                        and row["local"]):
-                    pulled_projects.setdefault(row["project"], True)
-            rc = adopt_for_resume(cfg, pulled_projects, args.dry_run)
+            rc = adopt_all(rows, args.dry_run)
             return rc or (1 if failures else 0)
         return 1 if failures else 0
 
@@ -2133,6 +2146,87 @@ def do_adopt(src: str, repo: str, dry_run: bool = False) -> int:
     if not dry_run:
         say(f"next: cd {repo} && claude --resume")
     return 0
+
+
+def resolve_local_repo_path(recorded: str) -> str:
+    """Translate a repo path recorded by another machine into this machine's
+    equivalent. The same absolute path when it exists here (both machines
+    use the same layout); otherwise the foreign home prefix (/home/<u>,
+    /Users/<u>, X:\\Users\\<u>) swapped for this machine's home, so
+    /home/recoding/Kairo-v1 lands on ~/Kairo-v1. "" when the path is the
+    home itself, untranslatable, or unrecorded."""
+    if not recorded:
+        return ""
+    home = str(Path.home())
+
+    def norm(p: str) -> str:
+        return p.rstrip("/\\").lower()
+
+    if os.path.exists(recorded):
+        if norm(recorded) == norm(home):     # home junk guard
+            return ""
+        return recorded
+    rest = None
+    for pat in (r"^[/\\]+home[/\\]+[^/\\]+([/\\].+)$",
+                r"^[A-Za-z]:[/\\]+Users[/\\]+[^/\\]+([/\\].+)$",
+                r"^[/\\]+Users[/\\]+[^/\\]+([/\\].+)$"):
+        m = re.match(pat, recorded)
+        if m:
+            rest = m.group(1).replace("\\", "/").lstrip("/")
+            break
+    if not rest:
+        return ""
+    return os.path.join(home, rest)
+
+
+def adopt_all(rows: list, dry_run: bool) -> int:
+    """pull --adopt's adopt-all (SPEC §7, 2026-11-20 revision): for every
+    claude project folder the Drive knows about, read the repo path its
+    transcripts record (session_cwd), translate it onto this machine
+    (resolve_local_repo_path), and re-home the whole folder there — so
+    `cd <repo>; claude --resume` works without sessium ever keying on the
+    current directory. Folders already at this machine's name are no-ops;
+    repos not on this machine are prepared at this machine's home + repo
+    name for when the repo is cloned there. Codex is never passed in (codex
+    resumes from anywhere). Returns 0 unless something failed."""
+    candidates = {}
+    for row in rows:
+        if row["app"] == "claude" and (row["remote"] or row["local"]):
+            candidates[row["project"]] = True
+    rc = 0
+    root = claude_dir() / "projects"
+    for src in sorted(candidates):
+        src_dir = root / src
+        if not src_dir.is_dir():
+            # remote-only in dry-run (nothing downloaded) or a failed pull
+            if dry_run:
+                say(f"would pull + adopt {src} (destination read from its "
+                    "transcripts)")
+            else:
+                warn(f"{src} has no local copy (its pull failed?) — pull "
+                     "again to adopt it")
+            continue
+        # the repo path the transcripts record, from the first file with one
+        recorded = ""
+        for jsonl in sorted(src_dir.glob("*.jsonl")):
+            recorded = session_cwd(jsonl)
+            if recorded:
+                break
+        if not recorded:
+            warn(f"{src}: no repo path recorded in its transcripts — left "
+                 f"as '{src}'")
+            continue
+        repo_path = resolve_local_repo_path(recorded)
+        if not repo_path:
+            warn(f"{src}: recorded repo '{recorded}' has no equivalent "
+                 f"here — left as '{src}'")
+            continue
+        if dry_run and not os.path.exists(repo_path):
+            say(f"note: repo '{repo_path}' is not on this machine yet — "
+                "sessions would be prepared there")
+        if do_adopt(src, repo_path, dry_run) != 0:
+            rc = 1
+    return rc
 
 
 def cmd_adopt(args) -> int:

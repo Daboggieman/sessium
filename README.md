@@ -127,11 +127,15 @@ sessium pull --adopt      # download sessions AND adopt everything not on this P
 claude --resume           # the picker now lists them
 ```
 
-`pull --adopt` re-homes every claude session folder that is not on this PC
-into this machine's equivalent of the repo its transcripts record — the
-`cwd` stamps decide, not where you happen to stand: a recorded path that
-exists here is used as-is; otherwise the foreign home prefix maps onto this
-machine's home (`/home/recoding/proj` → `~/proj`). Works from any
+`pull --adopt` brings this machine fully up to Drive. Every session not on
+this PC comes down into the right `~/.claude` / `~/.codex` directories
+(both created if missing). Diverged sessions auto-resolve newest-wins —
+the losing copy is kept in `revert/`, so `sessium revert` rolls it back;
+nothing is ever overwritten irrecoverably. Then every claude session folder
+is re-homed to this machine's equivalent of the repo its transcripts record
+— the `cwd` stamps decide, not where you happen to stand: a recorded path
+that exists here is used as-is; otherwise the foreign home prefix maps onto
+this machine's home (`/home/recoding/proj` → `~/proj`). Works from any
 directory. Forgot the session id? `sessium resume` (no id) matches this
 repo by name across other machines' folders and adopts them;
 `sessium resume <id-prefix>` prints (or with `--go` runs) the exact resume

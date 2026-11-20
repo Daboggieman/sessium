@@ -227,16 +227,27 @@ only reads folders named for machine B. sessium has three answers.
 ### The one-step flow (recommended)
 
 ```bash
-git clone <your-repo> && cd <your-repo>
-sessium pull --adopt         # download AND re-home to this machine's name
-claude --resume              # the picker now lists them
+sessium pull --adopt         # bring this machine fully up to Drive
+claude --resume              # the picker now lists them (no cd needed first)
 ```
 
-`pull --adopt` re-homes every claude session folder that lives locally
-under another machine's name — pulled this run *or already there from an
-earlier sync* — into the current directory's munged name. Run it from the
-repo directory, not your home folder — adoption from $HOME is refused on
-purpose (it would create a junk folder named for your home path).
+`pull --adopt` is the whole-machine bring-up — no `git clone && cd` dance
+required, run it from anywhere:
+
+- every session on Drive that this machine lacks comes down into the right
+  `~/.claude` / `~/.codex` directories (both created if missing);
+- sessions that exist on both sides but diverged: the newest wins
+  automatically, and the losing copy is kept in `revert/` — `sessium
+  revert` rolls back if you change your mind. Nothing is ever overwritten
+  irrecoverably;
+- afterwards every claude session folder is re-homed to this machine's
+  equivalent of the repo its transcript records (the `cwd` stamps): a repo
+  that exists here at the same path is used as-is, otherwise
+  `/home/<you>/proj` (or `C:\Users\<you>\proj`) lands on `<home>/proj` —
+  ready for the day you clone the repo there.
+
+Plain `pull` stays conservative: it downloads but leaves conflicted
+sessions for `sync`/`resolve` to decide.
 
 ### `sessium resume` — pick up one session, or this repo's sessions
 
@@ -354,13 +365,15 @@ You asked `resume`/`open`/`diff` for a session that exists only on Drive.
 Run `sessium pull` (or `sessium pull --adopt` on a new machine), then retry.
 
 **`claude --resume` doesn't list my pulled sessions**
-The sessions landed under the *pushing* machine's folder name. From the
-repo directory run `sessium pull --adopt` (or `sessium resume`), which
-re-homes them under this machine's name for the current directory.
+The sessions landed under the *pushing* machine's folder name. Run
+`sessium pull --adopt` (from anywhere — it re-homes every folder to the
+repo its transcript records), or `sessium resume` from the repo directory.
 
 **"current directory is your home folder — cd into your repo first"**
-Adoption refuses to run from $HOME — it would create a junk folder named
-for your home path. `cd` into the actual repo and retry.
+`resume`/`open --adopt` refuse to run from $HOME — they would create a
+junk folder named for your home path. `cd` into the actual repo and retry.
+(`pull --adopt` has no such restriction — its destinations come from the
+transcripts, never the current directory.)
 
 **A push dies with `retry 1/2 … FAILED`**
 The transfer was retried twice and still failed — usually a network or

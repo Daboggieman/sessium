@@ -218,20 +218,26 @@ Two commands bridge that:
   adopted; then "next: claude --resume" — the native picker takes over.
   Adoption from the home directory is refused for `resume` and `open
   --adopt` (it would create a junk folder named for $HOME).
-- `sessium pull --adopt` — after the pull loop, adopt-all: EVERY claude
-  project the Drive knows about is adopted into this machine's equivalent
-  of the repo its transcripts record (the `cwd` stamps), never the current
-  directory: a recorded path that exists on this machine is used as-is;
-  otherwise the foreign home prefix (`/home/<u>`, `/Users/<u>`,
-  `X:\Users\<u>`) maps onto this machine's home, so `/home/recoding/proj`
-  lands on `<home>/proj` — prepared for the day the repo is cloned there.
-  Works from any directory, `$HOME` included (destinations never derive
-  from the cwd). The one-step new-computer flow is just `sessium pull
-  --adopt && claude --resume`. Folders already at this machine's name are
-  no-ops; a folder whose transcripts record no repo path is left as is.
+- `sessium pull --adopt` — the whole-machine bring-up. The pull loop itself
+  upgrades: every session Drive knows about comes down (no project filter
+  needed), and CONFLICTS are no longer skipped — newest wins automatically
+  (mtime), the losing copy preserved in revert/ + history/ (recoverable via
+  `sessium revert`), the ledger follows. Even a clean pull snapshots the
+  replaced bytes into history/ first: nothing is ever lost irrecoverably.
+  Plain `pull` (no --adopt) keeps the conservative rule (conflicts skipped).
+  After the loop, adopt-all: EVERY claude project the Drive knows about is
+  adopted into this machine's equivalent of the repo its transcripts record
+  (the `cwd` stamps), never the current directory: a recorded path that
+  exists on this machine is used as-is; otherwise the foreign home prefix
+  (`/home/<u>`, `/Users/<u>`, `X:\Users\<u>`) maps onto this machine's
+  home, so `/home/recoding/proj` lands on `<home>/proj` — prepared for the
+  day the repo is cloned there. Works from any directory, `$HOME` included
+  (destinations never derive from the cwd). The one-step new-computer flow
+  is just `sessium pull --adopt && claude --resume`. Folders already at
+  this machine's name are no-ops; a folder whose transcripts record no repo
+  path is left as is. `~/.claude` and `~/.codex` are created when missing.
   Codex rows are skipped (no adoption needed). Implemented on the Windows
-  port 2026-11-18; linux/sessium still runs the older cwd-based rule until
-  ported.
+  port 2026-11-18; linux/sessium ported 2026-11-20 (both engines).
 
 Adopting the WHOLE folder is deliberate: the user gets all their sessions
 for that repo in the picker, not just one. `open --adopt` shares the same

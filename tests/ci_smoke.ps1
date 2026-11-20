@@ -24,6 +24,28 @@ if (-not ($bom[0] -eq 0xEF -and $bom[1] -eq 0xBB -and $bom[2] -eq 0xBF)) {
 }
 Write-Host "  ok   windows/sessium.ps1 ships UTF-8 with BOM (PowerShell 5.1 safe)"
 
+# --- root-copy guard ----------------------------------------------------------
+# The repo-root sessium.ps1/sessium.cmd exist so `sessium ...` works from the
+# repo root via sessium.cmd; they are COPIES of the windows/ engine, never a
+# fork. A stale root copy once resurrected a fixed 5.1 bug ("pulled: 0"
+# forever, 2026-11-19). Fail CI the moment the copies drift.
+$rootPs1 = Join-Path $repo "sessium.ps1"
+$winCmd = Join-Path $repo "windows\sessium.cmd"
+$rootCmd = Join-Path $repo "sessium.cmd"
+foreach ($pair in @(@($ps1, $rootPs1), @($winCmd, $rootCmd))) {
+    if (-not (Test-Path -LiteralPath $pair[1])) {
+        Write-Host ("  FAIL {0} is missing (root copy of the engine must exist)" -f $pair[1]) -ForegroundColor Red
+        exit 1
+    }
+    $h1 = (Get-FileHash -LiteralPath $pair[0] -Algorithm SHA256).Hash
+    $h2 = (Get-FileHash -LiteralPath $pair[1] -Algorithm SHA256).Hash
+    if ($h1 -ne $h2) {
+        Write-Host ("  FAIL {0} drifted from {1} — copy it again (the root files are copies, never edited separately)" -f $pair[1], $pair[0]) -ForegroundColor Red
+        exit 1
+    }
+}
+Write-Host "  ok   root sessium.ps1/.cmd are byte-identical to the windows/ engine"
+
 # --- tiny assertion helpers -------------------------------------------------
 
 $script:failed = 0
