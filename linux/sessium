@@ -2148,6 +2148,60 @@ def do_adopt(src: str, repo: str, dry_run: bool = False) -> int:
     return 0
 
 
+HOME_PREFIX_PATS = (
+    r"^[A-Za-z]:[/\\]+Users[/\\]+[^/\\]+",   # C:\Users\<u>
+    r"^[/\\]+home[/\\]+[^/\\]+",             # /home/<u>
+    r"^[/\\]+Users[/\\]+[^/\\]+",            # /Users/<u> (mac)
+)
+
+
+def munged_home_prefix(recorded: str) -> str:
+    """The recorded cwd's HOME part, munged — e.g. 'c:\\Users\\find\\repo'
+    -> 'c--Users-find'. This is the same for every session from that
+    machine, so it can split a foreign folder name into home + repo even
+    when the stamps' repo part is stale (sessions resumed across repos,
+    VS Code multi-root launches). "" when the cwd records no home."""
+    for pat in HOME_PREFIX_PATS:
+        m = re.match(pat, recorded)
+        if m:
+            return munge(m.group(0))
+    return ""
+
+
+def translate_folder_name(src: str, home_prefix: str = "") -> str:
+    """The local path a foreign munged project folder name stands for:
+    strip the source machine's munged home prefix, map the rest onto this
+    machine's home. 'C--Users-find-Kairo-v1' on a machine whose home is
+    /home/recoding -> /home/recoding/Kairo-v1. The prefix comes from the
+    transcripts' recorded cwd (authoritative user split) when available,
+    else a recognized home-name pattern (dash-free usernames). "" when
+    untranslatable or it lands on the home itself (junk guard)."""
+    home = str(Path.home())
+
+    def norm(p: str) -> str:
+        return p.rstrip("/\\").lower()
+
+    prefixes = []
+    if home_prefix:
+        prefixes.append(home_prefix)
+    if re.match(r"^[A-Za-z]--Users-", src):
+        prefixes.append(re.match(r"^[A-Za-z]--Users-[^-]+", src).group(0))
+    if src.startswith("-home-"):
+        prefixes.append(re.match(r"^-home-[^-]+", src).group(0))
+    elif src.startswith("-Users-"):
+        prefixes.append(re.match(r"^-Users-[^-]+", src).group(0))
+    for prefix in prefixes:
+        if len(src) > len(prefix) and src.lower().startswith(prefix.lower()):
+            rest = src[len(prefix):].lstrip("-")
+            if not rest:                     # the folder IS the home
+                return ""
+            dest = os.path.join(home, rest.replace("\\", "/"))
+            if norm(dest) == norm(home):
+                return ""
+            return dest
+    return ""
+
+
 def resolve_local_repo_path(recorded: str) -> str:
     """Translate a repo path recorded by another machine into this machine's
     equivalent. The same absolute path when it exists here (both machines
@@ -2181,14 +2235,21 @@ def resolve_local_repo_path(recorded: str) -> str:
 
 def adopt_all(rows: list, dry_run: bool) -> int:
     """pull --adopt's adopt-all (SPEC §7, 2026-11-20 revision): for every
-    claude project folder the Drive knows about, read the repo path its
-    transcripts record (session_cwd), translate it onto this machine
-    (resolve_local_repo_path), and re-home the whole folder there — so
-    `cd <repo>; claude --resume` works without sessium ever keying on the
-    current directory. Folders already at this machine's name are no-ops;
-    repos not on this machine are prepared at this machine's home + repo
-    name for when the repo is cloned there. Codex is never passed in (codex
-    resumes from anywhere). Returns 0 unless something failed."""
+    claude project folder the Drive knows about, work out where it belongs
+    on THIS machine and re-home the whole folder there — so `cd <repo>;
+    claude --resume` works without sessium ever keying on the current
+    directory. The destination is the FOLDER NAME translated: the folder
+    is the source machine's munged cwd, so stripping its munged home prefix
+    and mapping the rest onto this machine's home re-homes it — the same
+    repo, this machine's name (C--Users-find-Kairo-v1 -> ~/Kairo-v1). The
+    transcripts' recorded cwd splits the prefix when it can (authoritative
+    user segment) and is the full fallback when the name carries no home
+    pattern; stamps alone are never trusted over the name — sessions
+    resumed across repos record a cwd that contradicts their folder.
+    Folders already at this machine's name are no-ops; repos not on this
+    machine are prepared at this machine's home + repo name for when the
+    repo is cloned there. Codex is never passed in (codex resumes from
+    anywhere). Returns 0 unless something failed."""
     candidates = {}
     for row in rows:
         if row["app"] == "claude" and (row["remote"] or row["local"]):
@@ -2201,7 +2262,7 @@ def adopt_all(rows: list, dry_run: bool) -> int:
             # remote-only in dry-run (nothing downloaded) or a failed pull
             if dry_run:
                 say(f"would pull + adopt {src} (destination read from its "
-                    "transcripts)")
+                    "name/stamps)")
             else:
                 warn(f"{src} has no local copy (its pull failed?) — pull "
                      "again to adopt it")
@@ -2212,14 +2273,24 @@ def adopt_all(rows: list, dry_run: bool) -> int:
             recorded = session_cwd(jsonl)
             if recorded:
                 break
-        if not recorded:
-            warn(f"{src}: no repo path recorded in its transcripts — left "
-                 f"as '{src}'")
-            continue
-        repo_path = resolve_local_repo_path(recorded)
+        # 1st: the folder name, split by the stamps' home prefix (the
+        # stamps' repo half can lie — resumed sessions — but their HOME
+        # half is the source machine's, and the folder is that machine's
+        # munged path, so the prefix splits it authoritatively)
+        repo_path = ""
+        if recorded:
+            prefix = munged_home_prefix(recorded)
+            if prefix and prefix.lower() != munge(recorded).lower():
+                repo_path = translate_folder_name(src, prefix)
         if not repo_path:
-            warn(f"{src}: recorded repo '{recorded}' has no equivalent "
-                 f"here — left as '{src}'")
+            # 2nd: the folder name via a recognized home pattern
+            repo_path = translate_folder_name(src)
+        if not repo_path and recorded:
+            # 3rd: the recorded path itself (same layout / home-mapped)
+            repo_path = resolve_local_repo_path(recorded)
+        if not repo_path:
+            warn(f"{src}: no repo path recorded and the name carries no "
+                 f"home prefix — left as '{src}'")
             continue
         if dry_run and not os.path.exists(repo_path):
             say(f"note: repo '{repo_path}' is not on this machine yet — "
@@ -2239,12 +2310,14 @@ def cmd_adopt(args) -> int:
 
 
 def adopt_for_resume(cfg: dict, projects: dict, dry_run: bool) -> int:
-    """The second half of cross-machine resume (`pull --adopt`, `resume`
-    with no id): re-home every munged project folder in `projects` into
-    this machine's name for the CURRENT directory, so claude's native
-    --resume picker lists those sessions. Whole folders, deliberately —
-    the user gets all their sessions for that repo, not just one. Codex
-    is never passed in (codex resumes from anywhere)."""
+    """Cross-machine resume's adoption half (`resume` with no id): re-home
+    every munged project folder in `projects` into this machine's name for
+    the CURRENT directory, so claude's native --resume picker lists those
+    sessions. (pull --adopt does NOT come through here anymore — its
+    adopt-all derives destinations from the transcripts; see adopt_all.)
+    Whole folders, deliberately — the user gets all their sessions for that
+    repo, not just one. Codex is never passed in (codex resumes from
+    anywhere)."""
     cwd = os.getcwd()
     if Path(cwd) == Path.home() or cwd == os.path.expanduser("~").rstrip("/"):
         warn("current directory is your home folder — cd into your repo "
@@ -3028,9 +3101,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_pull.add_argument("--quiet", action="store_true",
                         help="chatter off (for hooks and cron); errors still print")
     p_pull.add_argument("--adopt", action="store_true",
-                        help="after pulling, re-home pulled sessions into this "
-                             "machine's name for the current directory — the "
-                             "one-step new-computer flow (cd into your repo first)")
+                        help="whole-machine bring-up: pull everything, "
+                             "auto-resolve conflicts newest-wins (loser kept "
+                             "in revert/), re-home every claude project by "
+                             "translating its folder name's home prefix "
+                             "(works from any directory)")
     add_app_arg(p_pull)
     p_pull.set_defaults(func=cmd_pull)
 

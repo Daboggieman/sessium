@@ -2580,6 +2580,53 @@ function Invoke-AdoptForResume($Projects, [bool]$DryRun) {
     return $rc
 }
 
+<# The recorded cwd's HOME part, munged - e.g. 'c:\Users\find\repo' ->
+   'c--Users-find'. This is the same for every session from that machine,
+   so it can split a foreign folder name into home + repo even when the
+   stamps' repo part is stale (sessions resumed across repos, VS Code
+   multi-root launches). "" when the cwd records no home. #>
+$script:HomePrefixPats = @(
+    '^[A-Za-z]:[/\\]+Users[/\\]+[^/\\]+',    # C:\Users\<u>
+    '^[/\\]+home[/\\]+[^/\\]+',              # /home/<u>
+    '^[/\\]+Users[/\\]+[^/\\]+'              # /Users/<u> (mac)
+)
+function Get-MungedHomePrefix([string]$Recorded) {
+    foreach ($pat in $script:HomePrefixPats) {
+        if ($Recorded -match $pat) {
+            return ConvertTo-Munge $Matches[0]
+        }
+    }
+    return ""
+}
+
+<# The local path a foreign munged project folder name stands for: strip
+   the source machine's munged home prefix, map the rest onto this
+   machine's home. 'C--Users-find-Kairo-v1' on a machine whose home is
+   C:\Users\me -> C:\Users\me\Kairo-v1. The prefix comes from the
+   transcripts' recorded cwd (authoritative user split) when available,
+   else a recognized home-name pattern (dash-free usernames). "" when
+   untranslatable or it lands on the home itself (junk guard). #>
+function ConvertTo-TranslatedFolderName([string]$Src, [string]$HomePrefix = "") {
+    $homeDir = [Environment]::GetFolderPath("UserProfile")
+    $prefixes = @()
+    if ($HomePrefix) { $prefixes += $HomePrefix }
+    if ($Src -cmatch '^[A-Za-z]--Users-[^-]+') { $prefixes += $Matches[0] }
+    if ($Src.StartsWith("-home-")) { $prefixes += ($Src -replace '^(-home-[^-]+).*', '$1') }
+    elseif ($Src.StartsWith("-Users-")) { $prefixes += ($Src -replace '^(-Users-[^-]+).*', '$1') }
+    foreach ($prefix in $prefixes) {
+        if ($Src.Length -gt $prefix.Length -and
+                $Src.ToLowerInvariant().StartsWith($prefix.ToLowerInvariant())) {
+            $rest = $Src.Substring($prefix.Length).TrimStart('-')
+            if (-not $rest) { return "" }             # the folder IS the home
+            $dest = Join-Path $homeDir ($rest -replace '\\', '/')
+            if ($dest.TrimEnd('\', '/').ToLowerInvariant() -eq
+                    $homeDir.TrimEnd('\', '/').ToLowerInvariant()) { return "" }
+            return $dest
+        }
+    }
+    return ""
+}
+
 <# Translate a repo path recorded by another machine into this machine's
    equivalent. The same absolute path when it exists here (both machines
    use the same layout); otherwise the foreign home prefix (/home/<u>,
@@ -2604,14 +2651,21 @@ function Resolve-LocalRepoPath([string]$Recorded) {
     return (Join-Path $env:USERPROFILE $rest.TrimStart('\', '/'))
 }
 
-<# pull --adopt's adopt-all (SPEC §7, 2026-11-18 revision): for every claude
-   project folder the Drive knows about, read the repo path its transcripts
-   record (Get-SessionCwd), translate it onto this machine
-   (Resolve-LocalRepoPath), and re-home the whole folder there — so `cd
-   <repo>; claude --resume` works without sessium ever keying on the current
-   directory. Folders already at this machine's name are no-ops; repos not
-   on this machine are prepared at this machine's home + repo name for when
-   the repo is cloned there. Codex is never passed in (codex resumes from
+<# pull --adopt's adopt-all (SPEC §7, 2026-11-20 revision): for every claude
+   project folder the Drive knows about, work out where it belongs on THIS
+   machine and re-home the whole folder there - so `cd <repo>; claude
+   --resume` works without sessium ever keying on the current directory.
+   The destination is the FOLDER NAME translated: the folder is the source
+   machine's munged cwd, so stripping its munged home prefix and mapping
+   the rest onto this machine's home re-homes it - the same repo, this
+   machine's name (C--Users-find-Kairo-v1 -> <home>\Kairo-v1). The
+   transcripts' recorded cwd splits the prefix when it can (authoritative
+   user segment) and is the full fallback when the name carries no home
+   pattern; stamps alone are never trusted over the name - sessions
+   resumed across repos record a cwd that contradicts their folder.
+   Folders already at this machine's name are no-ops; repos not on this
+   machine are prepared at this machine's home + repo name for when the
+   repo is cloned there. Codex is never passed in (codex resumes from
    anywhere). Returns 0 unless something failed. #>
 function Invoke-AdoptAll($Rows, [bool]$DryRun) {
     $candidates = @{}
@@ -2626,7 +2680,7 @@ function Invoke-AdoptAll($Rows, [bool]$DryRun) {
         if (-not (Test-Path -LiteralPath $srcDir)) {
             # remote-only in dry-run (nothing downloaded) or a failed pull
             if ($DryRun) {
-                Write-Info "would pull + adopt $src (destination read from its transcripts)"
+                Write-Info "would pull + adopt $src (destination read from its name/stamps)"
             } else {
                 Write-Warn2 "  [!]  $src has no local copy (its pull failed?) — pull again to adopt it"
             }
@@ -2638,13 +2692,27 @@ function Invoke-AdoptAll($Rows, [bool]$DryRun) {
             $recorded = Get-SessionCwd $f.FullName
             if ($recorded) { break }
         }
-        if (-not $recorded) {
-            Write-Warn2 "  [!]  ${src}: no repo path recorded in its transcripts — left as '$src'"
-            continue
+        # 1st: the folder name, split by the stamps' home prefix (the
+        # stamps' repo half can lie - resumed sessions - but their HOME
+        # half is the source machine's, and the folder is that machine's
+        # munged path, so the prefix splits it authoritatively)
+        $repoPath = ""
+        if ($recorded) {
+            $prefix = Get-MungedHomePrefix $recorded
+            if ($prefix -and $prefix.ToLowerInvariant() -ne (ConvertTo-Munge $recorded).ToLowerInvariant()) {
+                $repoPath = ConvertTo-TranslatedFolderName $src $prefix
+            }
         }
-        $repoPath = Resolve-LocalRepoPath $recorded
         if (-not $repoPath) {
-            Write-Warn2 "  [!]  ${src}: recorded repo '$recorded' has no equivalent here — left as '$src'"
+            # 2nd: the folder name via a recognized home pattern
+            $repoPath = ConvertTo-TranslatedFolderName $src
+        }
+        if (-not $repoPath -and $recorded) {
+            # 3rd: the recorded path itself (same layout / home-mapped)
+            $repoPath = Resolve-LocalRepoPath $recorded
+        }
+        if (-not $repoPath) {
+            Write-Warn2 "  [!]  ${src}: no repo path recorded and the name carries no home prefix — left as '$src'"
             continue
         }
         if ($DryRun -and -not (Test-Path -LiteralPath $repoPath)) {
@@ -3548,10 +3616,10 @@ usage: sessium <command> [args]
                                            download new/changed sessions;
                                            --adopt adopts every claude
                                            session not on this PC: each
-                                           folder re-homed to this machine's
-                                           equivalent of the repo its
-                                           transcripts record (works from
-                                           any directory)
+                                           folder re-homed by translating
+                                           its name's home prefix onto
+                                           this machine (works from any
+                                           directory)
   sync [--interactive] [--dry-run] [--quiet] [--project <m>] [--only memory|skills]
                                            push AND pull; decides conflicts
   diff <id> [--messages] [--json]          local vs remote vs last-synced

@@ -310,6 +310,11 @@ source folder name).
   adoption after the pull loop — the one-step new-computer flow. `open
   --adopt` got the same semantics (the old target was a silent no-op).
   Adoption from $HOME is refused everywhere (junk-folder guard).
+  *(Revised 2026-11-20: `pull --adopt` outgrew this — it is now the
+  whole-machine bring-up with transcript-recorded destinations, works from
+  any directory, and auto-resolves conflicts newest-wins; the cwd-based
+  rule and the $HOME refusal remain only for `resume`/`open --adopt`. See
+  SPEC §7.)*
 - **Tests**: Linux suite 107 → 140 (naming/parse unit tests, gz roundtrip,
   legacy in-sync + migrate + supersede-removal, corrupt-gz loud failure
   both shapes, deep-check on .gz rows, stale-object invisibility +

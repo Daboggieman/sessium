@@ -131,8 +131,10 @@ sessium sync                # both directions; decides conflicts (see §6)
 sessium sync --interactive  # force the conflict prompt even when piped
 ```
 
-- `push` and `pull` **never touch conflicts** — they skip them and say so;
-  `sync` (or `resolve`) decides.
+- `push` and plain `pull` **never touch conflicts** — they skip them and
+  say so; `sync` (or `resolve`) decides. The exception is `pull --adopt`
+  (the bring-up mode): it auto-resolves conflicts newest-wins and keeps the
+  losing copy in `revert/`.
 - `sessium pull --project <munged>` scopes a run to one project folder.
 - Sessions are **gzip-compressed on the wire** (typically 5–10× smaller) and
   stored on Drive as `<sid>-<rawmd5>.jsonl.gz` — the md5 of the
@@ -241,10 +243,14 @@ required, run it from anywhere:
   revert` rolls back if you change your mind. Nothing is ever overwritten
   irrecoverably;
 - afterwards every claude session folder is re-homed to this machine's
-  equivalent of the repo its transcript records (the `cwd` stamps): a repo
-  that exists here at the same path is used as-is, otherwise
-  `/home/<you>/proj` (or `C:\Users\<you>\proj`) lands on `<home>/proj` —
-  ready for the day you clone the repo there.
+  equivalent of its repo. The folder name itself is translated — it's the
+  pushing machine's munged cwd, so its home prefix maps onto yours
+  (`C--Users-find-Kairo-v1` → `~/Kairo-v1`): the same repo, your machine's
+  name. The transcripts' recorded cwd splits the prefix when it can and is
+  the fallback when the name carries no home pattern; stamps are never
+  trusted over the name (sessions resumed across repos record a cwd that
+  contradicts their folder). A repo that exists here at the same path is
+  used as-is.
 
 Plain `pull` stays conservative: it downloads but leaves conflicted
 sessions for `sync`/`resolve` to decide.
@@ -412,7 +418,7 @@ live-md5 spot-checks — read-only, safe to run anytime.
 | `list [--titles] [--json] [--project m]` | browse sessions, newest first |
 | `status [--json] [--project m]` | what changed here / there / conflicted |
 | `push [--dry-run] [--quiet] [--project m]` | upload new/changed sessions |
-| `pull [--dry-run] [--quiet] [--adopt] [--project m]` | download new/changed sessions; `--adopt` re-homes for this machine |
+| `pull [--dry-run] [--quiet] [--adopt] [--project m]` | download new/changed sessions; `--adopt` = whole-machine bring-up (auto-resolve + re-home, any directory) |
 | `sync [--interactive] [--dry-run] [--quiet] [--only memory\|skills] [--project m]` | push AND pull; decides conflicts |
 | `diff <id> [--messages] [--json]` | local vs remote vs last-synced |
 | `resolve <id>` | decide a conflicted session by hand |

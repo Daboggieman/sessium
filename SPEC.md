@@ -226,16 +226,20 @@ Two commands bridge that:
   replaced bytes into history/ first: nothing is ever lost irrecoverably.
   Plain `pull` (no --adopt) keeps the conservative rule (conflicts skipped).
   After the loop, adopt-all: EVERY claude project the Drive knows about is
-  adopted into this machine's equivalent of the repo its transcripts record
-  (the `cwd` stamps), never the current directory: a recorded path that
-  exists on this machine is used as-is; otherwise the foreign home prefix
-  (`/home/<u>`, `/Users/<u>`, `X:\Users\<u>`) maps onto this machine's
-  home, so `/home/recoding/proj` lands on `<home>/proj` — prepared for the
-  day the repo is cloned there. Works from any directory, `$HOME` included
-  (destinations never derive from the cwd). The one-step new-computer flow
-  is just `sessium pull --adopt && claude --resume`. Folders already at
-  this machine's name are no-ops; a folder whose transcripts record no repo
-  path is left as is. `~/.claude` and `~/.codex` are created when missing.
+  adopted into this machine's equivalent of its repo — the FOLDER NAME is
+  translated: the folder is the source machine's munged cwd, so stripping
+  its munged home prefix and mapping the rest onto this machine's home
+  re-homes it (C--Users-find-Kairo-v1 -> <home>/Kairo-v1). The transcripts'
+  recorded cwd splits the prefix when it can (authoritative user segment;
+  never trusted over the name — sessions resumed across repos record a cwd
+  that contradicts their folder) and is the fallback when the name carries
+  no home pattern. A recorded path that exists on this machine is used
+  as-is when the name offers no home prefix. Works from any directory,
+  `$HOME` included (destinations never derive from the cwd). The one-step
+  new-computer flow is just `sessium pull --adopt && claude --resume`.
+  Folders already at this machine's name are no-ops; a folder with no
+  stamps and no recognizable home prefix is left as is. `~/.claude` and
+  `~/.codex` are created when missing.
   Codex rows are skipped (no adoption needed). Implemented on the Windows
   port 2026-11-18; linux/sessium ported 2026-11-20 (both engines).
 

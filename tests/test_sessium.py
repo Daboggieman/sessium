@@ -2013,16 +2013,47 @@ class ResumeTests(SyncBase):
         self.assertTrue((dest / "aaa.jsonl").is_file(),
                         "adopted despite running from the home dir")
 
-    def test_pull_adopt_leaves_unrecorded_folders(self):
-        # transcripts with no cwd stamp: no destination to derive — left as is
+    def test_pull_adopt_translates_folder_name_without_stamps(self):
+        # transcripts with no cwd stamp: the FOLDER NAME still carries the
+        # source machine's munged cwd — its home prefix maps onto this
+        # machine's home (-home-test-proj -> <home>/proj)
         self.local_file(self.a, "aaa").write_text(SESSION_WITH_TITLE, encoding="utf-8")
         self.assertEqual(run_sessium(self.env(self.a), "push").returncode, 0)
         p = run_sessium(self.env(self.b), "pull", "--adopt")
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertIn("no repo path recorded", p.stderr)
-        self.assertTrue(
-            (self.b["claude"] / "projects" / PROJ / "aaa.jsonl").is_file(),
-            "the pulled session stays under the foreign folder name")
+        dest = self._adopt_dest(self.b)
+        self.assertTrue((dest / "aaa.jsonl").is_file(),
+                        "adopted via the folder name's home prefix")
+
+    def test_pull_adopt_folder_name_beats_stamps(self):
+        # the real-world case (2026-11-20): sessions RESUMED across repos
+        # record a cwd that contradicts their folder name — the folder is
+        # where the session lives, so it wins (stamps only split its home
+        # prefix). Folder C--Users-find-Kairo-v1, stamps say tbot-v3:
+        # the sessions must land in <home>/Kairo-v1, never <home>/tbot-v3
+        win_folder = "C--Users-find-Kairo-v1"
+        src = self.b["claude"] / "projects" / win_folder
+        src.mkdir(parents=True, exist_ok=True)
+        stamps = "\n".join([
+            json.dumps({"type": "summary", "summary": "ignored"}),
+            json.dumps({"type": "user", "cwd": "c:\\Users\\find\\tbot-v3",
+                        "message": {"content": "work"}}),
+        ]) + "\n"
+        (src / "win1.jsonl").write_text(stamps, encoding="utf-8")
+        (self.drive / "backup" / "projects" / win_folder).mkdir(
+            parents=True, exist_ok=True)
+        (self.drive / "backup" / "projects" / win_folder / "win1.jsonl"
+         ).write_text(stamps, encoding="utf-8")
+        p = run_sessium(self.env(self.b), "pull", "--adopt")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        dest = self.b["claude"] / "projects" / (
+            "-" + str(self.b["state"].parent / "Kairo-v1")[1:].replace(os.sep, "-"))
+        self.assertTrue((dest / "win1.jsonl").is_file(),
+                        f"re-homed to this machine's Kairo folder ({dest})")
+        tbot_dest = self.b["claude"] / "projects" / (
+            "-" + str(self.b["state"].parent / "tbot-v3")[1:].replace(os.sep, "-"))
+        self.assertFalse(tbot_dest.exists(),
+                         "the contradicting stamp must not decide")
 
     def test_pull_adopt_creates_missing_app_roots(self):
         # fresh-machine bring-up: --adopt makes sure both app roots exist

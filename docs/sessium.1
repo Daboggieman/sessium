@@ -68,13 +68,19 @@ Upload new and locally-changed sessions. Conflicts are
 with a warning — sync or resolve decides them. Never deletes from Drive.
 .TP
 .BR pull " [\-\-dry\-run] [\-\-quiet] [\-\-adopt] [\-\-app " \fIapp\fR "] [\-\-project " \fImunged\fR "]"
-Download new and remotely-changed sessions. Skips conflicts like push.
-With
+Download new and remotely-changed sessions. Plain pull skips conflicts like
+push. With
 .BR \-\-adopt ,
-every pulled session folder is afterwards re-homed under this machine's
-name for the current directory — the one-step new-computer flow:
-`git clone ... && cd repo && sessium pull --adopt && claude --resume`.
-Refused when run from the home directory.
+the whole-machine bring-up: every session on Drive not on this machine is
+downloaded (conflicts auto-resolved newest-wins — the losing copy is kept
+in revert/ and history/, recoverable via
+.BR revert ),
+then every claude project folder is re-homed to this machine's equivalent
+of its repo: the folder name is translated (it is the pushing machine's
+munged cwd — its home prefix maps onto this machine's home, so
+C--Users-find-Kairo-v1 becomes ~/Kairo-v1); the transcripts' recorded cwd
+splits the prefix when it can and is the fallback. Works from any
+directory; ~/.claude and ~/.codex are created when missing.
 .TP
 .BR sync " [\-\-interactive] [\-\-dry\-run] [\-\-quiet] [\-\-app " \fIapp\fR "] [\-\-project " \fImunged\fR "] [\-\-only " \fImemory\fB|\fIskills\fR "]"
 Push and pull what changed in one pass, and
